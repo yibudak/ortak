@@ -36,7 +36,7 @@ ortak daemon
 For Claude Code, install the plugin from this repository:
 
 ```bash
-claude plugin marketplace add /path/to/ortak
+claude plugin marketplace add yibudak/ortak
 claude plugin install ortak@ortak
 ```
 
@@ -46,6 +46,16 @@ For Codex, add this repository as a marketplace and install the plugin:
 codex plugin marketplace add yibudak/ortak
 codex plugin add ortak@ortak
 ```
+
+When working on ortak itself, point the marketplace at a clone instead so the
+plugin reflects local changes:
+
+```bash
+claude plugin marketplace add /path/to/your/ortak/clone
+```
+
+Switch back to the published plugin with `claude plugin marketplace remove ortak`
+followed by the `add` command above.
 
 ## Use
 
