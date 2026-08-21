@@ -55,9 +55,7 @@ fn map_line(hunks: &[Hunk], line: i64) -> LineMap {
 pub fn map_region(hunks: &[Hunk], r: Region) -> Option<Region> {
     let (start, end) = match (map_line(hunks, r.start), map_line(hunks, r.end)) {
         (LineMap::At(a), LineMap::At(b)) => (a, b),
-        (LineMap::At(a), LineMap::Inside(j)) => {
-            (a, hunks[j].new_start + hunks[j].new_lines - 1)
-        }
+        (LineMap::At(a), LineMap::Inside(j)) => (a, hunks[j].new_start + hunks[j].new_lines - 1),
         (LineMap::Inside(i), LineMap::At(b)) => (hunks[i].new_start.max(1), b),
         (LineMap::Inside(i), LineMap::Inside(j)) => {
             if i == j {
@@ -72,7 +70,10 @@ pub fn map_region(hunks: &[Hunk], r: Region) -> Option<Region> {
     if end < start.max(1) {
         None
     } else {
-        Some(Region { start: start.max(1), end })
+        Some(Region {
+            start: start.max(1),
+            end,
+        })
     }
 }
 
@@ -115,7 +116,12 @@ mod tests {
     use super::*;
 
     fn h(old_start: i64, old_lines: i64, new_start: i64, new_lines: i64) -> Hunk {
-        Hunk { old_start, old_lines, new_start, new_lines }
+        Hunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        }
     }
     fn r(start: i64, end: i64) -> Region {
         Region { start, end }

@@ -113,7 +113,11 @@ pub fn blame_verdict(
     let out = run_model(cfg, &prompt)?;
     let v = extract_json(&out)?;
     let culprit_str = v.get("culprit")?.as_str()?;
-    let id: i64 = culprit_str.trim().trim_start_matches("ortak-").parse().ok()?;
+    let id: i64 = culprit_str
+        .trim()
+        .trim_start_matches("ortak-")
+        .parse()
+        .ok()?;
     // The verdict must name a real candidate; otherwise fall back.
     if !candidates.iter().any(|(cid, _, _)| *cid == id) {
         return None;

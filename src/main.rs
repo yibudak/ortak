@@ -16,7 +16,11 @@ use db::{Db, HEARTBEAT_ALIVE_SECS};
 use workspace::Workspace;
 
 #[derive(Parser)]
-#[command(name = "ortak", version, about = "Coordination layer for concurrent agents sharing one live workspace")]
+#[command(
+    name = "ortak",
+    version,
+    about = "Coordination layer for concurrent agents sharing one live workspace"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -76,10 +80,7 @@ enum Command {
     /// List error records
     Errors,
     /// Reassign an open error
-    Assign {
-        error_id: i64,
-        session: String,
-    },
+    Assign { error_id: i64, session: String },
     /// Harness hook adapters (read hook JSON from stdin)
     Hook {
         #[command(subcommand)]
@@ -147,7 +148,11 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = Config::load(&ws.config_path)?;
             publish::run(&ws, &cfg, &session, branch.as_deref(), push)
         }
-        Command::Report { session, command, text } => {
+        Command::Report {
+            session,
+            command,
+            text,
+        } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
             line::report(&ws, &cfg, &session, command.as_deref(), &text.join(" "))
@@ -215,7 +220,10 @@ fn status() -> Result<()> {
             } else {
                 format!("{}-{}", start, end)
             };
-            println!("  {} {} - {} (ortak-{}), {} min ago", file, range, agent, sid, mins);
+            println!(
+                "  {} {} - {} (ortak-{}), {} min ago",
+                file, range, agent, sid, mins
+            );
         }
     }
     Ok(())
@@ -253,7 +261,10 @@ fn log(session: Option<&str>, limit: u32) -> Result<()> {
         let t = chrono::DateTime::from_timestamp(e.ts, 0)
             .map(|d| d.format("%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
-        println!("[{}] {:6} {} - {} (ortak-{})", t, e.change_kind, e.file, e.agent_name, e.session_id);
+        println!(
+            "[{}] {:6} {} - {} (ortak-{})",
+            t, e.change_kind, e.file, e.agent_name, e.session_id
+        );
     }
     Ok(())
 }

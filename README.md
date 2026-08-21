@@ -14,7 +14,15 @@ ortak lets coding agents and people work in the same live directory without sepa
 ## Install
 
 ```bash
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/yibudak/ortak/main/install.sh | sh
+```
+
+The installer verifies the release checksum and writes the binary to `~/.local/bin`. Set `ORTAK_INSTALL_DIR` to use another directory or `ORTAK_VERSION` to pin a release.
+
+To build from source instead:
+
+```bash
+cargo install --git https://github.com/yibudak/ortak --locked
 ```
 
 Initialize ortak inside your project and start the daemon:

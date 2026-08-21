@@ -20,7 +20,10 @@ pub fn run(
     let session = db.resolve_session(session_ref)?;
     let files = db.session_files(session.id)?;
     if files.is_empty() {
-        bail!("ortak-{} has no recorded file changes; nothing to publish", session.id);
+        bail!(
+            "ortak-{} has no recorded file changes; nothing to publish",
+            session.id
+        );
     }
 
     // Layer 0 has no gate, so overlapping edits are possible; surface them.
@@ -61,8 +64,12 @@ pub fn run(
             continue;
         }
         let abs = ws.root.join(file);
-        let data = std::fs::read(&abs)
-            .with_context(|| format!("could not read {} (was it deleted from the workspace?)", file))?;
+        let data = std::fs::read(&abs).with_context(|| {
+            format!(
+                "could not read {} (was it deleted from the workspace?)",
+                file
+            )
+        })?;
         let mode = if abs.metadata()?.permissions().mode() & 0o111 != 0 {
             0o100755
         } else {
@@ -116,9 +123,19 @@ pub fn run(
         ),
     };
     repo.branch(&branch_name, &repo.find_commit(commit_oid)?, false)
-        .with_context(|| format!("could not create branch {} (does it already exist?)", branch_name))?;
+        .with_context(|| {
+            format!(
+                "could not create branch {} (does it already exist?)",
+                branch_name
+            )
+        })?;
 
-    println!("branch ready: {} ({} files, commit {})", branch_name, files.len(), &commit_oid.to_string()[..8]);
+    println!(
+        "branch ready: {} ({} files, commit {})",
+        branch_name,
+        files.len(),
+        &commit_oid.to_string()[..8]
+    );
     for (f, k) in &files {
         println!("  {} {}", k, f);
     }

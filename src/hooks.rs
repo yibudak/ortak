@@ -8,9 +8,8 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-/// Claude Code and Codex hook adapters. These read hook event JSON from stdin.
-/// They must never break the agent's session: callers swallow errors and
-/// always exit 0.
+// Claude Code and Codex hook adapters read hook event JSON from stdin. They
+// must never break the agent's session: callers swallow errors and exit 0.
 
 fn read_stdin_json() -> Result<Value> {
     let mut buf = String::new();

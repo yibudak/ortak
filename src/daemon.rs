@@ -5,6 +5,7 @@ use crate::workspace::Workspace;
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -72,7 +73,7 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
 
 /// Cheap pre-filter before ignore rules: workspace-relative path, skipping
 /// the metadata directories that would otherwise feed back into the watcher.
-fn filter(ws: &Workspace, abs: &PathBuf) -> Option<String> {
+fn filter(ws: &Workspace, abs: &Path) -> Option<String> {
     let rel = ws.relativize(abs)?;
     let first = rel.split('/').next().unwrap_or("");
     if first == ".ortak" || first == ".git" {
@@ -82,7 +83,13 @@ fn filter(ws: &Workspace, abs: &PathBuf) -> Option<String> {
 }
 
 /// Journal one path change. Returns whether anything was recorded.
-fn process(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64, rel: &str) -> Result<bool> {
+fn process(
+    db: &Db,
+    repo: &git2::Repository,
+    ws: &Workspace,
+    human_id: i64,
+    rel: &str,
+) -> Result<bool> {
     if repo.is_path_ignored(rel).unwrap_or(false) {
         return Ok(false);
     }

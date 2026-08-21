@@ -29,7 +29,9 @@ fn default_lookback() -> i64 {
 
 impl Default for LineCfg {
     fn default() -> Self {
-        LineCfg { blame_lookback_minutes: default_lookback() }
+        LineCfg {
+            blame_lookback_minutes: default_lookback(),
+        }
     }
 }
 

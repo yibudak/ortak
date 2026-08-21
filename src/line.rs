@@ -17,7 +17,13 @@ pub fn shorten(text: &str, max: usize) -> String {
 /// An agent hit an error it believes is not its own: stop the line, hunt the
 /// culprit (file correlation, arbiter LLM, then the reporter), and
 /// record the obligation.
-pub fn report(ws: &Workspace, cfg: &Config, session_ref: &str, command: Option<&str>, text: &str) -> Result<()> {
+pub fn report(
+    ws: &Workspace,
+    cfg: &Config,
+    session_ref: &str,
+    command: Option<&str>,
+    text: &str,
+) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let reporter = db.resolve_session(session_ref)?;
     let excerpt: String = text.chars().take(4000).collect();
@@ -40,8 +46,10 @@ pub fn report(ws: &Workspace, cfg: &Config, session_ref: &str, command: Option<&
         }
     }
     let best_score = per_session.iter().map(|e| e.3.len()).max().unwrap_or(0);
-    let leaders: Vec<&(i64, String, Vec<String>, Vec<String>)> =
-        per_session.iter().filter(|e| e.3.len() == best_score && best_score > 0).collect();
+    let leaders: Vec<&(i64, String, Vec<String>, Vec<String>)> = per_session
+        .iter()
+        .filter(|e| e.3.len() == best_score && best_score > 0)
+        .collect();
 
     let (culprit, brief, how) = if leaders.len() == 1 {
         let l = leaders[0];
@@ -52,18 +60,36 @@ pub fn report(ws: &Workspace, cfg: &Config, session_ref: &str, command: Option<&
             .map(|(id, agent, files, _)| (*id, agent.clone(), files.clone()))
             .collect();
         let reporter_label = format!("ortak-{} {}", reporter.id, reporter.agent_name);
-        match orchestrator::blame_verdict(&cfg.orchestrator, &excerpt, &reporter_label, &candidates) {
+        match orchestrator::blame_verdict(&cfg.orchestrator, &excerpt, &reporter_label, &candidates)
+        {
             Some((id, brief)) => (id, Some(brief), "arbiter verdict".to_string()),
-            None => (reporter.id, None, "arbiter returned no answer; reporter owns the error by default".to_string()),
+            None => (
+                reporter.id,
+                None,
+                "arbiter returned no answer; reporter owns the error by default".to_string(),
+            ),
         }
     } else {
-        (reporter.id, None, "ambiguous match; reporter owns the error by default".to_string())
+        (
+            reporter.id,
+            None,
+            "ambiguous match; reporter owns the error by default".to_string(),
+        )
     };
 
-    let err_id = db.insert_error(reporter.id, command, &excerpt, Some(culprit), brief.as_deref())?;
+    let err_id = db.insert_error(
+        reporter.id,
+        command,
+        &excerpt,
+        Some(culprit),
+        brief.as_deref(),
+    )?;
     let culprit_session = db.get_session(culprit)?;
     println!("line STOPPED (error #{}).", err_id);
-    println!("responsible: ortak-{} {} ({})", culprit_session.id, culprit_session.agent_name, how);
+    println!(
+        "responsible: ortak-{} {} ({})",
+        culprit_session.id, culprit_session.agent_name, how
+    );
     if let Some(b) = &brief {
         println!("fix brief: {}", b);
     }
@@ -116,7 +142,13 @@ pub fn list(ws: &Workspace) -> Result<()> {
             .unwrap_or_default();
         println!(
             "#{} [{}] {} - reporter ortak-{} {}, owner ortak-{} {}",
-            e.id, e.status, t, e.reporter, e.reporter_name, e.responsible(), e.responsible_name()
+            e.id,
+            e.status,
+            t,
+            e.reporter,
+            e.reporter_name,
+            e.responsible(),
+            e.responsible_name()
         );
         println!("   {}", shorten(&e.excerpt, 120));
         if let Some(b) = &e.fix_brief {
@@ -130,6 +162,9 @@ pub fn assign(ws: &Workspace, error_id: i64, session_ref: &str) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let s = db.resolve_session(session_ref)?;
     db.assign_error(error_id, s.id)?;
-    println!("assigned error #{} to ortak-{} {}.", error_id, s.id, s.agent_name);
+    println!(
+        "assigned error #{} to ortak-{} {}.",
+        error_id, s.id, s.agent_name
+    );
     Ok(())
 }

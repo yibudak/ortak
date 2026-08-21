@@ -10,8 +10,12 @@ use std::path::Path;
 pub fn init(ws: &Workspace, cfg: &Config) -> Result<Repository> {
     let mut opts = git2::RepositoryInitOptions::new();
     opts.bare(true);
-    let repo = Repository::init_opts(&ws.shadow_dir, &opts)
-        .with_context(|| format!("could not create shadow repository: {}", ws.shadow_dir.display()))?;
+    let repo = Repository::init_opts(&ws.shadow_dir, &opts).with_context(|| {
+        format!(
+            "could not create shadow repository: {}",
+            ws.shadow_dir.display()
+        )
+    })?;
     {
         let mut config = repo.config()?;
         config.set_bool("core.bare", false)?;

@@ -18,20 +18,25 @@ pub struct Session {
     pub id: i64,
     pub external_id: String,
     pub agent_name: String,
+    #[allow(dead_code)]
     pub kind: String,
+    #[allow(dead_code)]
     pub harness: Option<String>,
     pub task_intent: Option<String>,
     pub status: String,
+    #[allow(dead_code)]
     pub started_at: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct EditRow {
+    #[allow(dead_code)]
     pub id: i64,
     pub session_id: i64,
     pub agent_name: String,
     pub file: String,
     pub change_kind: String,
+    #[allow(dead_code)]
     pub shadow_commit: Option<String>,
     pub ts: i64,
 }
@@ -41,6 +46,7 @@ pub struct ErrorRow {
     pub id: i64,
     pub reporter: i64,
     pub reporter_name: String,
+    #[allow(dead_code)]
     pub command: Option<String>,
     pub excerpt: String,
     pub status: String,
@@ -70,6 +76,8 @@ pub struct Conflict {
     pub end: i64,
     pub last_ts: i64,
 }
+
+pub type FreshRegion = (String, i64, i64, String, i64, i64);
 
 pub struct Db {
     conn: Connection,
@@ -299,7 +307,8 @@ impl Db {
     }
 
     pub fn recent_edits(&self, session_id: Option<i64>, limit: u32) -> Result<Vec<EditRow>> {
-        let sql = "SELECT e.id, e.session_id, s.agent_name, e.file, e.change_kind, e.shadow_commit, e.ts
+        let sql =
+            "SELECT e.id, e.session_id, s.agent_name, e.file, e.change_kind, e.shadow_commit, e.ts
                    FROM edits e JOIN sessions s ON s.id = e.session_id
                    WHERE (?1 IS NULL OR e.session_id = ?1)
                    ORDER BY e.id DESC LIMIT ?2";
@@ -436,7 +445,13 @@ impl Db {
         for t in targets {
             let found = stmt
                 .query_map(
-                    params![file, me, t.end.saturating_add(margin), t.start - margin, cutoff],
+                    params![
+                        file,
+                        me,
+                        t.end.saturating_add(margin),
+                        t.start - margin,
+                        cutoff
+                    ],
                     |r| {
                         Ok(Conflict {
                             session_id: r.get(0)?,
@@ -462,7 +477,7 @@ impl Db {
     }
 
     /// All hot regions in the workspace (for `status`).
-    pub fn fresh_regions(&self, presence_secs: i64) -> Result<Vec<(String, i64, i64, String, i64, i64)>> {
+    pub fn fresh_regions(&self, presence_secs: i64) -> Result<Vec<FreshRegion>> {
         let cutoff = now_ts() - presence_secs;
         let mut stmt = self.conn.prepare(
             "SELECT r.file, r.start_line, r.end_line, s.agent_name, s.id,
@@ -475,7 +490,14 @@ impl Db {
              ORDER BY r.file, r.start_line",
         )?;
         let rows = stmt.query_map(params![cutoff], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -506,7 +528,11 @@ impl Db {
              JOIN sessions rs ON rs.id = e.reporter_session
              LEFT JOIN sessions cs ON cs.id = e.culprit_session
              {} ORDER BY e.id DESC LIMIT ?1",
-            if only_open { "WHERE e.status = 'open'" } else { "" }
+            if only_open {
+                "WHERE e.status = 'open'"
+            } else {
+                ""
+            }
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![limit], |r| {
@@ -565,7 +591,10 @@ impl Db {
 
     /// (session_id, agent_name, file, last_ts) for edits within the lookback
     /// window. This forms the search space for assigning an owner.
-    pub fn recent_session_files(&self, lookback_secs: i64) -> Result<Vec<(i64, String, String, i64)>> {
+    pub fn recent_session_files(
+        &self,
+        lookback_secs: i64,
+    ) -> Result<Vec<(i64, String, String, i64)>> {
         let cutoff = now_ts() - lookback_secs;
         let mut stmt = self.conn.prepare(
             "SELECT e.session_id, s.agent_name, e.file, MAX(e.ts)
