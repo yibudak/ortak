@@ -4,10 +4,11 @@ use crate::regions::{Region, WHOLE_FILE};
 use crate::workspace::Workspace;
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-/// Claude Code hook adapters. These read the hook event JSON from stdin.
+/// Claude Code and Codex hook adapters. These read hook event JSON from stdin.
 /// They must never break the agent's session: callers swallow errors and
 /// always exit 0.
 
@@ -24,10 +25,35 @@ fn workspace_for(input: &Value) -> Result<Workspace> {
     Workspace::discover_from_cwd()
 }
 
+fn harness_for(input: &Value) -> &'static str {
+    let transcript_is_codex = input
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .is_some_and(|path| path.contains("/.codex/"));
+    let tool_is_codex = input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .is_some_and(|name| name == "apply_patch");
+    if transcript_is_codex || tool_is_codex {
+        "codex"
+    } else {
+        "claude-code"
+    }
+}
+
 /// Short, human-readable agent name derived from the harness session id.
-fn agent_name_for(external_id: &str) -> String {
-    let short: String = external_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(4).collect();
-    format!("claude-{}", short)
+fn agent_name_for(external_id: &str, harness: &str) -> String {
+    let short: String = external_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .collect();
+    let prefix = if harness == "codex" {
+        "codex"
+    } else {
+        "claude"
+    };
+    format!("{}-{}", prefix, short)
 }
 
 pub fn session_start() -> Result<()> {
@@ -39,7 +65,13 @@ pub fn session_start() -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let id = db.upsert_session(&external_id, &agent_name_for(&external_id), "llm", Some("claude-code"))?;
+    let harness = harness_for(&input);
+    let id = db.upsert_session(
+        &external_id,
+        &agent_name_for(&external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
     let context = format!(
         "ortak is active. The journal attributes this session's file changes to ortak-{id}. \
          Before editing, record your task intent: `ortak intent ortak-{id} \"<one-sentence task>\"`. \
@@ -64,18 +96,34 @@ pub fn post_edit() -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let harness = harness_for(&input);
     // Session may be unknown if the daemon/plugin were enabled mid-session.
-    let session_id =
-        db.upsert_session(&external_id, &agent_name_for(&external_id), "llm", Some("claude-code"))?;
+    let session_id = db.upsert_session(
+        &external_id,
+        &agent_name_for(&external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
+    let tool_name = input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
-    let file = tool_input
-        .get("file_path")
-        .or_else(|| tool_input.get("notebook_path"))
-        .and_then(|v| v.as_str());
-    if let Some(f) = file {
-        if let Some(rel) = ws.relativize(Path::new(f)) {
-            db.insert_hint(&rel, session_id)?;
-        }
+    let files = if tool_name == "apply_patch" {
+        patch_command(&tool_input)
+            .map(|patch| patch_files(&ws, patch))
+            .unwrap_or_default()
+    } else {
+        tool_input
+            .get("file_path")
+            .or_else(|| tool_input.get("notebook_path"))
+            .and_then(|v| v.as_str())
+            .and_then(|file| workspace_file(&ws, file))
+            .into_iter()
+            .collect()
+    };
+    for rel in files {
+        db.insert_hint(&rel, session_id)?;
     }
     Ok(())
 }
@@ -85,14 +133,22 @@ pub fn post_edit() -> Result<()> {
 pub fn pre_edit() -> Result<()> {
     let input = read_stdin_json()?;
     // Outside an ortak workspace, stay silent and allow the edit.
-    let Ok(ws) = workspace_for(&input) else { return Ok(()) };
+    let Ok(ws) = workspace_for(&input) else {
+        return Ok(());
+    };
     let cfg = Config::load(&ws.config_path).unwrap_or_default();
     let db = Db::open(&ws.db_path)?;
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let me = db.upsert_session(external_id, &agent_name_for(external_id), "llm", Some("claude-code"))?;
+    let harness = harness_for(&input);
+    let me = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
 
     // Stop-the-line: while any error is open, only its responsible session
     // may edit. This check runs even if the conflict gate is disabled.
@@ -127,22 +183,31 @@ pub fn pre_edit() -> Result<()> {
     if !cfg.gate.enabled {
         return Ok(());
     }
-    let tool_name = input.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_name = input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
-    let Some((rel, targets)) = target_ranges(&ws, tool_name, &tool_input) else {
+    let Some(file_targets) = target_files(&ws, tool_name, &tool_input) else {
         return Ok(());
     };
-
-    let conflicts = db.conflicts(
-        &rel,
-        &targets,
-        me,
-        cfg.gate.margin_lines,
-        cfg.gate.presence_minutes * 60,
-    )?;
-    if conflicts.is_empty() {
-        return Ok(());
+    let mut blocked = None;
+    for (rel, targets) in file_targets {
+        let conflicts = db.conflicts(
+            &rel,
+            &targets,
+            me,
+            cfg.gate.margin_lines,
+            cfg.gate.presence_minutes * 60,
+        )?;
+        if !conflicts.is_empty() {
+            blocked = Some((rel, conflicts));
+            break;
+        }
     }
+    let Some((rel, conflicts)) = blocked else {
+        return Ok(());
+    };
 
     // Layer 3: with the referee enabled, an intent-aware ruling can overrule
     // the deterministic first-toucher denial. Referee silence means deny.
@@ -206,25 +271,38 @@ pub fn pre_edit() -> Result<()> {
     Ok(())
 }
 
-/// Which line ranges of which file is this tool call about to touch?
+/// Which files and line ranges is this tool call about to touch?
 /// `None` means nothing can be checked, so allow. Conservative fallbacks return a
 /// whole-file range.
-fn target_ranges(ws: &Workspace, tool_name: &str, tool_input: &Value) -> Option<(String, Vec<Region>)> {
-    let whole = vec![Region { start: 1, end: WHOLE_FILE }];
+fn target_files(
+    ws: &Workspace,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Option<Vec<(String, Vec<Region>)>> {
+    let whole = vec![Region {
+        start: 1,
+        end: WHOLE_FILE,
+    }];
     match tool_name {
         "Write" => {
             let rel = rel_file(ws, tool_input, "file_path")?;
-            Some((rel, whole))
+            Some(vec![(rel, whole)])
         }
         "NotebookEdit" => {
             let rel = rel_file(ws, tool_input, "notebook_path")?;
-            Some((rel, whole))
+            Some(vec![(rel, whole)])
         }
         "Edit" => {
             let rel = rel_file(ws, tool_input, "file_path")?;
-            let old = tool_input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let all = tool_input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(ranged(ws, rel, &[(old, all)], whole)?)
+            let old = tool_input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let all = tool_input
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(vec![ranged(ws, rel, &[(old, all)], whole)?])
         }
         "MultiEdit" => {
             let rel = rel_file(ws, tool_input, "file_path")?;
@@ -235,13 +313,24 @@ fn target_ranges(ws: &Workspace, tool_name: &str, tool_input: &Value) -> Option<
                     arr.iter()
                         .filter_map(|e| {
                             let old = e.get("old_string")?.as_str()?;
-                            let all = e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let all = e
+                                .get("replace_all")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
                             Some((old, all))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(ranged(ws, rel, &edits, whole)?)
+            Some(vec![ranged(ws, rel, &edits, whole)?])
+        }
+        "apply_patch" => {
+            let files = patch_files(ws, patch_command(tool_input)?);
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.into_iter().map(|rel| (rel, whole.clone())).collect())
+            }
         }
         _ => None,
     }
@@ -249,7 +338,47 @@ fn target_ranges(ws: &Workspace, tool_name: &str, tool_input: &Value) -> Option<
 
 fn rel_file(ws: &Workspace, tool_input: &Value, key: &str) -> Option<String> {
     let p = tool_input.get(key)?.as_str()?;
-    ws.relativize(Path::new(p))
+    workspace_file(ws, p)
+}
+
+fn workspace_file(ws: &Workspace, file: &str) -> Option<String> {
+    let path = Path::new(file);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ws.root.join(path)
+    };
+    ws.relativize(&abs)
+}
+
+fn patch_command(tool_input: &Value) -> Option<&str> {
+    tool_input
+        .get("command")
+        .or_else(|| tool_input.get("patch"))
+        .and_then(|v| v.as_str())
+        .or_else(|| tool_input.as_str())
+}
+
+fn patch_files(ws: &Workspace, patch: &str) -> Vec<String> {
+    const PATH_PREFIXES: [&str; 4] = [
+        "*** Add File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    let mut files = BTreeSet::new();
+    for line in patch.lines() {
+        let Some(file) = PATH_PREFIXES
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        if let Some(rel) = workspace_file(ws, file.trim()) {
+            files.insert(rel);
+        }
+    }
+    files.into_iter().collect()
 }
 
 /// Locate old_string occurrences in the current file content and turn them
@@ -275,7 +404,10 @@ fn ranged(
         let n_lines = needle.lines().count().max(1) as i64;
         for (off, _) in content.match_indices(needle) {
             let start = content[..off].bytes().filter(|b| *b == b'\n').count() as i64 + 1;
-            targets.push(Region { start, end: start + n_lines - 1 });
+            targets.push(Region {
+                start,
+                end: start + n_lines - 1,
+            });
             if !*all || targets.len() >= 50 {
                 break;
             }
@@ -291,7 +423,9 @@ fn ranged(
 /// agent to report the error if it looks foreign. Bridges LLM forgetfulness.
 pub fn post_bash() -> Result<()> {
     let input = read_stdin_json()?;
-    let Ok(ws) = workspace_for(&input) else { return Ok(()) };
+    let Ok(ws) = workspace_for(&input) else {
+        return Ok(());
+    };
     let resp = input.get("tool_response").cloned().unwrap_or(Value::Null);
     let exit = resp
         .get("exit_code")
@@ -309,15 +443,27 @@ pub fn post_bash() -> Result<()> {
         resp.get("stderr").and_then(|v| v.as_str()).unwrap_or("")
     )
     .to_lowercase();
-    if !["error", "traceback", "exception", "fail", "panic"].iter().any(|k| text.contains(k)) {
+    if !["error", "traceback", "exception", "fail", "panic"]
+        .iter()
+        .any(|k| text.contains(k))
+    {
         return Ok(());
     }
     let db = Db::open(&ws.db_path)?;
     if !db.open_errors()?.is_empty() {
         return Ok(()); // line already stopped; prompt-context handles messaging
     }
-    let external_id = input.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let me = db.upsert_session(external_id, &agent_name_for(external_id), "llm", Some("claude-code"))?;
+    let external_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let harness = harness_for(&input);
+    let me = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
     let context = format!(
         "ortak: the last command failed. Fix the error if your changes caused it. Report it if it \
          appears unrelated so ortak can assign an owner: \
@@ -335,14 +481,25 @@ pub fn post_bash() -> Result<()> {
 /// session's context so the responsible session sees its assignment.
 pub fn prompt_context() -> Result<()> {
     let input = read_stdin_json()?;
-    let Ok(ws) = workspace_for(&input) else { return Ok(()) };
+    let Ok(ws) = workspace_for(&input) else {
+        return Ok(());
+    };
     let db = Db::open(&ws.db_path)?;
     let open = db.open_errors()?;
     if open.is_empty() {
         return Ok(());
     }
-    let external_id = input.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let me = db.upsert_session(external_id, &agent_name_for(external_id), "llm", Some("claude-code"))?;
+    let external_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let harness = harness_for(&input);
+    let me = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
     let mine: Vec<&crate::db::ErrorRow> = open.iter().filter(|e| e.responsible() == me).collect();
     let context = if !mine.is_empty() {
         let e = mine[0];
@@ -386,4 +543,68 @@ pub fn session_end() -> Result<()> {
         db.end_session(external_id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_codex_from_apply_patch_and_transcript() {
+        assert_eq!(
+            harness_for(&serde_json::json!({ "tool_name": "apply_patch" })),
+            "codex"
+        );
+        assert_eq!(
+            harness_for(&serde_json::json!({
+                "transcript_path": "/tmp/.codex/sessions/example.jsonl"
+            })),
+            "codex"
+        );
+        assert_eq!(harness_for(&serde_json::json!({})), "claude-code");
+    }
+
+    #[test]
+    fn extracts_all_workspace_paths_from_codex_patch() {
+        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
+        let patch = "*** Begin Patch\n\
+*** Update File: src/main.rs\n\
+*** Move to: src/bin/main.rs\n\
+*** Add File: tests/smoke.rs\n\
+*** Delete File: old.rs\n\
+*** Update File: /outside/not-ours.rs\n\
+*** End Patch";
+        assert_eq!(
+            patch_files(&ws, patch),
+            vec![
+                "old.rs".to_string(),
+                "src/bin/main.rs".to_string(),
+                "src/main.rs".to_string(),
+                "tests/smoke.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_patch_targets_whole_files() {
+        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
+        let targets = target_files(
+            &ws,
+            "apply_patch",
+            &serde_json::json!({
+                "command": "*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch"
+            }),
+        )
+        .expect("patch target");
+        assert_eq!(
+            targets,
+            vec![(
+                "src/main.rs".to_string(),
+                vec![Region {
+                    start: 1,
+                    end: WHOLE_FILE,
+                }],
+            )]
+        );
+    }
 }

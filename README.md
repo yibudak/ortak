@@ -32,6 +32,13 @@ claude plugin marketplace add /path/to/ortak
 claude plugin install ortak@ortak
 ```
 
+For Codex, add this repository as a marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add yibudak/ortak
+codex plugin add ortak@ortak
+```
+
 ## Use
 
 ```bash

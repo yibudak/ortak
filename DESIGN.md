@@ -65,7 +65,7 @@ The daemon runs as a local background process and communicates through a Unix so
   - A session can revert one edit without touching unrelated work.
   - Publishing collects one session's micro-commits on top of the base branch.
 
-### 3.3 Harness adapters (first target: Claude Code plugin)
+### 3.3 Harness adapters
 
 Adapters stay thin. The daemon owns coordination logic. The Claude Code adapter maps events as follows:
 
@@ -78,7 +78,9 @@ Adapters stay thin. The daemon owns coordination logic. The Claude Code adapter 
 | Plugin MCP tools | Expose `report_error`, `resolved`, `publish`, and `status` for deliberate actions. |
 | Plugin skill | Teach task intent, unrelated-error reporting, gate handling, and publishing. |
 
-A second harness, such as Codex, needs another thin adapter. The daemon and data model stay the same.
+Each harness uses a thin adapter. The daemon and data model stay the same.
+
+The Codex plugin reuses the lifecycle hooks and workflow skill. Codex exposes `apply_patch` as an `Edit` and `Write` matcher alias; the adapter extracts every patch path and journals each resulting file event.
 
 ### 3.4 File watcher (person adapter)
 
@@ -175,7 +177,7 @@ Each layer extends a working end-to-end product.
 
 **Layer 0: Black box and publish (MVP). Implemented.**
 
-The daemon, shadow Git journal, Claude Code registration and attribution hooks, file watcher, and `publish` command produce Forgejo PRs. This layer supports concurrent tasks in one workspace and runtime without branch switching or code-state mismatch. Each task ends with a separate PR.
+The daemon, shadow Git journal, Claude Code and Codex registration and attribution hooks, file watcher, and `publish` command produce Forgejo PRs. This layer supports concurrent tasks in one workspace and runtime without branch switching or code-state mismatch. Each task ends with a separate PR.
 
 **Layer 1: Gate and deterministic priority. Implemented.**
 

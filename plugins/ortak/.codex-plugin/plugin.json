@@ -1,0 +1,41 @@
+{
+  "name": "ortak",
+  "version": "0.1.0",
+  "description": "Coordinate concurrent coding agents in one live workspace with ortak.",
+  "author": {
+    "name": "yibudak",
+    "url": "https://github.com/yibudak"
+  },
+  "homepage": "https://github.com/yibudak/ortak",
+  "repository": "https://github.com/yibudak/ortak",
+  "license": "MIT",
+  "keywords": [
+    "coding agents",
+    "coordination",
+    "concurrency",
+    "journal",
+    "git"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ortak",
+    "shortDescription": "Coordinate Codex sessions in one live workspace",
+    "longDescription": "Use ortak hooks and workflow guidance to register Codex sessions, attribute apply_patch edits, prevent active-region conflicts, handle stop-the-line errors, and publish session changes.",
+    "developerName": "yibudak",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/yibudak/ortak",
+    "defaultPrompt": [
+      "Show ortak status and active work.",
+      "Explain which sessions own hot regions.",
+      "Publish my ortak session when the task is done."
+    ],
+    "brandColor": "#0A2749",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png",
+    "screenshots": []
+  }
+}

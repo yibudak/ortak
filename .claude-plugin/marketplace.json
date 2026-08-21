@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "ortak",
-      "source": "./plugin",
+      "source": "./plugins/ortak",
       "description": "ortak adapter with session registration, edit journaling hooks, and a workflow skill"
     }
   ]

@@ -1,0 +1,20 @@
+{
+  "name": "ortak",
+  "interface": {
+    "displayName": "Ortak"
+  },
+  "plugins": [
+    {
+      "name": "ortak",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ortak"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
