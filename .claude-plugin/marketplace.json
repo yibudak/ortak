@@ -1,0 +1,12 @@
+{
+  "name": "ortak",
+  "description": "ortak coordinates concurrent agents in one live workspace through a journal, conflict gate, stop-the-line flow, and arbiter",
+  "owner": { "name": "yibudak" },
+  "plugins": [
+    {
+      "name": "ortak",
+      "source": "./plugin",
+      "description": "ortak adapter with session registration, edit journaling hooks, and a workflow skill"
+    }
+  ]
+}
