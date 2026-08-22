@@ -338,26 +338,17 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Other sessions that also touched any of the given files.
-    pub fn overlapping_sessions(
-        &self,
-        session_id: i64,
-        files: &[String],
-    ) -> Result<Vec<(String, String)>> {
-        let mut out = Vec::new();
+    /// Every shadow micro-commit this session recorded, oldest first. Publishing
+    /// replays these to rebuild the session's own content, so the full history
+    /// matters here where `session_files` only needs each file's final state.
+    pub fn session_commits(&self, session_id: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT s.agent_name FROM edits e JOIN sessions s ON s.id = e.session_id
-             WHERE e.file = ?1 AND e.session_id != ?2",
+            "SELECT shadow_commit FROM edits
+             WHERE session_id = ?1 AND shadow_commit IS NOT NULL
+             ORDER BY id",
         )?;
-        for f in files {
-            let others = stmt
-                .query_map(params![f, session_id], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for o in others {
-                out.push((f.clone(), o));
-            }
-        }
-        Ok(out)
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn edit_count(&self, session_id: i64) -> Result<i64> {
