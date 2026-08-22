@@ -26,12 +26,6 @@ pub fn run(
         );
     }
 
-    // The gate lets two sessions edit distant lines of one file, so the file on
-    // disk can hold another session's work. Rebuild this session's own content
-    // from its shadow history instead of reading the workspace.
-    let shadow = crate::shadow::open(ws)?;
-    let session_tree = session_only_tree(&shadow, &db.session_commits(session.id)?)?;
-
     let repo = Repository::open(&ws.root).with_context(|| {
         format!(
             "publishing requires {} to be a git repository with a configured remote",
@@ -50,10 +44,19 @@ pub fn run(
                 )
             })?,
     };
+    let base_tree = base_commit.tree()?;
+
+    // The gate lets two sessions edit distant lines of one file, so the file on
+    // disk can hold another session's work. Rebuild this session's own content
+    // from its shadow history instead of reading the workspace.
+    let shadow = crate::shadow::open(ws)?;
+    let seed = base_seed(&shadow, &repo, &base_tree, &files)?;
+    let session_tree =
+        session_only_tree(&shadow, &seed, &base_tree, &db.session_commits(session.id)?)?;
 
     // Build the branch tree in an in-memory index: base tree + session files.
     let mut index = git2::Index::new()?;
-    index.read_tree(&base_commit.tree()?)?;
+    index.read_tree(&base_tree)?;
     for (file, kind) in &files {
         if kind == "delete" {
             let _ = index.remove_path(Path::new(file));
@@ -66,21 +69,7 @@ pub fn run(
         let mode = tracked.filemode() as u32;
         // The blob lives in the shadow object database; copy it into the project repo.
         let blob_id = repo.blob(&data)?;
-        let entry = IndexEntry {
-            ctime: IndexTime::new(0, 0),
-            mtime: IndexTime::new(0, 0),
-            dev: 0,
-            ino: 0,
-            mode,
-            uid: 0,
-            gid: 0,
-            file_size: data.len() as u32,
-            id: blob_id,
-            flags: 0,
-            flags_extended: 0,
-            path: file.as_bytes().to_vec(),
-        };
-        index.add(&entry)?;
+        index.add(&entry_for(file, blob_id, mode, data.len()))?;
     }
     let tree_oid = index.write_tree_to(&repo)?;
     let tree = repo.find_tree(tree_oid)?;
@@ -150,17 +139,53 @@ pub fn run(
     Ok(())
 }
 
-/// The shadow baseline: the parentless commit `ortak init` recorded.
-fn root_commit(shadow: &Repository) -> Result<Commit<'_>> {
-    let mut c = shadow.head()?.peel_to_commit()?;
-    while let Ok(parent) = c.parent(0) {
-        c = parent;
+fn entry_for(path: &str, id: Oid, mode: u32, size: usize) -> IndexEntry {
+    IndexEntry {
+        ctime: IndexTime::new(0, 0),
+        mtime: IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: size as u32,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
     }
-    Ok(c)
+}
+
+/// The tree the replay starts from: each touched file as the base branch has
+/// it, copied into the shadow object database.
+///
+/// The shadow repository's own root is the workspace as `ortak init` found it,
+/// which drifts further from the base branch every day the workspace lives. A
+/// file another session created after init is missing there, so replaying onto
+/// it turned every later edit of that file into a phantom conflict.
+fn base_seed<'r>(
+    shadow: &'r Repository,
+    repo: &Repository,
+    base_tree: &Tree,
+    files: &[(String, String)],
+) -> Result<Commit<'r>> {
+    let mut index = git2::Index::new()?;
+    for (file, _) in files {
+        let Ok(entry) = base_tree.get_path(Path::new(file)) else {
+            continue; // the session created it; nothing to seed
+        };
+        let data = repo.find_blob(entry.id())?.content().to_vec();
+        let id = shadow.blob(&data)?;
+        index.add(&entry_for(file, id, entry.filemode() as u32, data.len()))?;
+    }
+    let tree = shadow.find_tree(index.write_tree_to(shadow)?)?;
+    let sig = Signature::now("ortak", "publish@ortak.local")?;
+    let oid = shadow.commit(None, &sig, &sig, "publish base", &tree, &[])?;
+    Ok(shadow.find_commit(oid)?)
 }
 
 /// Rebuild the workspace as if only this session had touched it, by replaying
-/// its own shadow micro-commits onto the baseline.
+/// its own shadow micro-commits onto the base branch's content.
 ///
 /// Each micro-commit changes exactly one file, so its diff against its own
 /// parent is precisely this session's change at that moment, even when the
@@ -168,8 +193,13 @@ fn root_commit(shadow: &Repository) -> Result<Commit<'_>> {
 /// three-way merge, which absorbs the line shifts a concurrent session causes.
 /// The gate keeps sessions `margin_lines` apart, which is why those shifts stay
 /// outside the patch context in practice.
-fn session_only_tree<'r>(shadow: &'r Repository, commits: &[String]) -> Result<Tree<'r>> {
-    let mut head = root_commit(shadow)?;
+fn session_only_tree<'r>(
+    shadow: &'r Repository,
+    seed: &Commit<'r>,
+    base_tree: &Tree,
+    commits: &[String],
+) -> Result<Tree<'r>> {
+    let mut head = seed.clone();
     let sig = Signature::now("ortak", "publish@ortak.local")?;
     for id in commits {
         let oid = Oid::from_str(id).with_context(|| format!("malformed shadow commit id {id}"))?;
@@ -184,6 +214,22 @@ fn session_only_tree<'r>(shadow: &'r Repository, commits: &[String]) -> Result<T
                 .filter_map(|c| c.our.or(c.their).or(c.ancestor))
                 .map(|e| String::from_utf8_lossy(&e.path).into_owned())
                 .collect();
+            // A file the base branch does not carry is not a content clash: this
+            // session built on another session's work that has not shipped yet.
+            let unshipped: Vec<&String> = paths
+                .iter()
+                .filter(|p| base_tree.get_path(Path::new(p)).is_err())
+                .collect();
+            if !unshipped.is_empty() {
+                bail!(
+                    "cannot publish {}: this session changed a file another session created, and that file is not on the base branch yet. Publish and merge the session that created it first, or pass --branch to build on top of its branch",
+                    unshipped
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             bail!(
                 "cannot replay this session's changes to {}: another session's edits sit too close to separate them automatically",
                 paths.join(", ")
@@ -225,16 +271,28 @@ mod tests {
         v.join("\n") + "\n"
     }
 
-    /// Commit `content` as the only file in the tree, on top of `parent`.
-    fn commit(repo: &Repository, parent: Option<&Commit>, content: &str) -> Oid {
-        let blob = repo.blob(content.as_bytes()).unwrap();
+    fn tree_with<'r>(repo: &'r Repository, content: Option<&str>) -> Tree<'r> {
         let mut tb = repo.treebuilder(None).unwrap();
-        tb.insert("app.py", blob, 0o100644).unwrap();
-        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        if let Some(c) = content {
+            let blob = repo.blob(c.as_bytes()).unwrap();
+            tb.insert("app.py", blob, 0o100644).unwrap();
+        }
+        repo.find_tree(tb.write().unwrap()).unwrap()
+    }
+
+    /// One shadow micro-commit: `content` as the only file, on top of `parent`.
+    fn commit(repo: &Repository, parent: Option<&Commit>, content: Option<&str>) -> Oid {
+        let tree = tree_with(repo, content);
         let sig = Signature::now("t", "t@t.t").unwrap();
         let parents: Vec<&Commit> = parent.into_iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, "e", &tree, &parents)
             .unwrap()
+    }
+
+    fn parentless<'r>(repo: &'r Repository, tree: &Tree) -> Commit<'r> {
+        let sig = Signature::now("t", "t@t.t").unwrap();
+        let oid = repo.commit(None, &sig, &sig, "base", tree, &[]).unwrap();
+        repo.find_commit(oid).unwrap()
     }
 
     fn file_in(tree: &Tree, repo: &Repository) -> String {
@@ -243,30 +301,40 @@ mod tests {
         String::from_utf8_lossy(blob.content()).into_owned()
     }
 
+    fn scratch(name: &str) -> (std::path::PathBuf, Repository) {
+        let dir = std::env::temp_dir().join(format!("ortak-replay-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repository::init(&dir).unwrap();
+        (dir, repo)
+    }
+
     /// Two sessions edit distant lines of one file, which the gate permits, and
     /// their micro-commits interleave. Replaying session A must reproduce only
     /// A's lines: publishing A's branch may not carry B's work.
     #[test]
     fn replay_excludes_a_concurrent_session() {
-        let dir = std::env::temp_dir().join(format!("ortak-replay-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let repo = Repository::init(&dir).unwrap();
-
-        let base = commit(&repo, None, &lines(&[]));
-        let base = repo.find_commit(base).unwrap();
-        let a1 = commit(&repo, Some(&base), &lines(&[(3, "AAA-first")]));
+        let (dir, repo) = scratch("concurrent");
+        let root = commit(&repo, None, Some(&lines(&[])));
+        let root = repo.find_commit(root).unwrap();
+        let a1 = commit(&repo, Some(&root), Some(&lines(&[(3, "AAA-first")])));
         let a1c = repo.find_commit(a1).unwrap();
-        let b1 = commit(&repo, Some(&a1c), &lines(&[(3, "AAA-first"), (30, "BBB")]));
+        let b1 = commit(
+            &repo,
+            Some(&a1c),
+            Some(&lines(&[(3, "AAA-first"), (30, "BBB")])),
+        );
         let b1c = repo.find_commit(b1).unwrap();
         // A edits again, on top of a tree that already contains B's line.
         let a2 = commit(
             &repo,
             Some(&b1c),
-            &lines(&[(3, "AAA-first"), (30, "BBB"), (5, "AAA-second")]),
+            Some(&lines(&[(3, "AAA-first"), (30, "BBB"), (5, "AAA-second")])),
         );
 
+        let base = tree_with(&repo, Some(&lines(&[])));
+        let seed = parentless(&repo, &base);
         let picks = vec![a1.to_string(), a2.to_string()];
-        let tree = session_only_tree(&repo, &picks).unwrap();
+        let tree = session_only_tree(&repo, &seed, &base, &picks).unwrap();
         let out = file_in(&tree, &repo);
 
         assert!(out.contains("AAA-first"), "A's first edit is missing");
@@ -279,13 +347,62 @@ mod tests {
     }
 
     #[test]
-    fn replay_of_nothing_is_the_baseline() {
-        let dir = std::env::temp_dir().join(format!("ortak-replay-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let repo = Repository::init(&dir).unwrap();
-        commit(&repo, None, &lines(&[]));
-        let tree = session_only_tree(&repo, &[]).unwrap();
+    fn replay_of_nothing_is_the_base_branch() {
+        let (dir, repo) = scratch("empty");
+        let base = tree_with(&repo, Some(&lines(&[])));
+        let seed = parentless(&repo, &base);
+        let tree = session_only_tree(&repo, &seed, &base, &[]).unwrap();
         assert_eq!(file_in(&tree, &repo), lines(&[]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One session creates a file, it ships, and a later session edits it. The
+    /// shadow root predates the file entirely, so replaying onto the root used
+    /// to fail; the base branch is what the branch is built on, so that is what
+    /// the replay has to start from.
+    #[test]
+    fn replay_handles_a_file_created_after_init() {
+        let (dir, repo) = scratch("after-init");
+        let root = commit(&repo, None, None); // app.py does not exist yet
+        let root = repo.find_commit(root).unwrap();
+        let created = commit(&repo, Some(&root), Some(&lines(&[(3, "AAA-created")])));
+        let created_c = repo.find_commit(created).unwrap();
+        let edited = commit(
+            &repo,
+            Some(&created_c),
+            Some(&lines(&[(3, "AAA-created"), (30, "BBB-edit")])),
+        );
+
+        // Session A's file has since been merged, so the base branch carries it.
+        let base = tree_with(&repo, Some(&lines(&[(3, "AAA-created")])));
+        let seed = parentless(&repo, &base);
+        let tree = session_only_tree(&repo, &seed, &base, &[edited.to_string()]).unwrap();
+        assert!(file_in(&tree, &repo).contains("BBB-edit"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same shape, except the file has not shipped. There is no branch to
+    /// publish for B on its own, so the error has to say which file and why.
+    #[test]
+    fn replay_reports_a_dependency_on_unshipped_work() {
+        let (dir, repo) = scratch("unshipped");
+        let root = commit(&repo, None, None);
+        let root = repo.find_commit(root).unwrap();
+        let created = commit(&repo, Some(&root), Some(&lines(&[(3, "AAA-created")])));
+        let created_c = repo.find_commit(created).unwrap();
+        let edited = commit(
+            &repo,
+            Some(&created_c),
+            Some(&lines(&[(3, "AAA-created"), (30, "BBB-edit")])),
+        );
+
+        let base = tree_with(&repo, None); // nothing shipped
+        let seed = parentless(&repo, &base);
+        let err = session_only_tree(&repo, &seed, &base, &[edited.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("app.py"), "{err}");
+        assert!(err.contains("not on the base branch"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
