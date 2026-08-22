@@ -96,6 +96,8 @@ enum HookEvent {
     PreEdit,
     /// Claude Code PostToolUse (Edit|Write|MultiEdit|NotebookEdit)
     PostEdit,
+    /// Claude Code PreToolUse (Bash): claim files the command writes
+    PreBash,
     /// Claude Code PostToolUse (Bash): error-reporting reminder
     PostBash,
     /// Claude Code UserPromptSubmit: hat durumu enjeksiyonu
@@ -112,6 +114,7 @@ fn main() {
             HookEvent::SessionStart => hooks::session_start(),
             HookEvent::PreEdit => hooks::pre_edit(),
             HookEvent::PostEdit => hooks::post_edit(),
+            HookEvent::PreBash => hooks::pre_bash(),
             HookEvent::PostBash => hooks::post_bash(),
             HookEvent::PromptContext => hooks::prompt_context(),
             HookEvent::SessionEnd => hooks::session_end(),

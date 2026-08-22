@@ -420,11 +420,54 @@ fn ranged(
 
 /// PostToolUse on Bash: when a command fails and the line is open, nudge the
 /// agent to report the error if it looks foreign. Bridges LLM forgetfulness.
+/// PreToolUse on Bash: claim whatever the command is about to write. The edit
+/// hooks cannot see a shell redirect or an in-place rewrite, so without this the
+/// daemon attributes that work to the human and the session publishes nothing.
+pub fn pre_bash() -> Result<()> {
+    let input = read_stdin_json()?;
+    let Ok(ws) = workspace_for(&input) else {
+        return Ok(());
+    };
+    let db = Db::open(&ws.db_path)?;
+    let external_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let harness = harness_for(&input);
+    let me = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
+    // ponytail: the claim covers every unhinted change until the command ends,
+    // so a human editor save during a long build lands on this session too.
+    // Coarse, but the alternative loses the agent's own work.
+    db.insert_hint(crate::db::BASH_CLAIM, me)?;
+    Ok(())
+}
+
 pub fn post_bash() -> Result<()> {
     let input = read_stdin_json()?;
     let Ok(ws) = workspace_for(&input) else {
         return Ok(());
     };
+    let db = Db::open(&ws.db_path)?;
+    let external_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let harness = harness_for(&input);
+    let me = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    )?;
+    // The command has finished, so whatever it wrote has already reached the
+    // daemon. Close the claim before the early returns below.
+    db.clear_bash_claim(me)?;
+
     let resp = input.get("tool_response").cloned().unwrap_or(Value::Null);
     let exit = resp
         .get("exit_code")
@@ -448,21 +491,9 @@ pub fn post_bash() -> Result<()> {
     {
         return Ok(());
     }
-    let db = Db::open(&ws.db_path)?;
     if !db.open_errors()?.is_empty() {
         return Ok(()); // line already stopped; prompt-context handles messaging
     }
-    let external_id = input
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let harness = harness_for(&input);
-    let me = db.upsert_session(
-        external_id,
-        &agent_name_for(external_id, harness),
-        "llm",
-        Some(harness),
-    )?;
     let context = format!(
         "ortak: the last command failed. Fix the error if your changes caused it. Report it if it \
          appears unrelated so ortak can assign an owner: \

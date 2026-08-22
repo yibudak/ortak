@@ -6,6 +6,9 @@ use std::time::Duration;
 
 /// Attribution hints older than this are considered stale (seconds).
 pub const HINT_TTL_SECS: i64 = 15;
+/// Reserved `hints.file` value for a session's open Bash claim. A
+/// workspace-relative path is never `*`, so it cannot collide with a real file.
+pub const BASH_CLAIM: &str = "*";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
 
@@ -180,6 +183,11 @@ impl Db {
             "UPDATE sessions SET status = 'done', ended_at = ?2 WHERE external_id = ?1",
             params![external_id, now_ts()],
         )?;
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND session_id IN
+             (SELECT id FROM sessions WHERE external_id = ?2)",
+            params![BASH_CLAIM, external_id],
+        )?;
         Ok(())
     }
 
@@ -262,6 +270,9 @@ impl Db {
     }
 
     /// Consume the freshest non-stale hint for a file, clearing all hints on it.
+    /// Falls back to an open Bash claim: the harness hooks cover the edit tools
+    /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
+    /// the daemon unattributed and would otherwise land on the human session.
     pub fn take_hint(&self, file: &str) -> Result<Option<i64>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
@@ -275,10 +286,37 @@ impl Db {
             .optional()?;
         self.conn
             .execute("DELETE FROM hints WHERE file = ?1", params![file])?;
-        // Opportunistic purge of stale hints on other files.
-        self.conn
-            .execute("DELETE FROM hints WHERE ts < ?1", params![cutoff])?;
-        Ok(hit)
+        // Opportunistic purge of stale hints on other files. Claims are exempt:
+        // a build or a test run outlives the TTL, and `post-bash` closes them.
+        self.conn.execute(
+            "DELETE FROM hints WHERE ts < ?1 AND file != ?2",
+            params![cutoff, BASH_CLAIM],
+        )?;
+        if hit.is_some() {
+            return Ok(hit);
+        }
+        // A claim is not consumed: one command can write many files. Ending the
+        // session retires it, so a harness that dies mid-command cannot leave
+        // one standing.
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
+                 WHERE h.file = ?1 AND s.status = 'active'
+                 ORDER BY h.ts DESC LIMIT 1",
+                params![BASH_CLAIM],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Close a session's Bash claim once its command has finished.
+    pub fn clear_bash_claim(&self, session_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND session_id = ?2",
+            params![BASH_CLAIM, session_id],
+        )?;
+        Ok(())
     }
 
     // ---- edits ----------------------------------------------------------
@@ -645,4 +683,54 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: r.get(6)?,
         started_at: r.get(7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "ortak-db-test-{}-{}.sqlite",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&path);
+        Db::open(&path).unwrap()
+    }
+
+    #[test]
+    fn a_bash_claim_attributes_an_unhinted_write() {
+        let db = temp_db("claim");
+        let human = db.ensure_human().unwrap();
+        let agent = db
+            .upsert_session("sess-a", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+
+        // Nothing claimed: this is where the work used to fall through to human.
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+
+        db.insert_hint(BASH_CLAIM, agent).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(agent));
+        // The claim survives, because one command can write many files.
+        assert_eq!(db.take_hint("src/y.rs").unwrap(), Some(agent));
+
+        // A hint from the edit hooks still outranks the claim.
+        db.insert_hint("src/z.rs", human).unwrap();
+        assert_eq!(db.take_hint("src/z.rs").unwrap(), Some(human));
+
+        db.clear_bash_claim(agent).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn ending_a_session_retires_its_claim() {
+        let db = temp_db("end");
+        let agent = db
+            .upsert_session("sess-b", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, agent).unwrap();
+        db.end_session("sess-b").unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+    }
 }
