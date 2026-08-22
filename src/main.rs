@@ -176,11 +176,20 @@ fn run(cli: Cli) -> Result<()> {
 fn init() -> Result<()> {
     let root = std::env::current_dir()?;
     let ws = Workspace::at(&root);
-    if ws.ortak_dir.exists() {
+    let existed = ws.ortak_dir.exists();
+    std::fs::create_dir_all(&ws.ortak_dir)?;
+    // .ortak holds the SQLite database and the shadow repository, so it is never
+    // committed. Ignoring it from the inside keeps it out of `git status` without
+    // editing the project's own .gitignore. Written before the early return so an
+    // existing workspace picks it up by re-running init.
+    let ignore = ws.ortak_dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "*\n")?;
+    }
+    if existed {
         println!("already initialized: {}", ws.ortak_dir.display());
         return Ok(());
     }
-    std::fs::create_dir_all(&ws.ortak_dir)?;
     if !ws.config_path.exists() {
         std::fs::write(&ws.config_path, Config::default_toml())?;
         println!("wrote: {}", ws.config_path.display());
