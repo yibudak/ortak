@@ -115,11 +115,10 @@ pub fn run(
 
     let branch_name = match branch_override {
         Some(b) => b.to_string(),
-        None => format!(
-            "{}ortak-{}-{}",
-            cfg.publish.branch_prefix,
+        None => branch_name_for(
+            &cfg.publish.branch_prefix,
             session.id,
-            slug(&intent)
+            session.task_intent.as_deref(),
         ),
     };
     repo.branch(&branch_name, &repo.find_commit(commit_oid)?, false)
@@ -160,6 +159,16 @@ pub fn run(
     Ok(())
 }
 
+/// Generated branch name. A session that never ran `ortak intent` has no words
+/// to slug, and slugging the placeholder intent instead produced branches named
+/// `task/ortak-3-ortak-task-ortak-3`.
+fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
+    match intent.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(task) => format!("{}ortak-{}-{}", prefix, id, slug(task)),
+        None => format!("{}ortak-{}", prefix, id),
+    }
+}
+
 fn slug(text: &str) -> String {
     let mut out = String::new();
     for c in text.chars().take(48) {
@@ -174,5 +183,20 @@ fn slug(text: &str) -> String {
         "task".into()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_without_intent_gets_a_plain_branch_name() {
+        assert_eq!(branch_name_for("task/", 3, None), "task/ortak-3");
+        assert_eq!(branch_name_for("task/", 3, Some("  ")), "task/ortak-3");
+        assert_eq!(
+            branch_name_for("task/", 3, Some("Implement the login page")),
+            "task/ortak-3-implement-the-login-page"
+        );
     }
 }
