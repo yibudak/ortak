@@ -41,11 +41,14 @@ fn harness_for(input: &Value) -> &'static str {
 }
 
 /// Short, human-readable agent name derived from the harness session id.
+/// Eight characters, because this name is how a denial message, a status row
+/// and a published branch tell two sessions apart; four collide readily
+/// (`sess-A` and `sess-B` both became `claude-sess`).
 fn agent_name_for(external_id: &str, harness: &str) -> String {
     let short: String = external_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
-        .take(4)
+        .take(8)
         .collect();
     let prefix = if harness == "codex" {
         "codex"
@@ -547,6 +550,14 @@ pub fn session_end() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_from_one_harness_get_distinct_names() {
+        // Real Claude Code session ids share a generous prefix length.
+        let a = agent_name_for("63a2d8fa-3038-4728-874c-be1a21b07aab", "claude-code");
+        let b = agent_name_for("63a2d8fb-1111-4728-874c-be1a21b07aab", "claude-code");
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn detects_codex_from_apply_patch_and_transcript() {
