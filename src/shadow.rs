@@ -41,6 +41,15 @@ fn write_excludes(ws: &Workspace, cfg: &Config) -> Result<()> {
         ".ortak/".to_string(),
         ".git/".to_string(),
         "ortak.toml".to_string(),
+        // Without these, a project that has no .gitignore gets its dependency
+        // and build directories journaled, and re-committed to the shadow repo
+        // on every save. [workspace] ignore is appended below, so `!target/`
+        // and the like can put one back.
+        "node_modules/".to_string(),
+        "target/".to_string(),
+        "__pycache__/".to_string(),
+        ".venv/".to_string(),
+        "venv/".to_string(),
     ];
     lines.extend(cfg.workspace.ignore.iter().cloned());
     std::fs::write(info.join("exclude"), lines.join("\n") + "\n")?;
