@@ -55,6 +55,22 @@ fn agent_name_for(external_id: &str, harness: &str) -> String {
     format!("{}-{}", prefix, short)
 }
 
+/// The gate compares an edit against regions the daemon records, so a stopped
+/// daemon means nothing is journaled and nothing is protected. Staying silent
+/// then reads exactly like "no conflicts", which is the wrong thing to believe.
+fn daemon_warning(db: &Db) -> Option<String> {
+    let tail = match db.heartbeat_age() {
+        Ok(Some(age)) if age <= crate::db::HEARTBEAT_ALIVE_SECS => return None,
+        Ok(Some(age)) => format!("last heartbeat {age}s ago"),
+        _ => "it has not run in this workspace".to_string(),
+    };
+    Some(format!(
+        "ortak WARNING: the ortak daemon is not running ({tail}). Nothing is being journaled, \
+         the conflict gate cannot see other sessions' work, and `ortak publish` will have nothing \
+         to publish. Start it with `ortak daemon` before editing shared files."
+    ))
+}
+
 pub fn session_start() -> Result<()> {
     let input = read_stdin_json()?;
     let ws = workspace_for(&input)?;
@@ -76,6 +92,10 @@ pub fn session_start() -> Result<()> {
          Before editing, record your task intent: `ortak intent ortak-{id} \"<one-sentence task>\"`. \
          Publish your changes as a branch and PR with: `ortak publish ortak-{id}`."
     );
+    let context = match daemon_warning(&db) {
+        Some(w) => format!("{context}\n\n{w}"),
+        None => context,
+    };
     let out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -484,8 +504,15 @@ pub fn prompt_context() -> Result<()> {
         return Ok(());
     };
     let db = Db::open(&ws.db_path)?;
+    let warning = daemon_warning(&db);
     let open = db.open_errors()?;
     if open.is_empty() {
+        if let Some(w) = warning {
+            let out = serde_json::json!({
+                "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": w }
+            });
+            println!("{}", out);
+        }
         return Ok(());
     }
     let external_id = input
@@ -526,6 +553,10 @@ pub fn prompt_context() -> Result<()> {
             e.responsible(),
             e.responsible_name()
         )
+    };
+    let context = match warning {
+        Some(w) => format!("{w}\n\n{context}"),
+        None => context,
     };
     let out = serde_json::json!({
         "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": context }
