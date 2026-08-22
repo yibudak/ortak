@@ -104,7 +104,20 @@ enum HookEvent {
     SessionEnd,
 }
 
+/// Rust ignores SIGPIPE, so the first `println!` after a closed pipe panics with
+/// "failed printing to stdout" instead of the command simply ending. `ortak log
+/// | head` is an ordinary thing to type.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: sets a signal disposition before any thread is spawned.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() {
+    restore_sigpipe();
     let cli = Cli::parse();
     // Hook adapters must never break the agent's session: swallow errors, exit 0.
     if let Command::Hook { event } = &cli.command {

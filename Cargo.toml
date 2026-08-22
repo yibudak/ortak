@@ -10,6 +10,7 @@ anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 git2 = "0.20"
+libc = "0.2"
 notify = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
