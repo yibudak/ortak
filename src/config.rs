@@ -114,8 +114,10 @@ pub struct PublishCfg {
     pub base_branch: String,
     #[serde(default = "default_branch_prefix")]
     pub branch_prefix: String,
-    #[serde(default = "default_remote")]
-    pub remote: String,
+    /// Optional, and usually unset: the push remote differs per clone, so it is
+    /// normally read from `ortak.remote` in git config. See `publish::remote_for`.
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 fn default_base_branch() -> String {
@@ -124,16 +126,12 @@ fn default_base_branch() -> String {
 fn default_branch_prefix() -> String {
     "task/".into()
 }
-fn default_remote() -> String {
-    "origin".into()
-}
-
 impl Default for PublishCfg {
     fn default() -> Self {
         PublishCfg {
             base_branch: default_base_branch(),
             branch_prefix: default_branch_prefix(),
-            remote: default_remote(),
+            remote: None,
         }
     }
 }
@@ -161,8 +159,9 @@ ignore = []
 base_branch = "main"
 # Prefix for generated branch names
 branch_prefix = "task/"
-# Remote used for pushes
-remote = "origin"
+# Remote used for pushes. Leave it unset: the remote differs per clone, so set
+# yours with `git config ortak.remote <name>`. Defaults to origin.
+# remote = "origin"
 
 [gate]
 # Reject edits inside another session's active region

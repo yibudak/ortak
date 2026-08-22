@@ -68,4 +68,6 @@ ortak resolved ortak-2
 ortak publish ortak-2 --push
 ```
 
-Publishing requires a Git repository with at least one commit and a configured remote.
+Publishing requires a Git repository with at least one commit and a configured remote. It
+pushes to `origin` unless you point it elsewhere with `git config ortak.remote <name>`,
+which stays in your clone rather than in the committed `ortak.toml`.

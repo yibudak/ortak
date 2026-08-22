@@ -144,7 +144,7 @@ pub fn run(
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&ws.root)
-            .args(["push", "-u", &cfg.publish.remote, &branch_name])
+            .args(["push", "-u", &remote_for(&repo, cfg), &branch_name])
             .status()?;
         if !status.success() {
             bail!("git push failed");
@@ -158,6 +158,18 @@ pub fn run(
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
     }
     Ok(())
+}
+
+/// The push remote: `ortak.remote` in git config, then ortak.toml, then origin.
+/// One contributor pushes to a fork while another pushes to upstream, so this is
+/// a per-clone setting; git config is where per-clone settings already live, and
+/// it survives the `.ortak` wipes that resetting a workspace involves.
+fn remote_for(repo: &Repository, cfg: &Config) -> String {
+    repo.config()
+        .and_then(|c| c.get_string("ortak.remote"))
+        .ok()
+        .or_else(|| cfg.publish.remote.clone())
+        .unwrap_or_else(|| "origin".to_string())
 }
 
 fn slug(text: &str) -> String {
@@ -174,5 +186,34 @@ fn slug(text: &str) -> String {
         "task".into()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_resolution_order() {
+        let dir = std::env::temp_dir().join(format!("ortak-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = Config::default();
+
+        // Nothing configured anywhere.
+        assert_eq!(remote_for(&repo, &cfg), "origin");
+
+        // ortak.toml alone still works, for anyone already relying on it.
+        cfg.publish.remote = Some("upstream".into());
+        assert_eq!(remote_for(&repo, &cfg), "upstream");
+
+        // git config wins: it is the per-clone setting.
+        repo.config()
+            .unwrap()
+            .set_str("ortak.remote", "fork")
+            .unwrap();
+        assert_eq!(remote_for(&repo, &cfg), "fork");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
