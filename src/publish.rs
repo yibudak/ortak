@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::db::Db;
 use crate::workspace::Workspace;
-use anyhow::{bail, Context, Result};
-use git2::{BranchType, IndexEntry, IndexTime, Repository, Signature};
+use anyhow::{anyhow, bail, Context, Result};
+use git2::{BranchType, Commit, IndexEntry, IndexTime, Repository, Signature};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -42,18 +42,7 @@ pub fn run(
             ws.root.display()
         )
     })?;
-    let base_commit = match repo.find_branch(&cfg.publish.base_branch, BranchType::Local) {
-        Ok(b) => b.get().peel_to_commit()?,
-        Err(_) => repo
-            .head()
-            .and_then(|h| h.peel_to_commit())
-            .with_context(|| {
-                format!(
-                    "base branch '{}' does not exist and HEAD could not be resolved; the repository needs at least one commit",
-                    cfg.publish.base_branch
-                )
-            })?,
-    };
+    let base_commit = base_commit_for(&repo, &cfg.publish.base_branch)?;
 
     // Build the branch tree in an in-memory index: base tree + session files.
     let mut index = git2::Index::new()?;
@@ -160,6 +149,31 @@ pub fn run(
     Ok(())
 }
 
+/// The commit a published branch is built on.
+///
+/// Falling back to HEAD when the configured branch is missing looked harmless
+/// until you notice what HEAD is in a shared workspace: whatever branch the
+/// tree happens to sit on, which may be another session's task branch. A repo
+/// whose trunk is `master` published every task off HEAD and still printed
+/// `--base main`.
+fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
+    repo.find_branch(base, BranchType::Local)
+        .and_then(|b| b.get().peel_to_commit())
+        .map_err(|_| {
+            let head = repo
+                .head()
+                .ok()
+                .and_then(|h| h.shorthand().map(String::from))
+                .map(|h| format!(" (HEAD is on '{h}')"))
+                .unwrap_or_default();
+            anyhow!(
+                "base branch '{}' does not exist in this repository{}. Set [publish] base_branch in ortak.toml to the branch these tasks merge into",
+                base,
+                head
+            )
+        })
+}
+
 fn slug(text: &str) -> String {
     let mut out = String::new();
     for c in text.chars().take(48) {
@@ -174,5 +188,34 @@ fn slug(text: &str) -> String {
         "task".into()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_base_branch_is_an_error_not_a_guess() {
+        let dir = std::env::temp_dir().join(format!("ortak-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Default branch `master`, the way plenty of repositories still are.
+        let repo = Repository::init_opts(
+            &dir,
+            git2::RepositoryInitOptions::new().initial_head("master"),
+        )
+        .unwrap();
+        let sig = Signature::now("t", "t@t.t").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+
+        assert!(base_commit_for(&repo, "master").is_ok());
+        let err = base_commit_for(&repo, "main").unwrap_err().to_string();
+        assert!(err.contains("'main' does not exist"), "{err}");
+        assert!(err.contains("HEAD is on 'master'"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
