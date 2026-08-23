@@ -57,12 +57,28 @@ ortak publish ortak-N          # create the branch in the local repository
 ortak publish ortak-N --push   # push the branch; use the printed tea command to open a PR
 ```
 
+## Tell the other sessions what changed under them
+
+When you change something another session depends on, such as a function
+signature, a schema, or a file you are rewriting, say so. The message reaches
+the other session at the start of its next turn, so it does not find out from a
+broken build:
+
+```bash
+ortak tell ortak-3 "I renamed take_hint to peek_snapshots, your daemon call needs updating" --from ortak-N
+ortak tell all "publish.rs is mid-refactor, do not start anything there" --from ortak-N
+```
+
+Pass `--from ortak-N` with your own session id, or the message arrives as if a
+person sent it. Read what you have been sent with `ortak inbox ortak-N`.
+
 ## Useful commands
 
 ```bash
 ortak status        # daemon and sessions
 ortak log           # recent journal entries and their owners
 ortak log --session ortak-N
+ortak inbox ortak-N # messages other sessions sent you
 ```
 
 Check `ortak log` before changing unexpected content in a file. Another session may own that change.

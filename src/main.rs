@@ -51,6 +51,21 @@ enum Command {
         /// Task description
         text: Vec<String>,
     },
+    /// Send a message to another session, or to all of them
+    Tell {
+        /// Recipient: ortak-3, an agent name, or "all"
+        to: String,
+        /// Message text
+        text: Vec<String>,
+        /// Sending session (default: the human session)
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Show the messages a session has been sent
+    Inbox {
+        /// Session reference (ortak-3)
+        session: String,
+    },
     /// Publish a session's net changes as a branch
     Publish {
         /// Session reference (ortak-3, human, or agent name)
@@ -139,6 +154,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Log { session, limit } => log(session.as_deref(), limit),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
+        Command::Tell { to, text, from } => tell(&to, &text.join(" "), from.as_deref()),
+        Command::Inbox { session } => inbox(&session),
         Command::Publish {
             session,
             branch,
@@ -275,5 +292,54 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     let session = db.resolve_session(session_ref)?;
     db.set_intent(session.id, text)?;
     println!("recorded intent for ortak-{}: {}", session.id, text);
+    Ok(())
+}
+
+fn tell(to: &str, text: &str, from: Option<&str>) -> Result<()> {
+    if text.is_empty() {
+        anyhow::bail!("nothing to send; give the message as the remaining arguments");
+    }
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    // No sender named means a person at a terminal typed this.
+    let sender = match from {
+        Some(r) => db.resolve_session(r)?.id,
+        None => db.ensure_human()?,
+    };
+    if to == "all" {
+        match db.broadcast_message(sender, text)? {
+            0 => println!("no other active sessions; nothing was sent."),
+            1 => println!("sent to 1 other active session."),
+            n => println!("sent to {} other active sessions.", n),
+        }
+        return Ok(());
+    }
+    let recipient = db.resolve_session(to)?;
+    db.send_message(sender, recipient.id, text)?;
+    println!(
+        "sent to ortak-{} {}; it arrives at the start of that session's next turn.",
+        recipient.id, recipient.agent_name
+    );
+    Ok(())
+}
+
+fn inbox(session_ref: &str) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    let session = db.resolve_session(session_ref)?;
+    let messages = db.inbox(session.id)?;
+    if messages.is_empty() {
+        println!("ortak-{} has no messages.", session.id);
+        return Ok(());
+    }
+    for m in messages {
+        let t = chrono::DateTime::from_timestamp(m.ts, 0)
+            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        println!(
+            "[{}] ortak-{} {}: {}",
+            t, m.from_session, m.from_name, m.text
+        );
+    }
     Ok(())
 }
