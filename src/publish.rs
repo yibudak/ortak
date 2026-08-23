@@ -49,6 +49,16 @@ pub fn run(
         }
     }
 
+    // Before the work that can fail, not after the success that does not need
+    // it: the publish that dies on the earlier task's lines is the one that has
+    // to hear which branch to stack on.
+    if let Some(p) = previous.as_ref().filter(|p| !all && p.branch != base) {
+        eprintln!(
+            "ortak-{}'s earlier work is on {}; if this publish cannot separate the two, pass --base {} to stack this branch on it.",
+            session.id, p.branch, p.branch
+        );
+    }
+
     // Layer 0 has no gate, so overlapping edits are possible; surface them.
     let file_names: Vec<String> = files.iter().map(|(f, _)| f.clone()).collect();
     let overlaps = db.overlapping_sessions(session.id, &file_names)?;
@@ -163,14 +173,6 @@ pub fn run(
     );
     for (f, k) in &files {
         println!("  {} {}", k, f);
-    }
-    // A file touched by both tasks ships whole, so a branch built on the plain
-    // base carries the earlier task's changes to it as well.
-    if let Some(p) = previous.filter(|p| !all && p.branch != base) {
-        println!(
-            "\nortak-{}'s earlier work is on {}; pass --base {} to stack this branch on it.",
-            session.id, p.branch, p.branch
-        );
     }
 
     if push {
