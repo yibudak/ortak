@@ -208,6 +208,14 @@ fn intended_content(base: &[u8], tool_name: &str, tool_input: &Value) -> Option<
 
 /// PreToolUse gate: deny an edit that targets another active session's hot
 /// region. Deterministic first-toucher-wins; on any doubt or error, allow.
+///
+/// This is also the door messages arrive through. `UserPromptSubmit` fires when
+/// a person types, and an agent working through a brief types once and then
+/// runs for an hour, so everything sent in that hour waited for a turn that
+/// never came. PreToolUse fires before every edit instead, and the harness
+/// shows `additionalContext` whether the call is allowed or denied, so a
+/// message reaches a working session without the gate having to deny anything
+/// in order to say it.
 pub fn pre_edit() -> Result<()> {
     let input = read_stdin_json()?;
     let cwd_ws = workspace_for(&input).ok();
@@ -225,27 +233,78 @@ pub fn pre_edit() -> Result<()> {
     let mut groups = group_by_workspace(cwd_ws.as_ref(), &target_paths(tool_name, &tool_input));
     // The session's own workspace answers even when the call targets nothing in
     // it, so a stopped line there still holds the session still.
-    if let Some(ws) = cwd_ws {
+    if let Some(ws) = cwd_ws.clone() {
         if !groups.iter().any(|(w, _)| w.root == ws.root) {
             groups.push((ws, Vec::new()));
         }
     }
-    for (ws, files) in groups {
-        let Some(reason) = verdict(&ws, external_id, harness, &files, tool_name, &tool_input)?
-        else {
-            continue;
-        };
-        let out = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        });
+    let mut denial = None;
+    for (ws, files) in &groups {
+        if let Some(reason) = verdict(ws, external_id, harness, files, tool_name, &tool_input)? {
+            denial = Some(reason);
+            break;
+        }
+    }
+    // Drained after the ruling, not before: `take_messages` stamps a row
+    // delivered, and a run that errors on its way to the verdict prints
+    // nothing. Draining first would mark a message handed over that nobody
+    // ever saw.
+    let waiting = match &cwd_ws {
+        Some(ws) => {
+            let db = Db::open(&ws.db_path)?;
+            let me = db.upsert_session(
+                external_id,
+                &agent_name_for(external_id, harness),
+                "llm",
+                Some(harness),
+            )?;
+            pending_messages(&db, me)?
+        }
+        None => None,
+    };
+    if let Some(out) = pre_tool_use_output(denial, waiting) {
         println!("{}", out);
-        return Ok(());
     }
     Ok(())
+}
+
+/// One PreToolUse answer: a denial, a message, both, or nothing at all.
+///
+/// The denial keeps the text the gate wrote, and a message rides beside it in
+/// `additionalContext` rather than inside it, so an already dense denial does
+/// not get denser. A message on its own carries no `permissionDecision`, which
+/// leaves the edit to the harness exactly as if this hook had said nothing.
+fn pre_tool_use_output(denial: Option<String>, waiting: Option<String>) -> Option<Value> {
+    if denial.is_none() && waiting.is_none() {
+        return None;
+    }
+    let mut hook = serde_json::json!({ "hookEventName": "PreToolUse" });
+    if let Some(reason) = denial {
+        hook["permissionDecision"] = Value::from("deny");
+        hook["permissionDecisionReason"] = Value::from(reason);
+    }
+    if let Some(block) = waiting {
+        hook["additionalContext"] = Value::from(block);
+    }
+    Some(serde_json::json!({ "hookSpecificOutput": hook }))
+}
+
+/// Whatever this session has been sent and not yet been handed, as one block.
+/// `take_messages` stamps every row delivered, so whichever door opens first
+/// hands the message over and the others stay quiet about it.
+fn pending_messages(db: &Db, me: i64) -> Result<Option<String>> {
+    let waiting = db.take_messages(me)?;
+    if waiting.is_empty() {
+        return Ok(None);
+    }
+    let mut block = String::from("ortak MESSAGES from other sessions in this workspace:");
+    for m in &waiting {
+        block.push_str(&format!(
+            "\n- ortak-{} {}: {}",
+            m.from_session, m.from_name, m.text
+        ));
+    }
+    Ok(Some(block))
 }
 
 /// One workspace's ruling on a tool call. `Some(reason)` denies the edit;
@@ -553,6 +612,12 @@ pub fn pre_bash() -> Result<()> {
     // so a human editor save during a long build lands on this session too.
     // Coarse, but the alternative loses the agent's own work.
     db.insert_hint(crate::db::BASH_CLAIM, me, None)?;
+    // A session can go a long way between edits while it reads, greps and runs
+    // tests, and a message that waits for the next edit can wait that long.
+    // Bash is the call an agent makes constantly, so it opens the same door.
+    if let Some(out) = pre_tool_use_output(None, pending_messages(&db, me)?) {
+        println!("{}", out);
+    }
     Ok(())
 }
 
@@ -643,17 +708,10 @@ pub fn prompt_context() -> Result<()> {
         parts.push(warning);
     }
 
-    // Messages ride this hook so one session's news reaches the other at the
-    // top of its next turn, with nobody polling for it.
-    let waiting = db.take_messages(me)?;
-    if !waiting.is_empty() {
-        let mut block = String::from("ortak MESSAGES from other sessions in this workspace:");
-        for m in &waiting {
-            block.push_str(&format!(
-                "\n- ortak-{} {}: {}",
-                m.from_session, m.from_name, m.text
-            ));
-        }
+    // The original door, and still the one a person typing comes through. The
+    // edit and Bash hooks drain the same queue, so a message already handed to
+    // this session mid-task does not arrive a second time here.
+    if let Some(block) = pending_messages(&db, me)? {
         parts.push(block);
     }
 
@@ -737,6 +795,48 @@ mod tests {
         let a = agent_name_for("63a2d8fa-3038-4728-874c-be1a21b07aab", "claude-code");
         let b = agent_name_for("63a2d8fb-1111-4728-874c-be1a21b07aab", "claude-code");
         assert_ne!(a, b);
+    }
+
+    /// A denial's text is the gate's own, and a waiting message rides beside it
+    /// rather than inside it. The case that matters most is a message with no
+    /// denial: it must not carry a permission decision, or delivering the news
+    /// would block the edit it was delivered before.
+    #[test]
+    fn a_message_rides_beside_a_denial_without_becoming_one() {
+        assert!(pre_tool_use_output(None, None).is_none(), "nothing to say");
+
+        let msg = "ortak MESSAGES from other sessions in this workspace:\n\
+                   - ortak-3 claude-75c62662: db.rs is mid-refactor";
+        let alone = pre_tool_use_output(None, Some(msg.to_string())).expect("a message is output");
+        assert_eq!(alone["hookSpecificOutput"]["additionalContext"], msg);
+        assert!(
+            alone["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none(),
+            "delivering a message must leave the edit alone"
+        );
+
+        let denied = pre_tool_use_output(Some("the ortak gate denied this edit".into()), None)
+            .expect("a denial is output");
+        assert_eq!(denied["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            denied["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_none(),
+            "a quiet queue adds nothing to a denial"
+        );
+
+        let both = pre_tool_use_output(
+            Some("the ortak gate denied this edit".into()),
+            Some(msg.to_string()),
+        )
+        .expect("both are output");
+        assert_eq!(
+            both["hookSpecificOutput"]["permissionDecisionReason"],
+            "the ortak gate denied this edit",
+            "the denial reads as the gate wrote it"
+        );
+        assert_eq!(both["hookSpecificOutput"]["additionalContext"], msg);
     }
 
     #[test]
