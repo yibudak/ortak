@@ -68,6 +68,23 @@ ortak resolved ortak-2
 ortak publish ortak-2 --push
 ```
 
-Publishing requires a Git repository with at least one commit and a configured remote. It
-pushes to `origin` unless you point it elsewhere with `git config ortak.remote <name>`,
-which stays in your clone rather than in the committed `ortak.toml`.
+Publishing requires a Git repository with at least one commit and a configured remote.
+
+### Where `ortak publish --push` pushes
+
+To `origin`, unless you say otherwise. Set your own remote once per clone:
+
+```bash
+git config ortak.remote my-fork
+```
+
+Anyone contributing through a fork has to do this before the first `--push`, or the push
+goes to the upstream they cannot write to. It is the one setup step nothing prompts you
+for.
+
+The setting lives in git config rather than in `ortak.toml` because the right remote
+differs per clone. One contributor pushes to a fork, another has commit rights and pushes
+to upstream, and both are working in the same repository. `ortak.toml` is shared and
+committed, so it is the wrong place for an answer that is different for each person
+holding a checkout. `ortak.toml` still accepts a `remote` key for a team that genuinely
+does share one, and git config wins where both are set.
