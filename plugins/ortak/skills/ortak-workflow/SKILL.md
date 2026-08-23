@@ -72,6 +72,17 @@ ortak tell all "publish.rs is mid-refactor, do not start anything there" --from 
 Pass `--from ortak-N` with your own session id, or the message arrives as if a
 person sent it. Read what you have been sent with `ortak inbox ortak-N`.
 
+The message goes through your shell first. When it contains backticks, quotes
+or newlines, which is most messages worth sending, pass `--stdin` and pipe the
+body in so the shell leaves it alone:
+
+```bash
+ortak tell ortak-3 --from ortak-N --stdin <<'EOF'
+take_hint now returns Option<(i64, Attribution)>; your `process()` call needs
+the second field.
+EOF
+```
+
 ## Useful commands
 
 ```bash

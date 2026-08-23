@@ -60,6 +60,9 @@ enum Command {
         /// Sending session (default: the human session)
         #[arg(long)]
         from: Option<String>,
+        /// Read the message from standard input instead of the arguments
+        #[arg(long)]
+        stdin: bool,
     },
     /// Show the messages a session has been sent
     Inbox {
@@ -154,7 +157,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Log { session, limit } => log(session.as_deref(), limit),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
-        Command::Tell { to, text, from } => tell(&to, &text.join(" "), from.as_deref()),
+        Command::Tell {
+            to,
+            text,
+            from,
+            stdin,
+        } => tell(&to, &text, from.as_deref(), stdin),
         Command::Inbox { session } => inbox(&session),
         Command::Publish {
             session,
@@ -295,9 +303,27 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn tell(to: &str, text: &str, from: Option<&str>) -> Result<()> {
+fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()> {
+    // The messages worth sending are the ones with a signature, a path or a
+    // command in them, and the shell rewrites exactly those before ortak sees
+    // a word of it: backticks get substituted, quotes get eaten, newlines
+    // split the argument list. --stdin takes the body as it was written.
+    let text = if stdin {
+        if !text.is_empty() {
+            anyhow::bail!(
+                "--stdin reads the message from standard input; do not also pass it as arguments"
+            );
+        }
+        std::io::read_to_string(std::io::stdin())?
+            .trim()
+            .to_string()
+    } else {
+        text.join(" ")
+    };
     if text.is_empty() {
-        anyhow::bail!("nothing to send; give the message as the remaining arguments");
+        anyhow::bail!(
+            "nothing to send; give the message as the remaining arguments, or pass --stdin"
+        );
     }
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
@@ -307,7 +333,7 @@ fn tell(to: &str, text: &str, from: Option<&str>) -> Result<()> {
         None => db.ensure_human()?,
     };
     if to == "all" {
-        match db.broadcast_message(sender, text)? {
+        match db.broadcast_message(sender, &text)? {
             0 => println!("no other active sessions; nothing was sent."),
             1 => println!("sent to 1 other active session."),
             n => println!("sent to {} other active sessions.", n),
@@ -315,7 +341,7 @@ fn tell(to: &str, text: &str, from: Option<&str>) -> Result<()> {
         return Ok(());
     }
     let recipient = db.resolve_session(to)?;
-    db.send_message(sender, recipient.id, text)?;
+    db.send_message(sender, recipient.id, &text)?;
     println!(
         "sent to ortak-{} {}; it arrives at the start of that session's next turn.",
         recipient.id, recipient.agent_name
