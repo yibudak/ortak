@@ -338,26 +338,47 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Other sessions that also touched any of the given files.
-    pub fn overlapping_sessions(
-        &self,
-        session_id: i64,
-        files: &[String],
-    ) -> Result<Vec<(String, String)>> {
-        let mut out = Vec::new();
+    /// Every shadow micro-commit this session recorded with the file it touched,
+    /// oldest first. Publishing replays these to rebuild the session's own
+    /// content, so the full history matters here where `session_files` only
+    /// needs each file's final state. The file comes along so a publish can
+    /// leave one out of the replay as well as out of the branch.
+    pub fn session_commits(&self, session_id: i64) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT s.agent_name FROM edits e JOIN sessions s ON s.id = e.session_id
-             WHERE e.file = ?1 AND e.session_id != ?2",
+            "SELECT shadow_commit, file FROM edits
+             WHERE session_id = ?1 AND shadow_commit IS NOT NULL
+             ORDER BY id",
         )?;
-        for f in files {
-            let others = stmt
-                .query_map(params![f, session_id], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for o in others {
-                out.push((f.clone(), o));
-            }
-        }
-        Ok(out)
+        let rows = stmt.query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The shadow micro-commit behind a session's newest edit to a file: the
+    /// last content that session is known to have put there.
+    pub fn last_commit_for(&self, session_id: i64, file: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT shadow_commit FROM edits
+                 WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, file],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Whether any other session has journaled an edit to this file.
+    pub fn shared_file(&self, session_id: i64, file: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM edits WHERE file = ?1 AND session_id != ?2 LIMIT 1",
+                params![file, session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn edit_count(&self, session_id: i64) -> Result<i64> {
