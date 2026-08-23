@@ -264,9 +264,14 @@ fn log(session: Option<&str>, limit: u32) -> Result<()> {
         let t = chrono::DateTime::from_timestamp(e.ts, 0)
             .map(|d| d.format("%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
+        let how = if e.inferred() {
+            ", inferred from a running command"
+        } else {
+            ""
+        };
         println!(
-            "[{}] {:6} {} - {} (ortak-{})",
-            t, e.change_kind, e.file, e.agent_name, e.session_id
+            "[{}] {:6} {} - {} (ortak-{}{})",
+            t, e.change_kind, e.file, e.agent_name, e.session_id, how
         );
     }
     Ok(())

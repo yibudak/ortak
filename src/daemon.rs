@@ -110,10 +110,23 @@ fn process(
     };
     let hunks = shadow::compute_hunks(old_blob.as_ref(), new_data.as_deref())?;
     drop(old_blob);
-    let session_id = db.take_hint(rel)?.unwrap_or(human_id);
+    // Keep how the owner was found alongside the row. Nothing else in the
+    // journal separates a session naming its own file from the daemon guessing
+    // off a running command, and the two are worth different amounts of trust.
+    let (session_id, attributed_by) = match db.take_hint(rel)? {
+        Some((id, how)) => (id, Some(how)),
+        None => (human_id, None),
+    };
     let session = db.get_session(session_id)?;
     let oid = shadow::commit_edit(repo, rel, change, &session.agent_name, &session.external_id)?;
-    db.insert_edit(session_id, rel, change.as_str(), Some(&oid), &hunks)?;
+    db.insert_edit(
+        session_id,
+        rel,
+        change.as_str(),
+        Some(&oid),
+        &hunks,
+        attributed_by,
+    )?;
     db.apply_edit_regions(session_id, rel, &hunks)?;
     log(&format!(
         "{} {} - {} (ortak-{})",

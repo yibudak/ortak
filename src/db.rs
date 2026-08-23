@@ -31,6 +31,25 @@ pub struct Session {
     pub started_at: i64,
 }
 
+/// How the daemon worked out who owns an edit. An edit hook naming the file is
+/// evidence; a Bash claim is an inference, and one the daemon is allowed to
+/// decline. Absent on a row means neither applied and the change fell to the
+/// human session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    Hook,
+    Claim,
+}
+
+impl Attribution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Attribution::Hook => "hook",
+            Attribution::Claim => "claim",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EditRow {
     #[allow(dead_code)]
@@ -42,6 +61,16 @@ pub struct EditRow {
     #[allow(dead_code)]
     pub shadow_commit: Option<String>,
     pub ts: i64,
+    pub attributed_by: Option<String>,
+}
+
+impl EditRow {
+    /// Whether the owner was guessed rather than reported. Rare once a claim
+    /// only speaks for an unambiguous command, and that rarity is the point:
+    /// a marked row is the one worth a second look.
+    pub fn inferred(&self) -> bool {
+        self.attributed_by.as_deref() == Some(Attribution::Claim.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +134,8 @@ CREATE TABLE IF NOT EXISTS edits (
   change_kind   TEXT NOT NULL,            -- 'create' | 'modify' | 'delete'
   shadow_commit TEXT,
   ts            INTEGER NOT NULL,
-  hunks         TEXT                      -- JSON [{old_start,old_lines,new_start,new_lines}]
+  hunks         TEXT,                     -- JSON [{old_start,old_lines,new_start,new_lines}]
+  attributed_by TEXT                      -- 'hook' | 'claim'; NULL when nothing claimed the file
 );
 CREATE INDEX IF NOT EXISTS idx_edits_session ON edits(session_id);
 CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(file);
@@ -146,8 +176,9 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
-        // Migration for pre-region databases; harmless if the column exists.
+        // Migrations for older databases; harmless if the column exists.
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunks TEXT", []);
+        let _ = conn.execute("ALTER TABLE edits ADD COLUMN attributed_by TEXT", []);
         Ok(Db { conn })
     }
 
@@ -275,7 +306,7 @@ impl Db {
     /// the daemon unattributed and would otherwise land on the human session.
     /// That fallback applies only while exactly one session has a command
     /// running; see below for why a second claim cancels the guess.
-    pub fn take_hint(&self, file: &str) -> Result<Option<i64>> {
+    pub fn take_hint(&self, file: &str) -> Result<Option<(i64, Attribution)>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
             .conn
@@ -294,8 +325,8 @@ impl Db {
             "DELETE FROM hints WHERE ts < ?1 AND file != ?2",
             params![cutoff, BASH_CLAIM],
         )?;
-        if hit.is_some() {
-            return Ok(hit);
+        if let Some(id) = hit {
+            return Ok(Some((id, Attribution::Hook)));
         }
         // A claim is not consumed: one command can write many files. Ending the
         // session retires it, so a harness that dies mid-command cannot leave
@@ -316,7 +347,7 @@ impl Db {
             .query_map(params![BASH_CLAIM], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
-            [only] => Some(*only),
+            [only] => Some((*only, Attribution::Claim)),
             _ => None,
         })
     }
@@ -339,25 +370,27 @@ impl Db {
         change_kind: &str,
         shadow_commit: Option<&str>,
         hunks: &[Hunk],
+        attributed_by: Option<Attribution>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO edits (session_id, file, change_kind, shadow_commit, ts, hunks)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO edits (session_id, file, change_kind, shadow_commit, ts, hunks, attributed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 file,
                 change_kind,
                 shadow_commit,
                 now_ts(),
-                serde_json::to_string(hunks)?
+                serde_json::to_string(hunks)?,
+                attributed_by.map(Attribution::as_str)
             ],
         )?;
         Ok(())
     }
 
     pub fn recent_edits(&self, session_id: Option<i64>, limit: u32) -> Result<Vec<EditRow>> {
-        let sql =
-            "SELECT e.id, e.session_id, s.agent_name, e.file, e.change_kind, e.shadow_commit, e.ts
+        let sql = "SELECT e.id, e.session_id, s.agent_name, e.file, e.change_kind, e.shadow_commit,
+                          e.ts, e.attributed_by
                    FROM edits e JOIN sessions s ON s.id = e.session_id
                    WHERE (?1 IS NULL OR e.session_id = ?1)
                    ORDER BY e.id DESC LIMIT ?2";
@@ -371,6 +404,7 @@ impl Db {
                 change_kind: r.get(4)?,
                 shadow_commit: r.get(5)?,
                 ts: r.get(6)?,
+                attributed_by: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -722,13 +756,22 @@ mod tests {
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
 
         db.insert_hint(BASH_CLAIM, agent).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(agent));
+        assert_eq!(
+            db.take_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim))
+        );
         // The claim survives, because one command can write many files.
-        assert_eq!(db.take_hint("src/y.rs").unwrap(), Some(agent));
+        assert_eq!(
+            db.take_hint("src/y.rs").unwrap(),
+            Some((agent, Attribution::Claim))
+        );
 
         // A hint from the edit hooks still outranks the claim.
         db.insert_hint("src/z.rs", human).unwrap();
-        assert_eq!(db.take_hint("src/z.rs").unwrap(), Some(human));
+        assert_eq!(
+            db.take_hint("src/z.rs").unwrap(),
+            Some((human, Attribution::Hook))
+        );
 
         db.clear_bash_claim(agent).unwrap();
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
@@ -745,7 +788,10 @@ mod tests {
             .unwrap();
 
         db.insert_hint(BASH_CLAIM, a).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(a));
+        assert_eq!(
+            db.take_hint("src/x.rs").unwrap(),
+            Some((a, Attribution::Claim))
+        );
 
         // b starts a command of its own. Whoever writes src/x.rs now, the
         // daemon cannot tell which of the two did it, so it does not guess.
@@ -754,11 +800,46 @@ mod tests {
 
         // A hook naming the file is evidence and still outranks both claims.
         db.insert_hint("src/x.rs", b).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(b));
+        assert_eq!(
+            db.take_hint("src/x.rs").unwrap(),
+            Some((b, Attribution::Hook))
+        );
 
         // b's command finishes and a is an unambiguous guess again.
         db.clear_bash_claim(b).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(a));
+        assert_eq!(
+            db.take_hint("src/x.rs").unwrap(),
+            Some((a, Attribution::Claim))
+        );
+    }
+
+    #[test]
+    fn the_journal_says_which_rows_were_guessed() {
+        let db = temp_db("attributed-by");
+        let a = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_edit(a, "named.rs", "modify", None, &[], Some(Attribution::Hook))
+            .unwrap();
+        db.insert_edit(
+            a,
+            "guessed.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Claim),
+        )
+        .unwrap();
+        db.insert_edit(a, "orphan.rs", "modify", None, &[], None)
+            .unwrap();
+
+        let rows = db.recent_edits(None, 10).unwrap();
+        let row = |f: &str| rows.iter().find(|r| r.file == f).unwrap();
+        assert!(!row("named.rs").inferred(), "a hook named this file");
+        assert!(row("guessed.rs").inferred(), "a claim guessed this one");
+        // Nothing claimed it, so it went to the human by rule rather than by
+        // inference. The agent column already says so; do not mark it twice.
+        assert!(!row("orphan.rs").inferred());
     }
 
     #[test]
