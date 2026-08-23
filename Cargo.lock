@@ -711,6 +711,7 @@ dependencies = [
  "chrono",
  "clap",
  "git2",
+ "libc",
  "notify",
  "rusqlite",
  "serde",

@@ -144,8 +144,20 @@ fn classify_parse_failure(kind: clap::error::ErrorKind, first_arg: Option<&str>)
         (true, false) => ParseFailure::SilentSuccess,
     }
 }
+/// Rust ignores SIGPIPE, so the first `println!` after a closed pipe panics with
+/// "failed printing to stdout" instead of the command simply ending. `ortak log
+/// | head` is an ordinary thing to type.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: sets a signal disposition before any thread is spawned.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
 
 fn main() {
+    restore_sigpipe();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => match classify_parse_failure(e.kind(), std::env::args().nth(1).as_deref()) {
