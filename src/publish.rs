@@ -88,6 +88,7 @@ pub fn run(
     // Build the branch tree in an in-memory index: base tree + session files.
     let mut index = git2::Index::new()?;
     index.read_tree(&base_tree)?;
+    let mut stale: Vec<String> = Vec::new();
     for (file, kind) in &files {
         if kind == "delete" {
             let _ = index.remove_path(Path::new(file));
@@ -97,6 +98,9 @@ pub fn run(
             .get_path(Path::new(file))
             .with_context(|| format!("{} is missing from this session's replayed history", file))?;
         let data = shadow.find_blob(tracked.id())?.content().to_vec();
+        if differs_from_last_write(&db, &shadow, session.id, file, &data)? {
+            stale.push(file.clone());
+        }
         let mode = tracked.filemode() as u32;
         // The blob lives in the shadow object database; copy it into the project repo.
         let blob_id = repo.blob(&data)?;
@@ -160,6 +164,12 @@ pub fn run(
             );
         }
         println!("the branch is incomplete; publish and merge that session, then publish again");
+    }
+    for f in &stale {
+        println!(
+            "\nwarning: {f} on this branch does not match what ortak-{id} last wrote to it.\nEdits are missing from the journal, so the branch is incomplete. Check `ortak log\n--session ortak-{id}` against `git diff --stat` before you open a PR.",
+            id = session.id
+        );
     }
 
     if push {
@@ -286,6 +296,48 @@ fn session_only_tree<'r>(
         head = shadow.find_commit(next)?;
     }
     Ok((head.tree()?, unreplayable))
+}
+
+/// Whether the branch's content for a file differs from what the session last
+/// wrote to it.
+///
+/// The replay rebuilds each file from the session's own micro-commits. Lose one
+/// in the middle and the replay still succeeds, quietly producing a file the
+/// session never had: round 1 shipped exactly that, and `cargo clippy` in a
+/// verify worktree was the first thing to notice. The session's newest
+/// micro-commit holds the content it last put in the file, so the two should
+/// agree.
+///
+/// ponytail: only a file this session alone has journaled edits on can be
+/// checked. Where another session also touched it the replay is supposed to
+/// differ, which is the whole point of it, so those are skipped in silence. A
+/// base branch that has moved under the session produces the same difference on
+/// a file only it touched, which is why this warns rather than refuses.
+fn differs_from_last_write(
+    db: &Db,
+    shadow: &Repository,
+    session_id: i64,
+    file: &str,
+    replayed: &[u8],
+) -> Result<bool> {
+    if db.shared_file(session_id, file)? {
+        return Ok(false);
+    }
+    let Some(commit) = db.last_commit_for(session_id, file)? else {
+        return Ok(false);
+    };
+    let Some(last) = blob_at(shadow, &commit, file) else {
+        return Ok(false);
+    };
+    Ok(last != replayed)
+}
+
+/// A file's content at a shadow commit, when both are still readable.
+fn blob_at(shadow: &Repository, commit: &str, file: &str) -> Option<Vec<u8>> {
+    let oid = Oid::from_str(commit).ok()?;
+    let tree = shadow.find_commit(oid).ok()?.tree().ok()?;
+    let entry = tree.get_path(Path::new(file)).ok()?;
+    Some(shadow.find_blob(entry.id()).ok()?.content().to_vec())
 }
 
 /// Drop the `--exclude` paths from the publish, returning the ones that matched
@@ -496,6 +548,45 @@ mod tests {
             tree.get_path(Path::new("dep.py")).is_err(),
             "an unshipped dependency leaked into the branch"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A journal that lost a row in the middle replays into a file the session
+    /// never had. Nothing else notices, so publish has to.
+    #[test]
+    fn a_branch_missing_a_journal_row_is_flagged() {
+        let (dir, repo) = scratch("stale");
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db
+            .upsert_session("claude-a", "claude-a", "llm", None)
+            .unwrap();
+
+        let first = commit_file(&repo, None, "app.py", &lines(&[(3, "ONE")]));
+        let first_c = repo.find_commit(first).unwrap();
+        let second = commit_file(
+            &repo,
+            Some(&first_c),
+            "app.py",
+            &lines(&[(3, "ONE"), (9, "TWO")]),
+        );
+        db.insert_edit(mine, "app.py", "modify", Some(&first.to_string()), &[])
+            .unwrap();
+        db.insert_edit(mine, "app.py", "modify", Some(&second.to_string()), &[])
+            .unwrap();
+
+        let short = lines(&[(3, "ONE")]);
+        let whole = lines(&[(3, "ONE"), (9, "TWO")]);
+        assert!(differs_from_last_write(&db, &repo, mine, "app.py", short.as_bytes()).unwrap());
+        assert!(!differs_from_last_write(&db, &repo, mine, "app.py", whole.as_bytes()).unwrap());
+
+        // Once another session is in the file too, the replay is meant to
+        // differ and there is nothing left to assert.
+        let theirs = db
+            .upsert_session("claude-b", "claude-b", "llm", None)
+            .unwrap();
+        db.insert_edit(theirs, "app.py", "modify", None, &[])
+            .unwrap();
+        assert!(!differs_from_last_write(&db, &repo, mine, "app.py", short.as_bytes()).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

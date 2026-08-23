@@ -351,6 +351,34 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The shadow micro-commit behind a session's newest edit to a file: the
+    /// last content that session is known to have put there.
+    pub fn last_commit_for(&self, session_id: i64, file: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT shadow_commit FROM edits
+                 WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, file],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Whether any other session has journaled an edit to this file.
+    pub fn shared_file(&self, session_id: i64, file: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM edits WHERE file = ?1 AND session_id != ?2 LIMIT 1",
+                params![file, session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn edit_count(&self, session_id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM edits WHERE session_id = ?1",
