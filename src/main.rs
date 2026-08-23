@@ -77,8 +77,11 @@ enum Command {
     },
     /// Resolve errors assigned to you and reopen the line
     Resolved {
-        /// Session (ortak-N); omit to resolve all open errors
+        /// Session (ortak-N) whose error is fixed
         session: Option<String>,
+        /// Resolve every open error, whoever owns it
+        #[arg(long)]
+        all: bool,
     },
     /// List error records
     Errors,
@@ -173,9 +176,9 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = Config::load(&ws.config_path)?;
             line::report(&ws, &cfg, &session, command.as_deref(), &text.join(" "))
         }
-        Command::Resolved { session } => {
+        Command::Resolved { session, all } => {
             let ws = Workspace::discover_from_cwd()?;
-            line::resolved(&ws, session.as_deref())
+            line::resolved(&ws, session.as_deref(), all)
         }
         Command::Errors => {
             let ws = Workspace::discover_from_cwd()?;

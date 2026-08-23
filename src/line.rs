@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::orchestrator;
 use crate::workspace::Workspace;
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 pub fn shorten(text: &str, max: usize) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -132,14 +132,20 @@ pub fn report(
     Ok(())
 }
 
-pub fn resolved(ws: &Workspace, session_ref: Option<&str>) -> Result<()> {
+pub fn resolved(ws: &Workspace, session_ref: Option<&str>, all: bool) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let responsible = match session_ref {
         Some(r) => Some(db.resolve_session(r)?.id),
-        None => {
-            println!("warning: no session supplied; resolving ALL open errors.");
+        // Clearing every error restarts every stopped session, so it should not
+        // also be the shortest thing to type.
+        None if all => {
+            println!("resolving ALL open errors.");
             None
         }
+        None => bail!(
+            "name the session whose error is fixed, e.g. `ortak resolved ortak-2`, \
+             or pass --all to clear every open error"
+        ),
     };
     let n = db.resolve_errors(responsible)?;
     let remaining = db.open_errors()?;
