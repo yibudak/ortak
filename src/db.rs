@@ -866,12 +866,15 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// The ranges a session wrote, file by file, cooled or not: `publish` scans
-    /// for impact after cooling its own lines, and a scan that skipped them
-    /// would report nothing on exactly the run that needs it.
+    /// A session's live regions: the ranges it currently owns, file by file.
+    ///
+    /// Cooled ones are left out, and that is what scopes the impact scan to one
+    /// branch. `publish` scans before it cools, so the lines it is shipping are
+    /// still hot and the lines every earlier branch shipped are not.
     pub fn session_regions(&self, session_id: i64) -> Result<Vec<(String, i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file, start_line, end_line FROM regions WHERE session_id = ?1
+            "SELECT file, start_line, end_line FROM regions
+             WHERE session_id = ?1 AND cooled = 0
              ORDER BY file, start_line",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
