@@ -2,9 +2,10 @@ mod config;
 mod daemon;
 mod db;
 mod hooks;
-mod json;
 mod impact;
+mod json;
 mod line;
+mod notes;
 mod orchestrator;
 mod publish;
 mod regions;
@@ -55,6 +56,11 @@ enum Command {
     Blame {
         /// File, or file and line: src/db.rs or src/db.rs:143
         target: String,
+    },
+    /// Record why a change was made, or read the notes on a file
+    Why {
+        /// Writing: ortak-N <file> <why...>. Reading: <file> or <file>:<line>
+        args: Vec<String>,
     },
     /// List sessions
     Sessions,
@@ -253,6 +259,7 @@ fn run(cli: Cli) -> Result<()> {
             json,
         } => log(session.as_deref(), limit, json),
         Command::Blame { target } => blame(&target),
+        Command::Why { args } => notes::run(&args),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
         Command::Tell {

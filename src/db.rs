@@ -140,6 +140,17 @@ pub struct Owner {
     pub last_ts: i64,
 }
 
+/// Why one session made a change, kept against the range it owned at the time.
+#[derive(Debug, Clone)]
+pub struct Note {
+    pub session_id: i64,
+    pub agent_name: String,
+    pub start: i64,
+    pub end: i64,
+    pub text: String,
+    pub ts: i64,
+}
+
 pub type FreshRegion = (String, i64, i64, String, i64, i64);
 
 pub struct Db {
@@ -215,6 +226,16 @@ CREATE TABLE IF NOT EXISTS messages (
   delivered_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session);
+CREATE TABLE IF NOT EXISTS notes (
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  file       TEXT NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line   INTEGER NOT NULL,
+  text       TEXT NOT NULL,
+  ts         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_file ON notes(file);
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -763,6 +784,66 @@ impl Db {
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The range a note written now describes: the session's newest region on
+    /// the file. `None` when it owns nothing there, and the note goes against
+    /// the whole file instead.
+    pub fn session_region(&self, session_id: i64, file: &str) -> Result<Option<Region>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT start_line, end_line FROM regions
+                 WHERE session_id = ?1 AND file = ?2
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![session_id, file],
+                |r| {
+                    Ok(Region {
+                        start: r.get(0)?,
+                        end: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    // ---- notes ----------------------------------------------------------
+
+    pub fn insert_note(
+        &self,
+        session_id: i64,
+        file: &str,
+        start: i64,
+        end: i64,
+        text: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO notes (session_id, file, start_line, end_line, text, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_id, file, start, end, text, now_ts()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every note on a file, oldest first. Sessions are joined, not filtered:
+    /// a note outlives the session that wrote it.
+    pub fn file_notes(&self, file: &str) -> Result<Vec<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.session_id, s.agent_name, n.start_line, n.end_line, n.text, n.ts
+             FROM notes n JOIN sessions s ON s.id = n.session_id
+             WHERE n.file = ?1 ORDER BY n.id",
+        )?;
+        let rows = stmt.query_map(params![file], |r| {
+            Ok(Note {
+                session_id: r.get(0)?,
+                agent_name: r.get(1)?,
+                start: r.get(2)?,
+                end: r.get(3)?,
+                text: r.get(4)?,
+                ts: r.get(5)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }

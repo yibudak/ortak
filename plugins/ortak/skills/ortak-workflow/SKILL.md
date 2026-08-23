@@ -48,7 +48,15 @@ This command stops the line. ortak assigns an owner from the journal and rejects
 ortak resolved ortak-N
 ```
 
-## 5. Publish completed work
+## 5. Record why, when the why is not obvious
+
+When you do something a later reader would find surprising, leave the reason on the file you did it in. The journal already says who changed a line and when; a note is the only thing that says why.
+
+```bash
+ortak why ortak-N src/publish.rs "seeded the replay from the base branch because the shadow root drifts from main"
+```
+
+## 6. Publish completed work
 
 Run one of these commands when the task is complete or the user asks you to publish:
 
@@ -91,6 +99,7 @@ ortak log            # recent journal entries and their owners
 ortak log --session ortak-N
 ortak inbox ortak-N # messages other sessions sent you
 ortak impact ortak-N # who else is working on files that use what you changed
+ortak why <file>    # why sessions changed this file; add :<line> for one line
 ```
 
 Check `ortak log` before changing unexpected content in a file. Another session may own that change.
