@@ -34,6 +34,19 @@ pub struct Session {
     pub intent: Option<String>,
     pub status: String,
     pub edits: i64,
+    /// What this session has published, newest first. Empty until it publishes.
+    pub branches: Vec<Branch>,
+}
+
+#[derive(Serialize)]
+pub struct Branch {
+    pub branch: String,
+    /// When the publish went out, unix seconds.
+    pub published_at: i64,
+    /// Edits this session has made that none of its branches carries yet. Only
+    /// the newest publish can have any: work after an older one went into the
+    /// branches published since.
+    pub edits_since: i64,
 }
 
 #[derive(Serialize)]
@@ -80,6 +93,15 @@ pub fn status(db: &Db, presence_secs: i64) -> Result<Status> {
     let age = db.heartbeat_age()?;
     let mut sessions = Vec::new();
     for s in db.list_sessions()? {
+        let branches = db
+            .published_branches(s.id)?
+            .into_iter()
+            .map(|(p, behind)| Branch {
+                branch: p.branch,
+                published_at: p.ts,
+                edits_since: behind,
+            })
+            .collect();
         sessions.push(Session {
             session: format!("ortak-{}", s.id),
             agent: s.agent_name,
@@ -87,6 +109,7 @@ pub fn status(db: &Db, presence_secs: i64) -> Result<Status> {
             intent: s.task_intent,
             status: s.status,
             edits: db.edit_count(s.id)?,
+            branches,
         });
     }
     let now = crate::db::now_ts();
@@ -156,6 +179,11 @@ mod tests {
                 intent: Some("wire up the gate".into()),
                 status: "active".into(),
                 edits: 7,
+                branches: vec![Branch {
+                    branch: "feat/the-gate".into(),
+                    published_at: 1_700_000_000,
+                    edits_since: 2,
+                }],
             }],
             regions: vec![Region {
                 file: "src/db.rs".into(),
@@ -169,7 +197,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
-            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
+            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
         );
     }
 }
