@@ -215,7 +215,8 @@ fn intended_content(base: &[u8], tool_name: &str, tool_input: &Value) -> Option<
 /// never came. PreToolUse fires before every edit instead, and the harness
 /// shows `additionalContext` whether the call is allowed or denied, so a
 /// message reaches a working session without the gate having to deny anything
-/// in order to say it.
+/// in order to say it. A stopped line's owner is told through the same door,
+/// and for the same reason: see `pending_context`.
 pub fn pre_edit() -> Result<()> {
     let input = read_stdin_json()?;
     let cwd_ws = workspace_for(&input).ok();
@@ -258,7 +259,7 @@ pub fn pre_edit() -> Result<()> {
                 "llm",
                 Some(harness),
             )?;
-            pending_messages(&db, me)?
+            pending_context(&db, me)?
         }
         None => None,
     };
@@ -287,6 +288,49 @@ fn pre_tool_use_output(denial: Option<String>, waiting: Option<String>) -> Optio
         hook["additionalContext"] = Value::from(block);
     }
     Some(serde_json::json!({ "hookSpecificOutput": hook }))
+}
+
+/// Everything this session is owed before its next call: the stopped line it
+/// owns, then whatever the other sessions sent it. The line comes first because
+/// it is the one thing holding up the whole workspace.
+///
+/// The gate exempts the session responsible for an open error, which is right,
+/// because it has to edit to fix the thing. It also leaves that session the
+/// only party the stop-the-line never reaches: everybody else is told by the
+/// denial, and the notice naming the owner is written for a prompt that a
+/// session working through a brief submits once, at the start. So the owner
+/// fixes the code without ever learning an error was open, leaves it open
+/// behind them, and every other session stays stopped.
+fn pending_context(db: &Db, me: i64) -> Result<Option<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = db.take_owner_notice(me)? {
+        parts.push(owner_notice(me, &e));
+    }
+    if let Some(block) = pending_messages(db, me)? {
+        parts.push(block);
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.join("\n\n")))
+}
+
+/// What the session that owns a stopped line is told, at a prompt or before an
+/// edit. One wording, because the two doors say the same thing.
+fn owner_notice(me: i64, e: &crate::db::ErrorRow) -> String {
+    format!(
+        "ortak LINE STATUS: the line is stopped and YOU own the fix (ortak-{}). Error #{}: \"{}\"{} \
+         Fix this error before continuing your task. Run `ortak resolved ortak-{}` after the fix \
+         so other sessions can continue.",
+        me,
+        e.id,
+        crate::line::shorten(&e.excerpt, 300),
+        e.fix_brief
+            .as_deref()
+            .map(|b| format!(" Fix brief: {}", b))
+            .unwrap_or_default(),
+        me
+    )
 }
 
 /// Whatever this session has been sent and not yet been handed, as one block.
@@ -615,7 +659,7 @@ pub fn pre_bash() -> Result<()> {
     // A session can go a long way between edits while it reads, greps and runs
     // tests, and a message that waits for the next edit can wait that long.
     // Bash is the call an agent makes constantly, so it opens the same door.
-    if let Some(out) = pre_tool_use_output(None, pending_messages(&db, me)?) {
+    if let Some(out) = pre_tool_use_output(None, pending_context(&db, me)?) {
         println!("{}", out);
     }
     Ok(())
@@ -730,21 +774,10 @@ pub fn prompt_context() -> Result<()> {
         return emit_prompt_context(parts);
     }
     let mine: Vec<&crate::db::ErrorRow> = open.iter().filter(|e| e.responsible() == me).collect();
-    let context = if !mine.is_empty() {
-        let e = mine[0];
-        format!(
-            "ortak LINE STATUS: the line is stopped and YOU own the fix (ortak-{}). Error #{}: \"{}\"{} \
-             Fix this error before continuing your task. Run `ortak resolved ortak-{}` after the fix \
-             so other sessions can continue.",
-            me,
-            e.id,
-            crate::line::shorten(&e.excerpt, 300),
-            e.fix_brief
-                .as_deref()
-                .map(|b| format!(" Fix brief: {}", b))
-                .unwrap_or_default(),
-            me
-        )
+    // Read, never taken: a person who types deserves the status of the line
+    // whether or not their session has already been handed the assignment.
+    let context = if let Some(e) = mine.first() {
+        owner_notice(me, e)
     } else {
         let e = &open[0];
         format!(

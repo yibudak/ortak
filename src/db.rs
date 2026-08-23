@@ -228,7 +228,11 @@ CREATE TABLE IF NOT EXISTS errors (
   culprit_session  INTEGER REFERENCES sessions(id),
   fix_brief        TEXT,
   ts_opened        INTEGER NOT NULL,
-  ts_resolved      INTEGER
+  ts_resolved      INTEGER,
+  -- When the responsible session was handed its assignment, the way messages
+  -- carry delivered_at. Cleared on reassignment, because the new owner has not
+  -- heard it.
+  owner_told_at    INTEGER
 );
 CREATE TABLE IF NOT EXISTS publishes (
   id           INTEGER PRIMARY KEY,
@@ -281,6 +285,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunks TEXT", []);
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN attributed_by TEXT", []);
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN blob TEXT", []);
+        let _ = conn.execute("ALTER TABLE errors ADD COLUMN owner_told_at INTEGER", []);
         Ok(Db { conn })
     }
 
@@ -1025,25 +1030,45 @@ impl Db {
             }
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![limit], |r| {
-            Ok(ErrorRow {
-                id: r.get(0)?,
-                reporter: r.get(1)?,
-                reporter_name: r.get(2)?,
-                command: r.get(3)?,
-                excerpt: r.get(4)?,
-                status: r.get(5)?,
-                culprit: r.get(6)?,
-                culprit_name: r.get(7)?,
-                fix_brief: r.get(8)?,
-                ts_opened: r.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit], row_to_error)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn open_errors(&self) -> Result<Vec<ErrorRow>> {
         self.error_rows(true, 100)
+    }
+
+    /// The oldest open error this session must fix and has never been told
+    /// about, stamped told on the way out.
+    ///
+    /// The responsible session is the one party the stop-the-line never
+    /// reached: the gate exempts it, because it has to edit to fix the thing,
+    /// so it never sees the denial that names it. The stamp is what keeps a
+    /// notice from becoming wallpaper on a line that stays stopped for an hour.
+    pub fn take_owner_notice(&self, session_id: i64) -> Result<Option<ErrorRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found = {
+            let mut stmt = tx.prepare(
+                "SELECT e.id, e.reporter_session, rs.agent_name, e.command, e.output_excerpt,
+                        e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened
+                 FROM errors e
+                 JOIN sessions rs ON rs.id = e.reporter_session
+                 LEFT JOIN sessions cs ON cs.id = e.culprit_session
+                 WHERE e.status = 'open' AND e.owner_told_at IS NULL
+                   AND COALESCE(e.culprit_session, e.reporter_session) = ?1
+                 ORDER BY e.id LIMIT 1",
+            )?;
+            stmt.query_row(params![session_id], row_to_error)
+                .optional()?
+        };
+        if let Some(e) = &found {
+            tx.execute(
+                "UPDATE errors SET owner_told_at = ?2 WHERE id = ?1",
+                params![e.id, now_ts()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(found)
     }
 
     pub fn list_errors(&self, limit: u32) -> Result<Vec<ErrorRow>> {
@@ -1069,8 +1094,11 @@ impl Db {
     }
 
     pub fn assign_error(&self, error_id: i64, culprit: i64) -> Result<()> {
+        // The stamp goes back to NULL with the new owner: whoever the error has
+        // just landed on has not been told, whatever the last owner heard.
         let n = self.conn.execute(
-            "UPDATE errors SET culprit_session = ?2 WHERE id = ?1 AND status = 'open'",
+            "UPDATE errors SET culprit_session = ?2, owner_told_at = NULL
+             WHERE id = ?1 AND status = 'open'",
             params![error_id, culprit],
         )?;
         if n == 0 {
@@ -1163,6 +1191,21 @@ impl Db {
             .optional()?;
         Ok(v.and_then(|s| s.parse::<i64>().ok()).map(|t| now_ts() - t))
     }
+}
+
+fn row_to_error(r: &rusqlite::Row<'_>) -> rusqlite::Result<ErrorRow> {
+    Ok(ErrorRow {
+        id: r.get(0)?,
+        reporter: r.get(1)?,
+        reporter_name: r.get(2)?,
+        command: r.get(3)?,
+        excerpt: r.get(4)?,
+        status: r.get(5)?,
+        culprit: r.get(6)?,
+        culprit_name: r.get(7)?,
+        fix_brief: r.get(8)?,
+        ts_opened: r.get(9)?,
+    })
 }
 
 fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -1570,5 +1613,63 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(_, _, _, _, sid, _)| *sid == second));
+    }
+
+    /// The owner of a stopped line hears about it once. Once, because the gate
+    /// exempts that session and a notice before every edit for as long as the
+    /// line is down stops being read; and again on reassignment, because the
+    /// session the error has just landed on has heard nothing.
+    #[test]
+    fn the_line_reaches_its_owner_once_per_assignment() {
+        let db = temp_db("owner-notice");
+        let reporter = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let culprit = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        let id = db
+            .insert_error(
+                reporter,
+                Some("cargo test"),
+                "no method named `inferred` found for struct `EditRow`",
+                Some(culprit),
+                None,
+            )
+            .unwrap();
+
+        // The reporter is not the owner: it is already being told by the gate.
+        assert!(db.take_owner_notice(reporter).unwrap().is_none());
+
+        let told = db.take_owner_notice(culprit).unwrap().expect("owner hears");
+        assert_eq!(told.id, id);
+        assert!(
+            db.take_owner_notice(culprit).unwrap().is_none(),
+            "and hears it once, not before every edit"
+        );
+
+        db.assign_error(id, reporter).unwrap();
+        assert_eq!(
+            db.take_owner_notice(reporter).unwrap().map(|e| e.id),
+            Some(id),
+            "a reassignment is news to whoever it lands on"
+        );
+        assert!(
+            db.take_owner_notice(culprit).unwrap().is_none(),
+            "and the session it left owes nothing"
+        );
+
+        // An unassigned error is the reporter's own, and it must hear that too.
+        let ambiguous = db
+            .insert_error(reporter, None, "cannot find -lsqlite3", None, None)
+            .unwrap();
+        assert_eq!(
+            db.take_owner_notice(reporter).unwrap().map(|e| e.id),
+            Some(ambiguous)
+        );
+
+        // A resolved line is nobody's news, told or not.
+        let unread = db
+            .insert_error(reporter, None, "linker crashed", Some(culprit), None)
+            .unwrap();
+        assert_eq!(db.resolve_errors(None).unwrap(), 3);
+        assert!(db.take_owner_notice(culprit).unwrap().is_none());
+        assert!(db.open_errors().unwrap().is_empty(), "#{} closed", unread);
     }
 }
