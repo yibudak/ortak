@@ -450,6 +450,25 @@ fn status(as_json: bool) -> Result<()> {
         Some(age) => println!("daemon: NOT RUNNING (last heartbeat {}s ago)", age),
         None => println!("daemon: never started"),
     }
+    // Silent while the journal is healthy, which is nearly always, so the
+    // section is a signal rather than another line to scroll past.
+    let failing = db.journal_failures()?;
+    if let Some(newest) = failing.first() {
+        let age = (db::now_ts() - newest.ts).max(0);
+        let when = if age < 120 {
+            format!("{}s ago", age)
+        } else {
+            format!("{} min ago", age / 60)
+        };
+        println!(
+            "journal: NOT RECORDING {} file(s); changes to them are attributed to nobody",
+            failing.len()
+        );
+        println!(
+            "  {} ({} in a row, newest {}): {}",
+            newest.file, newest.streak, when, newest.reason
+        );
+    }
     println!();
     print_sessions(&db)?;
     let hot = db.fresh_regions(cfg.gate.presence_minutes * 60)?;

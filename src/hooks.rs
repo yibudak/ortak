@@ -658,10 +658,20 @@ pub fn prompt_context() -> Result<()> {
     }
 
     let open = db.open_errors()?;
-    let mine: Vec<&crate::db::ErrorRow> = open.iter().filter(|e| e.responsible() == me).collect();
+    let failing = db.journal_failures()?;
+    if let Some(newest) = failing.first() {
+        parts.push(format!(
+            "ortak JOURNAL FAILING: {} file(s) are not reaching the journal, most recently {}: {}. \
+             Edits to those files are attributed to nobody and will not publish. Run `ortak status`.",
+            failing.len(),
+            newest.file,
+            newest.reason
+        ));
+    }
     if open.is_empty() {
         return emit_prompt_context(parts);
     }
+    let mine: Vec<&crate::db::ErrorRow> = open.iter().filter(|e| e.responsible() == me).collect();
     let context = if !mine.is_empty() {
         let e = mine[0];
         format!(

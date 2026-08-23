@@ -89,8 +89,18 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
         // per snapshot, so two sessions writing one file inside one window stay
         // separate.
         for rel in db.snapshot_files()? {
-            if let Err(e) = process_snapshots(&db, &repo, &rel) {
-                log(&format!("ERROR {}: {}", rel, e));
+            match process_snapshots(&db, &repo, &rel) {
+                Ok(_) => {
+                    if let Err(e) = db.clear_journal_failure(&rel) {
+                        log(&format!("ERROR clearing health record for {}: {}", rel, e));
+                    }
+                }
+                Err(e) => {
+                    log(&format!("ERROR {}: {}", rel, e));
+                    if let Err(e2) = db.record_journal_failure(&rel, &e.to_string()) {
+                        log(&format!("ERROR recording failure for {}: {}", rel, e2));
+                    }
+                }
             }
         }
 
@@ -101,9 +111,7 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
             .collect();
         for rel in quiet {
             pending.remove(&rel);
-            if let Err(e) = process(&db, &repo, ws, human_id, &rel) {
-                log(&format!("ERROR {}: {}", rel, e));
-            }
+            journal(&db, &repo, ws, human_id, &rel);
         }
     }
 }
@@ -272,6 +280,31 @@ fn filter(ws: &Workspace, abs: &Path) -> Option<String> {
     Some(rel)
 }
 
+/// Journal one path and keep its health record current. Returns whether
+/// anything was recorded.
+///
+/// The daemon's own log lives in a terminal nobody is reading and no agent can
+/// reach, so a journaling failure used to be invisible to everything except the
+/// person watching that window. A session whose edits are not landing has to be
+/// able to find that out from `ortak status`.
+fn journal(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64, rel: &str) -> bool {
+    match process(db, repo, ws, human_id, rel) {
+        Ok(recorded) => {
+            if let Err(e) = db.clear_journal_failure(rel) {
+                log(&format!("ERROR clearing health record for {}: {}", rel, e));
+            }
+            recorded
+        }
+        Err(e) => {
+            log(&format!("ERROR {}: {}", rel, e));
+            if let Err(e2) = db.record_journal_failure(rel, &e.to_string()) {
+                log(&format!("ERROR recording failure for {}: {}", rel, e2));
+            }
+            false
+        }
+    }
+}
+
 /// Journal one path change. Returns whether anything was recorded.
 fn process(
     db: &Db,
@@ -423,10 +456,8 @@ fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64)
     let mut journaled = 0u32;
     for entry in statuses.iter() {
         let Some(rel) = entry.path() else { continue };
-        match process(db, repo, ws, human_id, rel) {
-            Ok(true) => journaled += 1,
-            Ok(false) => {}
-            Err(e) => log(&format!("startup scan failed for {}: {}", rel, e)),
+        if journal(db, repo, ws, human_id, rel) {
+            journaled += 1;
         }
     }
     if journaled > 0 {
