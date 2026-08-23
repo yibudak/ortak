@@ -14,10 +14,6 @@ pub fn shorten(text: &str, max: usize) -> String {
     }
 }
 
-/// How strongly an error excerpt implicates one file. A full workspace-relative
-/// path names the session's own file beyond doubt; a bare basename is a guess,
-/// and a traceback mentioning a dependency's `models.py` should never outweigh
-/// the session that actually edited `src/api/models.py`.
 /// One session weighed as the author of an error, over the blame lookback.
 struct Suspect {
     id: i64,
@@ -27,6 +23,10 @@ struct Suspect {
     score: u32,
 }
 
+/// How strongly an error excerpt implicates one file. A full workspace-relative
+/// path names the session's own file beyond doubt; a bare basename is a guess,
+/// and a traceback mentioning a dependency's `models.py` should never outweigh
+/// the session that actually edited `src/api/models.py`.
 fn blame_score(excerpt: &str, file: &str) -> u32 {
     if excerpt.contains(file) {
         return 2;
@@ -37,6 +37,52 @@ fn blame_score(excerpt: &str, file: &str) -> u32 {
     } else {
         0
     }
+}
+
+/// Every session with a recent edit, scored by how far the output implicates
+/// its files. The reporter is in the list, because the arbiter should see what
+/// it was working on, and always scores zero.
+///
+/// A traceback names where a failure surfaced, not where it came from, and
+/// where it surfaced is the reporter's own file: it is the session that ran the
+/// command. Both collisions that have actually cost this project time read that
+/// way. A renamed method names only the call site, so scoring the reporter's
+/// file made the session that noticed the error its author, with `file match`
+/// confidence. A changed signature names the call site and the definition, so
+/// both sessions tied and the tie fell back to the reporter as ambiguous. The
+/// reporter loses either way, which is the one thing `report` exists to say.
+///
+/// A reporter that really did break its own file still ends up with it: nothing
+/// else scores, and the fallback below hands it back. What it no longer does is
+/// outrank a session the journal actually implicates.
+fn suspects(excerpt: &str, reporter: i64, recent: &[(i64, String, String, i64)]) -> Vec<Suspect> {
+    let mut per_session: Vec<Suspect> = Vec::new();
+    for (sid, agent, file, _ts) in recent {
+        let entry = match per_session.iter_mut().find(|s| s.id == *sid) {
+            Some(e) => e,
+            None => {
+                per_session.push(Suspect {
+                    id: *sid,
+                    agent: agent.clone(),
+                    files: Vec::new(),
+                    matched: Vec::new(),
+                    score: 0,
+                });
+                per_session.last_mut().unwrap()
+            }
+        };
+        entry.files.push(file.clone());
+        let score = if *sid == reporter {
+            0
+        } else {
+            blame_score(excerpt, file)
+        };
+        if score > 0 {
+            entry.matched.push(file.clone());
+            entry.score += score;
+        }
+    }
+    per_session
 }
 
 /// An agent hit an error it believes is not its own: stop the line, hunt the
@@ -55,28 +101,7 @@ pub fn report(
 
     // Deterministic hunt: whose recently-edited files appear in the output?
     let recent = db.recent_session_files(cfg.line.blame_lookback_minutes * 60)?;
-    let mut per_session: Vec<Suspect> = Vec::new();
-    for (sid, agent, file, _ts) in &recent {
-        let entry = match per_session.iter_mut().find(|s| s.id == *sid) {
-            Some(e) => e,
-            None => {
-                per_session.push(Suspect {
-                    id: *sid,
-                    agent: agent.clone(),
-                    files: Vec::new(),
-                    matched: Vec::new(),
-                    score: 0,
-                });
-                per_session.last_mut().unwrap()
-            }
-        };
-        entry.files.push(file.clone());
-        let score = blame_score(&excerpt, file);
-        if score > 0 {
-            entry.matched.push(file.clone());
-            entry.score += score;
-        }
-    }
+    let per_session = suspects(&excerpt, reporter.id, &recent);
     let best_score = per_session.iter().map(|s| s.score).max().unwrap_or(0);
     let leaders: Vec<&Suspect> = per_session
         .iter()
@@ -102,11 +127,25 @@ pub fn report(
             ),
         }
     } else {
-        (
-            reporter.id,
-            None,
-            "ambiguous match; reporter owns the error by default".to_string(),
-        )
+        // Two different silences, and the reader has to act on them
+        // differently: nobody implicated is a hunt that found nothing to go on,
+        // and a tie is a hunt that found too much. The old wording called both
+        // ambiguous, which sent a reader looking for a rival that was not there.
+        let how = if best_score == 0 {
+            "nothing in the output names another session's recent files; reporter owns the error \
+             by default"
+                .to_string()
+        } else {
+            format!(
+                "ambiguous: {} match equally; reporter owns the error by default",
+                leaders
+                    .iter()
+                    .map(|l| format!("ortak-{}", l.id))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )
+        };
+        (reporter.id, None, how)
     };
 
     let err_id = db.insert_error(
@@ -211,6 +250,55 @@ pub fn assign(ws: &Workspace, error_id: i64, session_ref: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn score_of(found: &[Suspect], session: i64) -> u32 {
+        found
+            .iter()
+            .find(|s| s.id == session)
+            .map_or(0, |s| s.score)
+    }
+
+    /// Both shapes are real rustc output for the two collisions that have cost
+    /// this project time. A changed signature names the call site and the
+    /// definition; a renamed method names only the call site. Either way the
+    /// call site is the reporter's file, because the reporter ran the build.
+    #[test]
+    fn the_session_that_ran_the_build_is_not_its_author() {
+        let author = 2;
+        let reporter = 3;
+        let recent = vec![
+            (author, "claude-a".to_string(), "src/rows.rs".to_string(), 0),
+            (
+                reporter,
+                "claude-b".to_string(),
+                "src/render.rs".to_string(),
+                0,
+            ),
+        ];
+
+        let changed_signature = "error[E0061]: this method takes 1 argument but 0 arguments were \
+             supplied\n --> src/render.rs:4:9\nnote: method defined here\n --> src/rows.rs:6:12";
+        let found = suspects(changed_signature, reporter, &recent);
+        assert_eq!(score_of(&found, author), 2, "the definition is named");
+        assert_eq!(
+            score_of(&found, reporter),
+            0,
+            "and the call site is not evidence against whoever is standing there"
+        );
+
+        // Renamed: rustc names no file but the caller's, so nobody is
+        // implicated and the fallback hands it back to the reporter. Honest,
+        // where scoring the caller was confidently wrong.
+        let renamed = "error[E0599]: no method named `inferred` found for reference `&EditRow`\n \
+                       --> src/render.rs:4:9";
+        let found = suspects(renamed, reporter, &recent);
+        assert!(found.iter().all(|s| s.score == 0));
+
+        // The exemption follows the reporter, it is not a rule about one file.
+        let found = suspects(changed_signature, author, &recent);
+        assert_eq!(score_of(&found, author), 0);
+        assert_eq!(score_of(&found, reporter), 2);
+    }
 
     #[test]
     fn a_full_path_outweighs_a_bare_filename() {
