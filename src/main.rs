@@ -33,8 +33,15 @@ struct Cli {
 enum Command {
     /// Initialize this directory as an ortak workspace
     Init,
-    /// Run the journal daemon (file watcher and shadow repository) in the foreground
-    Daemon,
+    /// Run the journal daemon (file watcher and shadow repository)
+    Daemon {
+        /// Run in the background, with output going to .ortak/daemon.log
+        #[arg(long)]
+        detach: bool,
+        /// Stop the daemon running on this workspace
+        #[arg(long, conflicts_with = "detach")]
+        stop: bool,
+    },
     /// Show daemon and session status
     Status {
         /// Emit JSON for another program to read
@@ -247,8 +254,14 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init(),
-        Command::Daemon => {
+        Command::Daemon { detach, stop } => {
             let ws = Workspace::discover_from_cwd()?;
+            if stop {
+                return daemon::stop(&ws);
+            }
+            if detach {
+                return daemon::detach(&ws);
+            }
             let cfg = Config::load(&ws.config_path)?;
             daemon::run(&ws, &cfg)
         }

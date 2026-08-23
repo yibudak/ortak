@@ -33,6 +33,8 @@ ortak init
 ortak daemon
 ```
 
+That runs in the foreground. To put it in the background instead, `ortak daemon --detach` sends its output to `.ortak/daemon.log` and writes its process id to `.ortak/daemon.pid`, and `ortak daemon --stop` stops it again. Either way a workspace takes one daemon and a second refuses to start, since two of them race on the shadow repository and drop each other's edits. A detached daemon is what you would point a launchd agent or a systemd unit at; writing that file is left to you.
+
 For Claude Code, install the plugin from this repository:
 
 ```bash

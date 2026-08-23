@@ -18,6 +18,10 @@ const UNATTRIBUTED_QUIET: Duration = Duration::from_millis(1500);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 /// Names the daemon that owns this workspace, inside `.ortak`.
 const PIDFILE: &str = "daemon.pid";
+/// Where a detached daemon's output goes, inside `.ortak`.
+const LOGFILE: &str = "daemon.log";
+/// Set on the re-executed child so its log says which kind of daemon it is.
+const DETACHED_ENV: &str = "ORTAK_DAEMON_DETACHED";
 
 struct PidfileGuard(PathBuf);
 
@@ -48,7 +52,12 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
     })?;
     watcher.watch(&ws.root, RecursiveMode::Recursive)?;
 
-    log(&format!("daemon started: {}", ws.root.display()));
+    let how = if std::env::var_os(DETACHED_ENV).is_some() {
+        "detached"
+    } else {
+        "foreground"
+    };
+    log(&format!("daemon started ({}): {}", how, ws.root.display()));
     db.heartbeat()?;
     startup_scan(&db, &repo, ws, human_id);
 
@@ -125,6 +134,99 @@ fn claim(pidfile: &Path, alive: impl Fn(u32) -> bool) -> Result<()> {
     }
     std::fs::write(pidfile, me.to_string())?;
     Ok(())
+}
+
+/// Start the daemon in the background by re-executing this binary, with its
+/// output going to `.ortak/daemon.log`. The child claims the workspace itself,
+/// so the pidfile ends up holding the pid that is actually watching.
+pub fn detach(ws: &Workspace) -> Result<()> {
+    let pidfile = ws.ortak_dir.join(PIDFILE);
+    // The child would refuse too, but its complaint would land in a log file
+    // nobody is watching. Answer on the terminal that asked.
+    if let Some(pid) = read_pid(&pidfile) {
+        if process_alive(pid) {
+            bail!(
+                "another ortak daemon is already running on this workspace (pid {}). \
+                 Stop it with `ortak daemon --stop`.",
+                pid
+            );
+        }
+    }
+    let log_path = ws.ortak_dir.join(LOGFILE);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .arg("daemon")
+        .current_dir(&ws.root)
+        .env(DETACHED_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()?;
+    println!("daemon detached (pid {})", child.id());
+    println!("log:  {}", log_path.display());
+    println!("pid:  {}", pidfile.display());
+    println!("stop: ortak daemon --stop");
+    Ok(())
+}
+
+/// Stop whatever daemon this workspace's pidfile names.
+pub fn stop(ws: &Workspace) -> Result<()> {
+    let pidfile = ws.ortak_dir.join(PIDFILE);
+    match stop_action(&pidfile, process_alive) {
+        StopAction::NothingRunning => {
+            println!(
+                "no daemon is running on this workspace ({})",
+                ws.root.display()
+            );
+        }
+        StopAction::Stale(pid) => {
+            std::fs::remove_file(&pidfile)?;
+            match pid {
+                Some(pid) => println!(
+                    "no daemon is running; removed a stale pidfile left by pid {}",
+                    pid
+                ),
+                None => println!("no daemon is running; removed a pidfile that named no process"),
+            }
+        }
+        StopAction::Kill(pid) => {
+            let killed = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !killed {
+                bail!(
+                    "could not signal the daemon (pid {}); it is still running",
+                    pid
+                );
+            }
+            std::fs::remove_file(&pidfile)?;
+            println!("stopped the daemon (pid {})", pid);
+        }
+    }
+    Ok(())
+}
+
+/// What `--stop` should do about the pidfile it found.
+#[derive(Debug, PartialEq)]
+enum StopAction {
+    NothingRunning,
+    /// A pidfile naming a process that is gone, or no process at all.
+    Stale(Option<u32>),
+    Kill(u32),
+}
+
+fn stop_action(pidfile: &Path, alive: impl Fn(u32) -> bool) -> StopAction {
+    match read_pid(pidfile) {
+        None if pidfile.exists() => StopAction::Stale(None),
+        None => StopAction::NothingRunning,
+        Some(pid) if alive(pid) => StopAction::Kill(pid),
+        Some(pid) => StopAction::Stale(Some(pid)),
+    }
 }
 
 fn read_pid(pidfile: &Path) -> Option<u32> {
@@ -386,6 +488,18 @@ mod tests {
         assert_eq!(read_pid(&f), None);
         claim(&f, |_| true).expect("an impossible pid holds nothing");
         assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn stop_tells_a_live_daemon_apart_from_the_file_a_dead_one_left() {
+        let f = pidfile("stop");
+        assert_eq!(stop_action(&f, |_| true), StopAction::NothingRunning);
+        std::fs::write(&f, "424242").unwrap();
+        assert_eq!(stop_action(&f, |_| true), StopAction::Kill(424242));
+        assert_eq!(stop_action(&f, |_| false), StopAction::Stale(Some(424242)));
+        std::fs::write(&f, "not a pid").unwrap();
+        assert_eq!(stop_action(&f, |_| true), StopAction::Stale(None));
         let _ = std::fs::remove_file(&f);
     }
 
