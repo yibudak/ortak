@@ -360,7 +360,7 @@ fn process(
         &hunks,
         attributed_by,
     )?;
-    db.apply_edit_regions(session_id, rel, &hunks)?;
+    db.apply_edit_regions(session_id, rel, &hunks, attributed_by)?;
     // Only now. Everything above can fail, and a hint consumed ahead of its
     // commit is not there for the retry.
     db.clear_hints(rel)?;
@@ -424,7 +424,7 @@ fn process_snapshots(db: &Db, repo: &git2::Repository, rel: &str) -> Result<bool
             &hunks,
             Some(Attribution::Hook),
         )?;
-        db.apply_edit_regions(session_id, rel, &hunks)?;
+        db.apply_edit_regions(session_id, rel, &hunks, Some(Attribution::Hook))?;
         // Only now: a hook reading between the select above and this point must
         // still find the row, or it bases its own snapshot on pre-commit content
         // and the change this commit just recorded is undone by the next one.

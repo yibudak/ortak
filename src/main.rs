@@ -863,11 +863,11 @@ mod blame_tests {
         db.set_intent(a, "rewrite the header").unwrap();
         db.insert_edit(a, "src/db.rs", "modify", None, &[], None)
             .unwrap();
-        db.apply_edit_regions(a, "src/db.rs", &[hunk(1, 3)])
+        db.apply_edit_regions(a, "src/db.rs", &[hunk(1, 3)], None)
             .unwrap();
         db.insert_edit(b, "src/db.rs", "modify", None, &[], None)
             .unwrap();
-        db.apply_edit_regions(b, "src/db.rs", &[hunk(40, 2)])
+        db.apply_edit_regions(b, "src/db.rs", &[hunk(40, 2)], None)
             .unwrap();
 
         let owners = db.file_regions("src/db.rs").unwrap();
