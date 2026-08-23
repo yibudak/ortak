@@ -174,6 +174,25 @@ pub fn run(
     }
 
     if push {
+        // A stacked branch is unusable on the forge until its base is there too:
+        // GitHub and Forgejo both refuse a pull request whose base branch they
+        // cannot find, so --base builds the stack locally and then strands it.
+        // Only a branch --base named explicitly, and never the configured trunk,
+        // which is nobody's to push on a publish's initiative.
+        if let Some(stack) = base_override.filter(|b| !on_remote(ws, &cfg.publish.remote, b)) {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.root)
+                .args(["push", "-u", &cfg.publish.remote, stack])
+                .status()?;
+            if !status.success() {
+                bail!("git push of the base branch {} failed", stack);
+            }
+            println!(
+                "pushed base branch {} first; it did not exist on {}",
+                stack, cfg.publish.remote
+            );
+        }
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&ws.root)
@@ -191,6 +210,20 @@ pub fn run(
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
     }
     Ok(())
+}
+
+/// Whether the remote already carries this branch. Local refs go stale, and a
+/// wrong answer here either strands a stack or pushes a branch nobody asked for,
+/// so ask the remote.
+fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["ls-remote", "--exit-code", "--heads", remote, branch])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The branch this publish builds on. `--base` is per invocation, so work that
@@ -230,5 +263,52 @@ mod tests {
             base_branch(&cfg, Some("task/ortak-3-parser")),
             "task/ortak-3-parser"
         );
+    }
+
+    /// The stack's base has to be pushed before the branch that stands on it,
+    /// so the question is whether the remote already has it.
+    #[test]
+    fn a_branch_the_remote_lacks_is_reported_missing() {
+        let root = std::env::temp_dir().join(format!("ortak-lsremote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bare = root.join("remote.git");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare", "."]);
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(work.join("f.txt"), "x\n").unwrap();
+        git(&work, &["add", "f.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        git(&work, &["remote", "add", "up", bare.to_str().unwrap()]);
+        git(&work, &["push", "-q", "up", "main"]);
+
+        let ws = Workspace::at(&work);
+        assert!(on_remote(&ws, "up", "main"));
+        assert!(!on_remote(&ws, "up", "feat/never-pushed"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }
