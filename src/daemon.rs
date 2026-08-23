@@ -110,11 +110,15 @@ fn process(
     };
     let hunks = shadow::compute_hunks(old_blob.as_ref(), new_data.as_deref())?;
     drop(old_blob);
-    let session_id = db.take_hint(rel)?.unwrap_or(human_id);
+    let session_id = db.peek_hint(rel)?.unwrap_or(human_id);
     let session = db.get_session(session_id)?;
     let oid = shadow::commit_edit(repo, rel, change, &session.agent_name, &session.external_id)?;
     db.insert_edit(session_id, rel, change.as_str(), Some(&oid), &hunks)?;
     db.apply_edit_regions(session_id, rel, &hunks)?;
+    // Only now. Everything above can fail, and a hint consumed ahead of its
+    // commit is not there for the retry: the change lands on the human and the
+    // regions of every session working in this file stop being shifted.
+    db.clear_hints(rel)?;
     log(&format!(
         "{} {} - {} (ortak-{})",
         change.as_str(),

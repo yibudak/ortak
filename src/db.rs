@@ -261,24 +261,38 @@ impl Db {
         Ok(())
     }
 
-    /// Consume the freshest non-stale hint for a file, clearing all hints on it.
-    pub fn take_hint(&self, file: &str) -> Result<Option<i64>> {
+    /// The freshest non-stale hint for a file, left where it is.
+    ///
+    /// Reading and deleting used to be one step, so a hint was consumed before
+    /// the commit it belonged to had been attempted. A commit that then failed
+    /// took the attribution with it: the retry found nothing and credited the
+    /// change to the human, and `apply_edit_regions` never ran either, which
+    /// left every other session's regions on that file pointing at stale line
+    /// numbers. The daemon calls `clear_hints` once the edit is in the journal.
+    pub fn peek_hint(&self, file: &str) -> Result<Option<i64>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
             .conn
             .query_row(
+                // Two sessions writing one file inside the same second tie on
+                // ts, and the tie went to the older row.
                 "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2
-                 ORDER BY ts DESC LIMIT 1",
+                 ORDER BY ts DESC, rowid DESC LIMIT 1",
                 params![file, cutoff],
                 |r| r.get(0),
             )
             .optional()?;
-        self.conn
-            .execute("DELETE FROM hints WHERE file = ?1", params![file])?;
         // Opportunistic purge of stale hints on other files.
         self.conn
             .execute("DELETE FROM hints WHERE ts < ?1", params![cutoff])?;
         Ok(hit)
+    }
+
+    /// Drop every hint on a file. Called once its edit is recorded.
+    pub fn clear_hints(&self, file: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM hints WHERE file = ?1", params![file])?;
+        Ok(())
     }
 
     // ---- edits ----------------------------------------------------------
@@ -645,4 +659,64 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: r.get(6)?,
         started_at: r.get(7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        Db::open(Path::new(":memory:")).expect("in-memory database")
+    }
+
+    fn session(db: &Db, name: &str) -> i64 {
+        db.upsert_session(name, name, "llm", Some("claude-code"))
+            .expect("session")
+    }
+
+    #[test]
+    fn a_hint_outlives_a_commit_that_failed() {
+        let db = db();
+        let agent = session(&db, "claude-a");
+        db.insert_hint("src/lib.rs", agent).unwrap();
+
+        // The daemon reads the hint, its shadow commit fails, and it never
+        // reaches clear_hints. The retry has to find the same owner.
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), Some(agent));
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), Some(agent));
+
+        db.clear_hints("src/lib.rs").unwrap();
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn clearing_one_file_leaves_the_rest_alone() {
+        let db = db();
+        let agent = session(&db, "claude-a");
+        db.insert_hint("src/lib.rs", agent).unwrap();
+        db.insert_hint("src/main.rs", agent).unwrap();
+
+        db.clear_hints("src/lib.rs").unwrap();
+
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/main.rs").unwrap(), Some(agent));
+    }
+
+    #[test]
+    fn the_newest_hint_wins_and_a_stale_one_is_ignored() {
+        let db = db();
+        let first = session(&db, "claude-a");
+        let second = session(&db, "claude-b");
+        db.insert_hint("src/lib.rs", first).unwrap();
+        db.insert_hint("src/lib.rs", second).unwrap();
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), Some(second));
+
+        db.conn
+            .execute(
+                "UPDATE hints SET ts = ?1 WHERE file = 'src/lib.rs'",
+                params![now_ts() - HINT_TTL_SECS - 1],
+            )
+            .unwrap();
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+    }
 }
