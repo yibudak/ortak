@@ -145,11 +145,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
 
     let branch_name = match branch_override {
         Some(b) => b.to_string(),
-        None => format!(
-            "{}ortak-{}-{}",
-            cfg.publish.branch_prefix,
+        None => branch_name_for(
+            &cfg.publish.branch_prefix,
             session.id,
-            slug(&intent)
+            session.task_intent.as_deref(),
         ),
     };
     repo.branch(&branch_name, &repo.find_commit(commit_oid)?, false)
@@ -377,6 +376,8 @@ fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<S
         }
     }
     unmatched
+}
+
 /// The push remote: `ortak.remote` in git config, then ortak.toml, then origin.
 /// One contributor pushes to a fork while another pushes to upstream, so this is
 /// a per-clone setting; git config is where per-clone settings already live, and
@@ -387,6 +388,16 @@ fn remote_for(repo: &Repository, cfg: &Config) -> String {
         .ok()
         .or_else(|| cfg.publish.remote.clone())
         .unwrap_or_else(|| "origin".to_string())
+}
+
+/// Generated branch name. A session that never ran `ortak intent` has no words
+/// to slug, and slugging the placeholder intent instead produced branches named
+/// `task/ortak-3-ortak-task-ortak-3`.
+fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
+    match intent.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(task) => format!("{}ortak-{}-{}", prefix, id, slug(task)),
+        None => format!("{}ortak-{}", prefix, id),
+    }
 }
 
 fn slug(text: &str) -> String {
@@ -696,6 +707,8 @@ mod tests {
         assert!(file_in(&tree, &repo).contains("KEPT-edit"));
         assert!(tree.get_path(Path::new("drop.py")).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn remote_resolution_order() {
         let dir = std::env::temp_dir().join(format!("ortak-remote-{}", std::process::id()));
@@ -718,5 +731,15 @@ mod tests {
         assert_eq!(remote_for(&repo, &cfg), "fork");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_without_intent_gets_a_plain_branch_name() {
+        assert_eq!(branch_name_for("task/", 3, None), "task/ortak-3");
+        assert_eq!(branch_name_for("task/", 3, Some("  ")), "task/ortak-3");
+        assert_eq!(
+            branch_name_for("task/", 3, Some("Implement the login page")),
+            "task/ortak-3-implement-the-login-page"
+        );
     }
 }
