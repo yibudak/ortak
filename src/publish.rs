@@ -89,6 +89,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             session.id, p.branch, p.branch
         );
     }
+    let before_exclude: Vec<String> = files.iter().map(|(f, _)| f.clone()).collect();
     for pattern in drop_excluded(&mut files, exclude) {
         println!(
             "warning: --exclude {} matched none of ortak-{}'s files",
@@ -159,6 +160,22 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             base
         );
     }
+    // Everything the session changed that this branch is not carrying, either
+    // because `--exclude` held it back or because the replay could not rebuild
+    // it. The mark has to stop short of the first of those, or the next
+    // incremental publish starts past work that has never shipped. Read after
+    // the file list rather than before, unlike `head_edit`: this can only lower
+    // the mark, and a lower mark republishes rather than drops.
+    let held_back: Vec<String> = before_exclude
+        .iter()
+        .filter(|f| !files.iter().any(|(g, _)| g == *f))
+        .cloned()
+        .collect();
+    let mark = match db.first_edit_on(session.id, after, &held_back)? {
+        Some(first) => first - 1,
+        None => head_edit,
+    };
+
     // Build the branch tree in an in-memory index: base tree + session files.
     let mut index = git2::Index::new()?;
     index.read_tree(&base_tree)?;
@@ -221,9 +238,9 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // An amend moves the branch's own mark instead of adding a second row for
     // it, so the next new deliverable still starts after everything published.
     if amend {
-        db.amend_publish(session.id, &branch_name, head_edit)?;
+        db.amend_publish(session.id, &branch_name, mark)?;
     } else {
-        db.record_publish(session.id, &branch_name, head_edit)?;
+        db.record_publish(session.id, &branch_name, mark)?;
     }
 
     // The work is out, so the lines are free. Until now only presence_minutes
@@ -632,6 +649,44 @@ fn slug(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--exclude` means "not on this branch", never "not on any branch". The
+    /// mark used to jump to the session's newest edit whatever shipped, so the
+    /// held-back file sat behind it and no later incremental publish looked
+    /// that far back again.
+    #[test]
+    fn the_mark_stops_at_the_first_file_held_back() {
+        let dir = std::env::temp_dir().join(format!("ortak-mark-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let me = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let hunk = [crate::regions::Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+        }];
+        for f in ["keep.txt", "later.txt", "keep.txt"] {
+            db.insert_edit(me, f, "modify", None, &hunk, None).unwrap();
+        }
+        let ids: Vec<i64> = (1..=3).collect();
+
+        // Nothing held back: the mark is the session's newest edit.
+        assert_eq!(db.first_edit_on(me, 0, &[]).unwrap(), None);
+        // later.txt held back: the mark stops just before its only edit, so the
+        // next publish sees it again, and keep.txt's later edit comes with it.
+        assert_eq!(
+            db.first_edit_on(me, 0, &["later.txt".to_string()]).unwrap(),
+            Some(ids[1])
+        );
+        // Already past it: a second publish does not rewind to work it shipped.
+        assert_eq!(
+            db.first_edit_on(me, ids[1], &["later.txt".to_string()])
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn lines(edits: &[(usize, &str)]) -> String {
         let mut v: Vec<String> = (1..=40).map(|i| format!("line_{i}")).collect();
