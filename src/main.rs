@@ -61,6 +61,9 @@ enum Command {
         /// Workspace-relative path to keep out of the branch (repeatable)
         #[arg(long)]
         exclude: Vec<String>,
+        /// Branch to build on, for this run only (default: [publish] base_branch)
+        #[arg(long)]
+        base: Option<String>,
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
@@ -207,6 +210,7 @@ fn run(cli: Cli) -> Result<()> {
             session,
             branch,
             exclude,
+            base,
             push,
         } => {
             let ws = Workspace::discover_from_cwd()?;
@@ -217,6 +221,7 @@ fn run(cli: Cli) -> Result<()> {
                 &session,
                 publish::PublishOpts {
                     branch: branch.as_deref(),
+                    base: base.as_deref(),
                     exclude: &exclude,
                     push,
                 },

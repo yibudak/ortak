@@ -12,6 +12,7 @@ use std::path::Path;
 /// such limit.
 pub struct PublishOpts<'a> {
     pub branch: Option<&'a str>,
+    pub base: Option<&'a str>,
     pub exclude: &'a [String],
     pub push: bool,
 }
@@ -23,9 +24,11 @@ pub struct PublishOpts<'a> {
 pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -> Result<()> {
     let PublishOpts {
         branch: branch_override,
+        base: base_override,
         exclude,
         push,
     } = opts;
+    let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
     let mut files = db.session_files(session.id)?;
@@ -54,7 +57,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             ws.root.display()
         )
     })?;
-    let base_commit = base_commit_for(&repo, &cfg.publish.base_branch)?;
+    let base_commit = base_commit_for(&repo, base)?;
     let base_tree = base_commit.tree()?;
 
     // The gate lets two sessions edit distant lines of one file, so the file on
@@ -87,7 +90,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             "cannot publish ortak-{}: every file it changed ({}) builds on another session's work that is not on {} yet. Publish and merge that session first, or point [publish] base_branch in ortak.toml at its branch",
             session.id,
             skipped.join(", "),
-            cfg.publish.base_branch
+            base
         );
     }
     // Build the branch tree in an in-memory index: base tree + session files.
@@ -164,7 +167,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         for f in &skipped {
             println!(
                 "  {} - built on another session's work that is not on {} yet",
-                f, cfg.publish.base_branch
+                f, base
             );
         }
         println!("the branch is incomplete; publish and merge that session, then publish again");
@@ -188,7 +191,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         println!("\ncreate the PR with:");
         println!(
             "  tea pr create --base {} --head {} --title \"{}\"",
-            cfg.publish.base_branch, branch_name, intent
+            base, branch_name, intent
         );
     } else {
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
@@ -412,6 +415,13 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
                 head
             )
         })
+}
+
+/// The branch this publish builds on. `--base` is per invocation, so work that
+/// sits on another session's unmerged branch can ship without every session in
+/// the workspace having to agree on a new `[publish] base_branch`.
+fn base_branch<'a>(cfg: &'a Config, base_override: Option<&'a str>) -> &'a str {
+    base_override.unwrap_or(&cfg.publish.base_branch)
 }
 
 fn slug(text: &str) -> String {
@@ -779,5 +789,16 @@ mod tests {
         assert!(err.contains("'main' does not exist"), "{err}");
         assert!(err.contains("HEAD is on 'master'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base_flag_overrides_the_configured_branch() {
+        let mut cfg = Config::default();
+        cfg.publish.base_branch = "main".into();
+        assert_eq!(base_branch(&cfg, None), "main");
+        assert_eq!(
+            base_branch(&cfg, Some("task/ortak-3-parser")),
+            "task/ortak-3-parser"
+        );
     }
 }
