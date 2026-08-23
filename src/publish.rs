@@ -140,6 +140,18 @@ pub fn run(
         println!("  {} {}", k, f);
     }
 
+    // The gate compares line regions, so it never sees the break that costs
+    // real time: a signature this branch changed and the call site another
+    // session is in. Once per deliverable is what makes the scan affordable
+    // here and not on every prompt. Advisory: a scan that fails found nothing,
+    // because a branch already built must not fail over what might break.
+    let (_, affected) = crate::impact::scan(ws, cfg, &db, session.id).unwrap_or_default();
+    if !affected.is_empty() {
+        println!("\nother sessions are working in files that use what this branch changed:");
+        crate::impact::print_refs(&affected);
+        println!("names are matched as text, so read these before believing them");
+    }
+
     if push {
         let status = std::process::Command::new("git")
             .arg("-C")

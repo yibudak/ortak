@@ -22,23 +22,8 @@ use anyhow::Result;
 pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let me = db.resolve_session(session_ref)?;
+    let (defs, refs) = scan(ws, cfg, &db, me.id)?;
 
-    let mut defs: Vec<(String, String)> = Vec::new(); // (name, the file defining it)
-    for (file, start, end) in db.session_regions(me.id)? {
-        let Ok(text) = std::fs::read_to_string(ws.root.join(&file)) else {
-            continue;
-        };
-        let skip = (start.max(1) - 1) as usize;
-        let take = (end - start + 1).max(0) as usize;
-        for line in text.lines().skip(skip).take(take) {
-            if let Some(name) = defined_name(line) {
-                let pair = (name.to_string(), file.clone());
-                if !defs.contains(&pair) {
-                    defs.push(pair);
-                }
-            }
-        }
-    }
     if defs.is_empty() {
         println!(
             "ortak-{} {} has no live regions that define anything ortak can name.",
@@ -53,16 +38,57 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str) -> Result<()> {
         me.agent_name,
         changed.join(", ")
     );
+    if refs.is_empty() {
+        println!("  no other active session has touched a file that mentions these.");
+        return Ok(());
+    }
+    print_refs(&refs);
+    Ok(())
+}
 
+/// One place another session's work meets a name this session changed.
+pub struct Ref {
+    pub name: String,
+    /// The file mentioning the name, never the one that defines it.
+    pub file: String,
+    pub session: i64,
+    pub agent: String,
+    pub minutes: i64,
+    pub intent: String,
+}
+
+/// What a scan found: the (name, defining file) pairs this session's live
+/// regions define, and the references other sessions make to them.
+pub type Scan = (Vec<(String, String)>, Vec<Ref>);
+
+/// The names this session's live regions define, and every reference the other
+/// sessions' recent files make to them. Two empty lists is the usual answer;
+/// `publish` reports the second and stays quiet about the first.
+pub fn scan(ws: &Workspace, cfg: &Config, db: &Db, session_id: i64) -> Result<Scan> {
+    let mut defs: Vec<(String, String)> = Vec::new(); // (name, the file defining it)
+    for (file, start, end) in db.session_regions(session_id)? {
+        let Ok(text) = std::fs::read_to_string(ws.root.join(&file)) else {
+            continue;
+        };
+        let skip = (start.max(1) - 1) as usize;
+        let take = (end - start + 1).max(0) as usize;
+        for line in text.lines().skip(skip).take(take) {
+            if let Some(name) = defined_name(line) {
+                let pair = (name.to_string(), file.clone());
+                if !defs.contains(&pair) {
+                    defs.push(pair);
+                }
+            }
+        }
+    }
     // Only files another active session has recently touched can matter, so
     // search those rather than walking the whole workspace for names nobody
     // else is working near.
     let recent = db.recent_session_files(cfg.line.blame_lookback_minutes * 60)?;
-    let mut hits = 0;
+    let mut refs = Vec::new();
     for (name, defined_in) in &defs {
-        let mut named = false;
         for (sid, agent, file, ts) in &recent {
-            if *sid == me.id || file == defined_in {
+            if *sid == session_id || file == defined_in {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(ws.root.join(file)) else {
@@ -71,27 +97,37 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str) -> Result<()> {
             if !mentions(&text, name) {
                 continue;
             }
-            if !named {
-                println!("  {} is referenced in {}", name, file);
-                named = true;
-            }
-            hits += 1;
-            let mins = ((crate::db::now_ts() - ts) / 60).max(0);
-            let intent = db
-                .get_session(*sid)
-                .ok()
-                .and_then(|s| s.task_intent)
-                .unwrap_or_else(|| "(not reported)".to_string());
-            println!(
-                "    ortak-{} {} has edits there, {} min ago, intent: {}",
-                sid, agent, mins, intent
-            );
+            refs.push(Ref {
+                name: name.clone(),
+                file: file.clone(),
+                session: *sid,
+                agent: agent.clone(),
+                minutes: ((crate::db::now_ts() - ts) / 60).max(0),
+                intent: db
+                    .get_session(*sid)
+                    .ok()
+                    .and_then(|s| s.task_intent)
+                    .unwrap_or_else(|| "(not reported)".to_string()),
+            });
         }
     }
-    if hits == 0 {
-        println!("  no other active session has touched a file that mentions these.");
+    Ok((defs, refs))
+}
+
+/// The references, one heading per name and file. `publish` prints the same
+/// shape, so a session reads one report whichever command produced it.
+pub fn print_refs(refs: &[Ref]) {
+    let mut heading: Option<(&str, &str)> = None;
+    for r in refs {
+        if heading != Some((&r.name, &r.file)) {
+            println!("  {} is referenced in {}", r.name, r.file);
+            heading = Some((&r.name, &r.file));
+        }
+        println!(
+            "    ortak-{} {} has edits there, {} min ago, intent: {}",
+            r.session, r.agent, r.minutes, r.intent
+        );
     }
-    Ok(())
 }
 
 /// The name a line defines, if it looks like a definition. Covers Rust `fn`,
@@ -139,6 +175,56 @@ fn mentions(text: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regions::Hunk;
+
+    /// The scan `publish` runs: a name inside this session's live region, and
+    /// another session working in a file that spells it.
+    #[test]
+    fn scan_finds_the_other_session_that_uses_the_name() {
+        let dir = std::env::temp_dir().join(format!("ortak-impact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.rs"),
+            "pub fn remote_for(cfg: &Config) {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("hooks.rs"), "let r = remote_for(&cfg);\n").unwrap();
+
+        let ws = Workspace::at(&dir);
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let me = db
+            .upsert_session("mine", "claude-mine", "llm", None)
+            .unwrap();
+        let them = db
+            .upsert_session("theirs", "claude-theirs", "llm", None)
+            .unwrap();
+        let first_line = Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+        };
+        db.apply_edit_regions(me, "config.rs", &[first_line])
+            .unwrap();
+        db.insert_edit(them, "hooks.rs", "modify", None, &[])
+            .unwrap();
+
+        let (defs, refs) = scan(&ws, &Config::default(), &db, me).unwrap();
+        assert_eq!(
+            defs,
+            vec![("remote_for".to_string(), "config.rs".to_string())]
+        );
+        assert_eq!(refs.len(), 1, "{:?}", refs.len());
+        assert_eq!(refs[0].name, "remote_for");
+        assert_eq!(refs[0].file, "hooks.rs");
+        assert_eq!(refs[0].session, them);
+
+        // A session with no regions defines nothing, so it breaks nobody.
+        let (defs, refs) = scan(&ws, &Config::default(), &db, them).unwrap();
+        assert!(defs.is_empty() && refs.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn reads_definitions_out_of_rust() {
