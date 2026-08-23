@@ -64,8 +64,16 @@ pub fn run(
     // from its shadow history instead of reading the workspace.
     let shadow = crate::shadow::open(ws)?;
     let seed = base_seed(&shadow, &repo, &base_tree, &files)?;
-    let (session_tree, unreplayable) =
-        session_only_tree(&shadow, &seed, &base_tree, &db.session_commits(session.id)?)?;
+    // An excluded file leaves the replay too, not just the branch. Its commits
+    // can still fail to apply, and a file nobody asked to publish has no
+    // business failing the publish.
+    let commits: Vec<String> = db
+        .session_commits(session.id)?
+        .into_iter()
+        .filter(|(_, f)| files.iter().any(|(g, _)| g == f))
+        .map(|(c, _)| c)
+        .collect();
+    let (session_tree, unreplayable) = session_only_tree(&shadow, &seed, &base_tree, &commits)?;
 
     // A file whose history cannot be replayed has no correct content to ship, so
     // it leaves the branch and the rest of the session's work still goes out.
@@ -599,5 +607,47 @@ mod tests {
         let unmatched = drop_excluded(&mut files, &["./notes.md".into(), "src/gone.rs".into()]);
         assert_eq!(files, vec![("src/db.rs".to_string(), "modify".to_string())]);
         assert_eq!(unmatched, vec!["src/gone.rs".to_string()]);
+    }
+
+    /// Excluding a file has to take its commits out of the replay as well.
+    /// Leaving them in let a file nobody was publishing fail the publish.
+    #[test]
+    fn an_excluded_file_is_not_replayed_either() {
+        let (dir, repo) = scratch("excluded-replay");
+        let root = commit_file(&repo, None, "app.py", &lines(&[]));
+        let root_c = repo.find_commit(root).unwrap();
+        // A commit on a file that will be excluded, in between two that are kept.
+        let dropped = commit_file(&repo, Some(&root_c), "drop.py", "unrelated\n");
+        let dropped_c = repo.find_commit(dropped).unwrap();
+        let kept = commit_file(
+            &repo,
+            Some(&dropped_c),
+            "app.py",
+            &lines(&[(4, "KEPT-edit")]),
+        );
+
+        let mut files = vec![
+            ("app.py".to_string(), "modify".to_string()),
+            ("drop.py".to_string(), "create".to_string()),
+        ];
+        drop_excluded(&mut files, &["drop.py".into()]);
+        let all = vec![
+            (dropped.to_string(), "drop.py".to_string()),
+            (kept.to_string(), "app.py".to_string()),
+        ];
+        let commits: Vec<String> = all
+            .into_iter()
+            .filter(|(_, f)| files.iter().any(|(g, _)| g == f))
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(commits, vec![kept.to_string()]);
+
+        let base = tree_with(&repo, Some(&lines(&[])));
+        let seed = parentless(&repo, &base);
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &commits).unwrap();
+        assert!(skipped.is_empty());
+        assert!(file_in(&tree, &repo).contains("KEPT-edit"));
+        assert!(tree.get_path(Path::new("drop.py")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

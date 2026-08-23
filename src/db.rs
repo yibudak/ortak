@@ -338,16 +338,18 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Every shadow micro-commit this session recorded, oldest first. Publishing
-    /// replays these to rebuild the session's own content, so the full history
-    /// matters here where `session_files` only needs each file's final state.
-    pub fn session_commits(&self, session_id: i64) -> Result<Vec<String>> {
+    /// Every shadow micro-commit this session recorded with the file it touched,
+    /// oldest first. Publishing replays these to rebuild the session's own
+    /// content, so the full history matters here where `session_files` only
+    /// needs each file's final state. The file comes along so a publish can
+    /// leave one out of the replay as well as out of the branch.
+    pub fn session_commits(&self, session_id: i64) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT shadow_commit FROM edits
+            "SELECT shadow_commit, file FROM edits
              WHERE session_id = ?1 AND shadow_commit IS NOT NULL
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
