@@ -533,12 +533,13 @@ fn blame(target: &str) -> Result<()> {
             return Ok(());
         };
         println!(
-            "{}:{} - ortak-{} {}, {}",
+            "{}:{} - ortak-{} {}, {}{}",
             rel,
             line,
             o.session_id,
             o.agent_name,
-            ago(now - o.last_ts)
+            ago(now - o.last_ts),
+            inferred_note(o)
         );
         println!(
             "  owns {}, intent: {}",
@@ -558,11 +559,12 @@ fn blame(target: &str) -> Result<()> {
     println!("{}", rel);
     for o in &owners {
         println!(
-            "  {:>12}  ortak-{} {}, {}",
+            "  {:>12}  ortak-{} {}, {}{}",
             range(o),
             o.session_id,
             o.agent_name,
-            ago(now - o.last_ts)
+            ago(now - o.last_ts),
+            inferred_note(o)
         );
         println!(
             "                intent: {}",
@@ -570,6 +572,16 @@ fn blame(target: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A session, a time and an intent read as a complete account whether or not
+/// anybody reported the edit. `ortak log` marks these rows in the same words.
+fn inferred_note(o: &db::Owner) -> &'static str {
+    if o.inferred {
+        "   (inferred from a running command)"
+    } else {
+        ""
+    }
 }
 
 fn range(o: &db::Owner) -> String {
