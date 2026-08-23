@@ -273,6 +273,8 @@ impl Db {
     /// Falls back to an open Bash claim: the harness hooks cover the edit tools
     /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
     /// the daemon unattributed and would otherwise land on the human session.
+    /// That fallback applies only while exactly one session has a command
+    /// running; see below for why a second claim cancels the guess.
     pub fn take_hint(&self, file: &str) -> Result<Option<i64>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
@@ -298,16 +300,25 @@ impl Db {
         // A claim is not consumed: one command can write many files. Ending the
         // session retires it, so a harness that dies mid-command cannot leave
         // one standing.
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
-                 WHERE h.file = ?1 AND s.status = 'active'
-                 ORDER BY h.ts DESC LIMIT 1",
-                params![BASH_CLAIM],
-                |r| r.get(0),
-            )
-            .optional()?)
+        //
+        // Only one, though. Two sessions running commands at the same time and
+        // the daemon has no way to tell whose command produced the write; it
+        // used to take the newest claim, which is how one agent's
+        // `cargo fmt --all` was credited to the other, taking the region and
+        // the publishable content with it. Nothing reported it. A wrong owner
+        // is worse than no owner, so an ambiguous write falls through to the
+        // human session, where it is at least honest.
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
+             WHERE h.file = ?1 AND s.status = 'active' LIMIT 2",
+        )?;
+        let claimants: Vec<i64> = stmt
+            .query_map(params![BASH_CLAIM], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(match claimants.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        })
     }
 
     /// Close a session's Bash claim once its command has finished.
@@ -721,6 +732,33 @@ mod tests {
 
         db.clear_bash_claim(agent).unwrap();
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn two_commands_at_once_credit_nobody() {
+        let db = temp_db("two-claims");
+        let a = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let b = db
+            .upsert_session("sess-b", "claude-b", "llm", Some("claude-code"))
+            .unwrap();
+
+        db.insert_hint(BASH_CLAIM, a).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(a));
+
+        // b starts a command of its own. Whoever writes src/x.rs now, the
+        // daemon cannot tell which of the two did it, so it does not guess.
+        db.insert_hint(BASH_CLAIM, b).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+
+        // A hook naming the file is evidence and still outranks both claims.
+        db.insert_hint("src/x.rs", b).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(b));
+
+        // b's command finishes and a is an unambiguous guess again.
+        db.clear_bash_claim(b).unwrap();
+        assert_eq!(db.take_hint("src/x.rs").unwrap(), Some(a));
     }
 
     #[test]
