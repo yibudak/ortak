@@ -60,9 +60,12 @@ ortak publish ortak-N --push   # push the branch; use the printed tea command to
 ## Useful commands
 
 ```bash
-ortak status        # daemon and sessions
-ortak log           # recent journal entries and their owners
+ortak status         # daemon and sessions
+ortak log            # recent journal entries and their owners
 ortak log --session ortak-N
+ortak impact ortak-N # who else is working on files that use what you changed
 ```
 
 Check `ortak log` before changing unexpected content in a file. Another session may own that change.
+
+Run `ortak impact ortak-N` after changing a function signature, a schema, or anything else another file calls. The gate compares line ranges, so it cannot see that your change at line 10 of one file breaks a call at line 200 of another.
