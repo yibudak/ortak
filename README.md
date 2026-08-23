@@ -57,6 +57,28 @@ claude plugin marketplace add /path/to/your/ortak/clone
 Switch back to the published plugin with `claude plugin marketplace remove ortak`
 followed by the `add` command above.
 
+## Working alongside other sessions
+
+ortak journals and gates file edits. It does not touch Git, and Git is the one
+place it cannot protect you: `git stash`, `checkout`, `switch`, `branch`,
+`commit` and `add` all act on the whole tree, including the uncommitted work of
+every other session in it. A stash takes their changes with yours; a commit
+ships files you never looked at. Leave those commands alone while other sessions
+are working and let `ortak publish` build the branch from your own journal
+instead. `git diff`, `git log` and `git status` change nothing, so use them
+freely.
+
+The SessionStart context states this rule and the plugin's skill expands on it,
+but neither is enforced. If you want it to hold every time, put it in your
+project's own `CLAUDE.md` or `AGENTS.md`, where the agent reads it on every turn
+instead of once at startup.
+
+A session that was already running when you installed the plugin does not have
+the hooks, because a harness reads them at session start. That session never
+registers, everything it writes lands on `human` in the journal, and
+`ortak publish` has no branch to build for it. Restart or resume it to pick the
+hooks up.
+
 ## Use
 
 ```bash
