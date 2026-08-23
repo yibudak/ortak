@@ -119,6 +119,9 @@ enum Command {
         /// Branch to build on, for this run only (default: [publish] base_branch)
         #[arg(long)]
         base: Option<String>,
+        /// Commit subject for this branch (default: the session's intent)
+        #[arg(long, short = 'm')]
+        message: Option<String>,
         /// Publish everything the session has touched, not just what is new
         #[arg(long)]
         all: bool,
@@ -301,6 +304,7 @@ fn run(cli: Cli) -> Result<()> {
             branch,
             exclude,
             base,
+            message,
             all,
             amend,
             push,
@@ -324,6 +328,7 @@ fn run(cli: Cli) -> Result<()> {
                     exclude: &exclude,
                     scope,
                     push,
+                    message: message.as_deref(),
                 },
             )
         }

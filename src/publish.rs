@@ -27,6 +27,8 @@ pub struct PublishOpts<'a> {
     pub exclude: &'a [String],
     pub scope: Scope,
     pub push: bool,
+    /// Subject line for this branch's commit, in place of the session intent.
+    pub message: Option<&'a str>,
 }
 
 /// Assemble a session's net change into a real branch on the workspace's git
@@ -40,6 +42,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         exclude,
         scope,
         push,
+        message: subject,
     } = opts;
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
@@ -190,9 +193,15 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         .task_intent
         .clone()
         .unwrap_or_else(|| format!("ortak task ortak-{}", session.id));
+    // `intent` was written when a session was one task. Since publish went
+    // incremental it is several, so a session either keeps the intent broad and
+    // every commit message names all three deliverables, or rewrites it before
+    // each publish and forgets. --message says what this branch is and leaves
+    // the intent to `status`, where the other sessions read it.
+    let subject = subject.unwrap_or(&intent);
     let message = format!(
         "{}\n\nOrtak-Session: {}\nOrtak-Agent: {}\nOrtak-Files: {}\n",
-        intent,
+        subject,
         session.external_id,
         session.agent_name,
         files.len()
@@ -322,7 +331,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             println!("\ncreate the PR with:");
             println!(
                 "  tea pr create --base {} --head {} --title \"{}\"",
-                base, branch_name, intent
+                base, branch_name, subject
             );
         }
     } else if amend {
