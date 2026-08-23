@@ -222,7 +222,7 @@ fn session_only_tree<'r>(
                 .collect();
             if !unshipped.is_empty() {
                 bail!(
-                    "cannot publish {}: this session changed a file another session created, and that file is not on the base branch yet. Publish and merge the session that created it first, or pass --branch to build on top of its branch",
+                    "cannot publish {}: this session changed a file another session created, and that file is not on the base branch yet. Publish and merge the session that created it first, or point [publish] base_branch in ortak.toml at its branch and publish again",
                     unshipped
                         .iter()
                         .map(|p| p.as_str())
