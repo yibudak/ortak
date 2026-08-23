@@ -755,6 +755,18 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// A session's live regions: the ranges it currently owns, file by file.
+    pub fn session_regions(&self, session_id: i64) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file, start_line, end_line FROM regions WHERE session_id = ?1
+             ORDER BY file, start_line",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// All hot regions in the workspace (for `status`).
     pub fn fresh_regions(&self, presence_secs: i64) -> Result<Vec<FreshRegion>> {
         let cutoff = now_ts() - presence_secs;

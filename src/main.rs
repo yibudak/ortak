@@ -3,6 +3,7 @@ mod daemon;
 mod db;
 mod hooks;
 mod json;
+mod impact;
 mod line;
 mod orchestrator;
 mod publish;
@@ -128,6 +129,11 @@ enum Command {
     },
     /// Reassign an open error
     Assign { error_id: i64, session: String },
+    /// Show what else in the workspace a session's changes may have broken
+    Impact {
+        /// Session reference (ortak-3)
+        session: String,
+    },
     /// Harness hook adapters (read hook JSON from stdin)
     Hook {
         #[command(subcommand)]
@@ -299,6 +305,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Assign { error_id, session } => {
             let ws = Workspace::discover_from_cwd()?;
             line::assign(&ws, error_id, &session)
+        }
+        Command::Impact { session } => {
+            let ws = Workspace::discover_from_cwd()?;
+            let cfg = Config::load(&ws.config_path)?;
+            impact::run(&ws, &cfg, &session)
         }
         Command::Hook { .. } => unreachable!("hook handled in main"),
     }
