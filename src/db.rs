@@ -400,6 +400,20 @@ impl Db {
 
     // ---- regions --------------------------------------------------------
 
+    /// Give up a session's claim on a file's lines, or on every file it holds.
+    /// Returns how many regions were dropped.
+    ///
+    /// `presence_minutes` was the only thing that ever cooled a region, and a
+    /// timer cannot tell a session that walked away from one that is still
+    /// working. A session that has published those lines, or says outright
+    /// that it is done with them, is a signal.
+    pub fn release_regions(&self, session_id: i64, file: Option<&str>) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM regions WHERE session_id = ?1 AND (?2 IS NULL OR file = ?2)",
+            params![session_id, file],
+        )?)
+    }
+
     /// After journaling an edit: shift every existing region on the file
     /// through the edit's hunks, drop regions the edit overwrote, and record
     /// the editor's own new regions (merged with what it already owned).
@@ -799,5 +813,47 @@ mod tests {
         let failing = db.journal_failures().unwrap();
         assert_eq!(failing.len(), 1);
         assert_eq!(failing[0].file, "src/main.rs");
+    }
+
+    /// Give a session a region on `file` by journaling an edit to it, the way
+    /// the daemon does.
+    fn owns(db: &Db, session_id: i64, file: &str, start: i64, lines: i64) {
+        let hunks = [Hunk {
+            old_start: start,
+            old_lines: lines,
+            new_start: start,
+            new_lines: lines,
+        }];
+        db.insert_edit(session_id, file, "modify", None, &hunks)
+            .unwrap();
+        db.apply_edit_regions(session_id, file, &hunks).unwrap();
+    }
+
+    #[test]
+    fn releasing_one_session_leaves_the_other_holding_its_lines() {
+        let db = db();
+        let first = session(&db, "claude-a");
+        let second = session(&db, "claude-b");
+        let onlooker = session(&db, "claude-c");
+        owns(&db, first, "src/hooks.rs", 10, 5);
+        owns(&db, second, "src/hooks.rs", 100, 5);
+
+        let at = |line: i64| Region {
+            start: line,
+            end: line,
+        };
+        let hot = |line: i64| db.conflicts("src/hooks.rs", &[at(line)], onlooker, 3, 1800);
+        assert_eq!(hot(12).unwrap().len(), 1);
+        assert_eq!(hot(102).unwrap().len(), 1);
+
+        assert_eq!(db.release_regions(first, Some("src/hooks.rs")).unwrap(), 1);
+
+        assert!(hot(12).unwrap().is_empty(), "released lines stay free");
+        assert_eq!(hot(102).unwrap().len(), 1, "the other session still holds");
+        assert!(db
+            .fresh_regions(1800)
+            .unwrap()
+            .iter()
+            .all(|(_, _, _, _, sid, _)| *sid == second));
     }
 }

@@ -130,6 +130,14 @@ pub fn run(
             )
         })?;
 
+    // The work is out, so the lines are free. Until now only presence_minutes
+    // ever cooled a region, and a session that had published and moved on kept
+    // the gate pointed at code it was finished with.
+    let mut released = 0;
+    for (file, _) in &files {
+        released += db.release_regions(session.id, Some(file))?;
+    }
+
     println!(
         "branch ready: {} ({} files, commit {})",
         branch_name,
@@ -138,6 +146,12 @@ pub fn run(
     );
     for (f, k) in &files {
         println!("  {} {}", k, f);
+    }
+    if released > 0 {
+        println!(
+            "released {} protected region(s) on those files; other sessions may edit them now",
+            released
+        );
     }
 
     if push {
