@@ -3,6 +3,7 @@ mod daemon;
 mod db;
 mod hooks;
 mod line;
+mod notes;
 mod orchestrator;
 mod publish;
 mod regions;
@@ -41,6 +42,11 @@ enum Command {
         session: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+    /// Record why a change was made, or read the notes on a file
+    Why {
+        /// Writing: ortak-N <file> <why...>. Reading: <file> or <file>:<line>
+        args: Vec<String>,
     },
     /// List sessions
     Sessions,
@@ -137,6 +143,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Status => status(),
         Command::Log { session, limit } => log(session.as_deref(), limit),
+        Command::Why { args } => notes::run(&args),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
         Command::Publish {
