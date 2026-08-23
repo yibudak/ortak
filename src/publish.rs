@@ -14,14 +14,27 @@ pub fn run(
     cfg: &Config,
     session_ref: &str,
     branch_override: Option<&str>,
+    exclude: &[String],
     push: bool,
 ) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
-    let files = db.session_files(session.id)?;
+    let mut files = db.session_files(session.id)?;
     if files.is_empty() {
         bail!(
             "ortak-{} has no recorded file changes; nothing to publish",
+            session.id
+        );
+    }
+    for pattern in drop_excluded(&mut files, exclude) {
+        println!(
+            "warning: --exclude {} matched none of ortak-{}'s files",
+            pattern, session.id
+        );
+    }
+    if files.is_empty() {
+        bail!(
+            "every file ortak-{} changed was excluded; nothing left to publish",
             session.id
         );
     }
@@ -51,8 +64,26 @@ pub fn run(
     // from its shadow history instead of reading the workspace.
     let shadow = crate::shadow::open(ws)?;
     let seed = base_seed(&shadow, &repo, &base_tree, &files)?;
-    let session_tree =
+    let (session_tree, unreplayable) =
         session_only_tree(&shadow, &seed, &base_tree, &db.session_commits(session.id)?)?;
+
+    // A file whose history cannot be replayed has no correct content to ship, so
+    // it leaves the branch and the rest of the session's work still goes out.
+    // One such file used to take the other four down with it.
+    let skipped: Vec<String> = files
+        .iter()
+        .map(|(f, _)| f.clone())
+        .filter(|f| unreplayable.contains(f))
+        .collect();
+    files.retain(|(f, _)| !skipped.contains(f));
+    if files.is_empty() {
+        bail!(
+            "cannot publish ortak-{}: every file it changed ({}) builds on another session's work that is not on {} yet. Publish and merge that session first, or point [publish] base_branch in ortak.toml at its branch",
+            session.id,
+            skipped.join(", "),
+            cfg.publish.base_branch
+        );
+    }
 
     // Build the branch tree in an in-memory index: base tree + session files.
     let mut index = git2::Index::new()?;
@@ -117,6 +148,18 @@ pub fn run(
     );
     for (f, k) in &files {
         println!("  {} {}", k, f);
+    }
+    // After the file list, never before it: someone skimming the output has to
+    // read what the branch does contain before they can judge what is missing.
+    if !skipped.is_empty() {
+        println!("\nleft out of this branch:");
+        for f in &skipped {
+            println!(
+                "  {} - built on another session's work that is not on {} yet",
+                f, cfg.publish.base_branch
+            );
+        }
+        println!("the branch is incomplete; publish and merge that session, then publish again");
     }
 
     if push {
@@ -193,13 +236,16 @@ fn base_seed<'r>(
 /// three-way merge, which absorbs the line shifts a concurrent session causes.
 /// The gate keeps sessions `margin_lines` apart, which is why those shifts stay
 /// outside the patch context in practice.
+///
+/// Returns the replayed tree and the files that had to be left out of it.
 fn session_only_tree<'r>(
     shadow: &'r Repository,
     seed: &Commit<'r>,
     base_tree: &Tree,
     commits: &[String],
-) -> Result<Tree<'r>> {
+) -> Result<(Tree<'r>, Vec<String>)> {
     let mut head = seed.clone();
+    let mut unreplayable: Vec<String> = Vec::new();
     let sig = Signature::now("ortak", "publish@ortak.local")?;
     for id in commits {
         let oid = Oid::from_str(id).with_context(|| format!("malformed shadow commit id {id}"))?;
@@ -216,19 +262,19 @@ fn session_only_tree<'r>(
                 .collect();
             // A file the base branch does not carry is not a content clash: this
             // session built on another session's work that has not shipped yet.
+            // Drop the commit and keep replaying, so one such file costs its own
+            // file and nothing else; `run` reports what was left out.
             let unshipped: Vec<&String> = paths
                 .iter()
                 .filter(|p| base_tree.get_path(Path::new(p)).is_err())
                 .collect();
-            if !unshipped.is_empty() {
-                bail!(
-                    "cannot publish {}: this session changed a file another session created, and that file is not on the base branch yet. Publish and merge the session that created it first, or point [publish] base_branch in ortak.toml at its branch and publish again",
-                    unshipped
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+            if !unshipped.is_empty() && unshipped.len() == paths.len() {
+                for p in unshipped {
+                    if !unreplayable.contains(p) {
+                        unreplayable.push(p.clone());
+                    }
+                }
+                continue;
             }
             bail!(
                 "cannot replay this session's changes to {}: another session's edits sit too close to separate them automatically",
@@ -239,7 +285,23 @@ fn session_only_tree<'r>(
         let next = shadow.commit(None, &sig, &sig, "replay", &tree, &[&head])?;
         head = shadow.find_commit(next)?;
     }
-    Ok(head.tree()?)
+    Ok((head.tree()?, unreplayable))
+}
+
+/// Drop the `--exclude` paths from the publish, returning the ones that matched
+/// nothing. A mistyped path is silent otherwise, and the file it was meant to
+/// keep out of the branch ships anyway.
+fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<String> {
+    let mut unmatched = Vec::new();
+    for pattern in exclude {
+        let path = pattern.trim_start_matches("./");
+        let before = files.len();
+        files.retain(|(f, _)| f != path);
+        if files.len() == before {
+            unmatched.push(pattern.clone());
+        }
+    }
+    unmatched
 }
 
 fn slug(text: &str) -> String {
@@ -296,9 +358,27 @@ mod tests {
     }
 
     fn file_in(tree: &Tree, repo: &Repository) -> String {
-        let entry = tree.get_path(Path::new("app.py")).unwrap();
+        named_file_in(tree, repo, "app.py")
+    }
+
+    fn named_file_in(tree: &Tree, repo: &Repository, name: &str) -> String {
+        let entry = tree.get_path(Path::new(name)).unwrap();
         let blob = repo.find_blob(entry.id()).unwrap();
         String::from_utf8_lossy(blob.content()).into_owned()
+    }
+
+    /// A micro-commit touching one named file, on top of whatever `parent` has.
+    fn commit_file(repo: &Repository, parent: Option<&Commit>, name: &str, content: &str) -> Oid {
+        let mut tb = match parent {
+            Some(p) => repo.treebuilder(Some(&p.tree().unwrap())).unwrap(),
+            None => repo.treebuilder(None).unwrap(),
+        };
+        let blob = repo.blob(content.as_bytes()).unwrap();
+        tb.insert(name, blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = Signature::now("t", "t@t.t").unwrap();
+        let parents: Vec<&Commit> = parent.into_iter().collect();
+        repo.commit(None, &sig, &sig, "e", &tree, &parents).unwrap()
     }
 
     fn scratch(name: &str) -> (std::path::PathBuf, Repository) {
@@ -334,7 +414,8 @@ mod tests {
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
         let picks = vec![a1.to_string(), a2.to_string()];
-        let tree = session_only_tree(&repo, &seed, &base, &picks).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
+        assert!(skipped.is_empty());
         let out = file_in(&tree, &repo);
 
         assert!(out.contains("AAA-first"), "A's first edit is missing");
@@ -351,7 +432,7 @@ mod tests {
         let (dir, repo) = scratch("empty");
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
-        let tree = session_only_tree(&repo, &seed, &base, &[]).unwrap();
+        let (tree, _) = session_only_tree(&repo, &seed, &base, &[]).unwrap();
         assert_eq!(file_in(&tree, &repo), lines(&[]));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -376,33 +457,56 @@ mod tests {
         // Session A's file has since been merged, so the base branch carries it.
         let base = tree_with(&repo, Some(&lines(&[(3, "AAA-created")])));
         let seed = parentless(&repo, &base);
-        let tree = session_only_tree(&repo, &seed, &base, &[edited.to_string()]).unwrap();
+        let (tree, _) = session_only_tree(&repo, &seed, &base, &[edited.to_string()]).unwrap();
         assert!(file_in(&tree, &repo).contains("BBB-edit"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The same shape, except the file has not shipped. There is no branch to
-    /// publish for B on its own, so the error has to say which file and why.
+    /// The same shape, except the file has not shipped, and the session also
+    /// touched a file of its own. One unreplayable file used to take the whole
+    /// session's work down with it; now it costs only itself.
     #[test]
-    fn replay_reports_a_dependency_on_unshipped_work() {
+    fn replay_leaves_out_a_dependency_on_unshipped_work() {
         let (dir, repo) = scratch("unshipped");
-        let root = commit(&repo, None, None);
-        let root = repo.find_commit(root).unwrap();
-        let created = commit(&repo, Some(&root), Some(&lines(&[(3, "AAA-created")])));
-        let created_c = repo.find_commit(created).unwrap();
-        let edited = commit(
+        // Another session created dep.py, and it is on no branch yet.
+        let theirs = commit_file(&repo, None, "dep.py", &lines(&[(3, "THEIRS")]));
+        let theirs = repo.find_commit(theirs).unwrap();
+        let touched = commit_file(
             &repo,
-            Some(&created_c),
-            Some(&lines(&[(3, "AAA-created"), (30, "BBB-edit")])),
+            Some(&theirs),
+            "dep.py",
+            &lines(&[(3, "THEIRS"), (30, "MINE-edit")]),
+        );
+        let touched_c = repo.find_commit(touched).unwrap();
+        let own = commit_file(
+            &repo,
+            Some(&touched_c),
+            "mine.py",
+            &lines(&[(1, "MINE-new")]),
         );
 
         let base = tree_with(&repo, None); // nothing shipped
         let seed = parentless(&repo, &base);
-        let err = session_only_tree(&repo, &seed, &base, &[edited.to_string()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("app.py"), "{err}");
-        assert!(err.contains("not on the base branch"), "{err}");
+        let picks = vec![touched.to_string(), own.to_string()];
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
+
+        assert_eq!(skipped, vec!["dep.py".to_string()]);
+        assert!(named_file_in(&tree, &repo, "mine.py").contains("MINE-new"));
+        assert!(
+            tree.get_path(Path::new("dep.py")).is_err(),
+            "an unshipped dependency leaked into the branch"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exclude_drops_the_named_file_and_reports_a_miss() {
+        let mut files = vec![
+            ("src/db.rs".to_string(), "modify".to_string()),
+            ("notes.md".to_string(), "create".to_string()),
+        ];
+        let unmatched = drop_excluded(&mut files, &["./notes.md".into(), "src/gone.rs".into()]);
+        assert_eq!(files, vec![("src/db.rs".to_string(), "modify".to_string())]);
+        assert_eq!(unmatched, vec!["src/gone.rs".to_string()]);
     }
 }

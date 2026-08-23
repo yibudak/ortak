@@ -58,6 +58,9 @@ enum Command {
         /// Branch name (default: <prefix>ortak-<id>-<slug>)
         #[arg(long)]
         branch: Option<String>,
+        /// Workspace-relative path to keep out of the branch (repeatable)
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
@@ -142,11 +145,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Publish {
             session,
             branch,
+            exclude,
             push,
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
-            publish::run(&ws, &cfg, &session, branch.as_deref(), push)
+            publish::run(&ws, &cfg, &session, branch.as_deref(), &exclude, push)
         }
         Command::Report {
             session,
