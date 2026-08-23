@@ -485,14 +485,44 @@ pub fn prompt_context() -> Result<()> {
     };
     let db = Db::open(&ws.db_path)?;
     let open = db.open_errors()?;
-    if open.is_empty() {
+    let failing = db.journal_failures()?;
+    if open.is_empty() && failing.is_empty() {
         return Ok(());
     }
+    let mut parts: Vec<String> = Vec::new();
+    if !open.is_empty() {
+        parts.push(line_status(&input, &db, &open)?);
+    }
+    // An agent that cannot see the daemon's terminal finds out here that its
+    // edits are not reaching the journal, at the top of its next turn rather
+    // than at publish time.
+    if let Some(newest) = failing.first() {
+        parts.push(format!(
+            "ortak JOURNAL FAILING: {} file(s) are not reaching the journal, most recently {}: {}. \
+             Edits to those files are attributed to nobody and will not publish. Run `ortak status`.",
+            failing.len(),
+            newest.file,
+            newest.reason
+        ));
+    }
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": parts.join("\n\n"),
+        }
+    });
+    println!("{}", out);
+    Ok(())
+}
+
+/// The stopped-line half of the prompt context: who owns the fix, and what it
+/// means for the session reading it.
+fn line_status(input: &Value, db: &Db, open: &[crate::db::ErrorRow]) -> Result<String> {
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let harness = harness_for(&input);
+    let harness = harness_for(input);
     let me = db.upsert_session(
         external_id,
         &agent_name_for(external_id, harness),
@@ -527,11 +557,7 @@ pub fn prompt_context() -> Result<()> {
             e.responsible_name()
         )
     };
-    let out = serde_json::json!({
-        "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": context }
-    });
-    println!("{}", out);
-    Ok(())
+    Ok(context)
 }
 
 pub fn session_end() -> Result<()> {

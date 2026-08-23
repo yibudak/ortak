@@ -79,6 +79,16 @@ pub struct Conflict {
 
 pub type FreshRegion = (String, i64, i64, String, i64, i64);
 
+/// A file the daemon is currently failing to journal.
+#[derive(Debug, Clone)]
+pub struct JournalFailure {
+    pub file: String,
+    pub reason: String,
+    pub ts: i64,
+    /// Consecutive failed attempts on this file.
+    pub streak: i64,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -130,6 +140,12 @@ CREATE TABLE IF NOT EXISTS errors (
   fix_brief        TEXT,
   ts_opened        INTEGER NOT NULL,
   ts_resolved      INTEGER
+);
+CREATE TABLE IF NOT EXISTS journal_failures (
+  file   TEXT PRIMARY KEY,          -- newest failure only; the history is noise
+  reason TEXT NOT NULL,
+  ts     INTEGER NOT NULL,
+  streak INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -623,6 +639,47 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    // ---- journal health -------------------------------------------------
+
+    /// Note that a file could not be journaled.
+    ///
+    /// Only the newest failure per file is kept. A daemon stuck in a bad loop
+    /// would otherwise add a row every 400 ms, and the history answers nothing
+    /// the streak does not.
+    pub fn record_journal_failure(&self, file: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO journal_failures (file, reason, ts, streak) VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(file) DO UPDATE SET reason = ?2, ts = ?3, streak = streak + 1",
+            params![file, reason, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a file's failure, once it journals again.
+    pub fn clear_journal_failure(&self, file: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM journal_failures WHERE file = ?1",
+            params![file],
+        )?;
+        Ok(())
+    }
+
+    /// Files the daemon is failing on right now, newest failure first.
+    pub fn journal_failures(&self) -> Result<Vec<JournalFailure>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file, reason, ts, streak FROM journal_failures ORDER BY ts DESC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(JournalFailure {
+                file: r.get(0)?,
+                reason: r.get(1)?,
+                ts: r.get(2)?,
+                streak: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- meta / heartbeat ----------------------------------------------
 
     pub fn heartbeat(&self) -> Result<()> {
@@ -718,5 +775,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn a_failing_file_is_held_until_it_journals_again() {
+        let db = db();
+        assert!(db.journal_failures().unwrap().is_empty());
+
+        db.record_journal_failure("src/db.rs", "the index is locked")
+            .unwrap();
+        db.record_journal_failure("src/db.rs", "the index is locked")
+            .unwrap();
+        db.record_journal_failure("src/main.rs", "old reference value does not match")
+            .unwrap();
+
+        let failing = db.journal_failures().unwrap();
+        assert_eq!(failing.len(), 2, "one row per file, not one per attempt");
+        let locked = failing.iter().find(|f| f.file == "src/db.rs").unwrap();
+        assert_eq!(locked.streak, 2);
+        assert_eq!(locked.reason, "the index is locked");
+
+        db.clear_journal_failure("src/db.rs").unwrap();
+        let failing = db.journal_failures().unwrap();
+        assert_eq!(failing.len(), 1);
+        assert_eq!(failing[0].file, "src/main.rs");
     }
 }
