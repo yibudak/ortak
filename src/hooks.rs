@@ -71,10 +71,18 @@ pub fn session_start() -> Result<()> {
         "llm",
         Some(harness),
     )?;
+    // The no-git rule belongs here rather than only in the skill: a skill loads
+    // when the model judges it relevant, and this is the rule people get burned
+    // by. Advisory on purpose. Nothing blocks git, because the gate cannot tell
+    // a lone session's harmless commit from one that sweeps up another
+    // session's uncommitted work.
     let context = format!(
         "ortak is active. The journal attributes this session's file changes to ortak-{id}. \
          Before editing, record your task intent: `ortak intent ortak-{id} \"<one-sentence task>\"`. \
-         Publish your changes as a branch and PR with: `ortak publish ortak-{id}`."
+         Publish your changes as a branch and PR with: `ortak publish ortak-{id}`. \
+         Do not run `git stash`, `checkout`, `switch`, `branch`, `commit` or `add` in this \
+         workspace: other sessions have uncommitted work in the same tree and those commands \
+         will take it. Read-only git is fine."
     );
     let out = serde_json::json!({
         "hookSpecificOutput": {
