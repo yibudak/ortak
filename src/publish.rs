@@ -319,10 +319,19 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             bail!("git push failed");
         }
         if !amend {
+            // The command has to match the forge. This printed `tea` wherever it
+            // pushed, so everybody on GitHub, including this project's own
+            // contributors, was handed a Gitea tool they do not have installed.
+            let github = repo
+                .find_remote(&remote)
+                .ok()
+                .and_then(|r| r.url().map(|u| u.contains("github.com")))
+                .unwrap_or(false);
+            let tool = if github { "gh" } else { "tea" };
             println!("\ncreate the PR with:");
             println!(
-                "  tea pr create --base {} --head {} --title \"{}\"",
-                base, branch_name, intent
+                "  {} pr create --base {} --head {} --title \"{}\"",
+                tool, base, branch_name, intent
             );
         }
     } else if amend {
