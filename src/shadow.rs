@@ -29,6 +29,11 @@ pub fn init(ws: &Workspace, cfg: &Config) -> Result<Repository> {
 pub fn open(ws: &Workspace) -> Result<Repository> {
     let repo = Repository::open(&ws.shadow_dir)
         .with_context(|| "could not open shadow repository; run `ortak init` first")?;
+    // Re-seed the ignore list instead of trusting what init left behind.
+    // `ortak init` returns early on an existing workspace, so someone who adds a
+    // pattern to .git/info/exclude afterwards has no other way to make it count;
+    // this way the next daemon start picks it up.
+    write_excludes(ws, &Config::load(&ws.config_path)?)?;
     repo.set_workdir(&ws.root, false)?;
     Ok(repo)
 }
@@ -42,8 +47,22 @@ fn write_excludes(ws: &Workspace, cfg: &Config) -> Result<()> {
         ".git/".to_string(),
         "ortak.toml".to_string(),
     ];
+    // The project's own per-clone ignore list. Someone who puts a file there
+    // means "this never leaves my machine", and the shadow repo has to agree, or
+    // ortak journals it and `ortak publish` ships it in the branch.
+    if let Ok(local) = std::fs::read_to_string(ws.root.join(".git/info/exclude")) {
+        lines.push("# from .git/info/exclude".to_string());
+        lines.extend(local.lines().map(str::to_string));
+    }
+    // Last, so a `!pattern` in [workspace] ignore can still put something back.
     lines.extend(cfg.workspace.ignore.iter().cloned());
-    std::fs::write(info.join("exclude"), lines.join("\n") + "\n")?;
+    let body = lines.join("\n") + "\n";
+    let path = info.join("exclude");
+    // Only on a change: `open` runs this on every daemon start, and rewriting the
+    // file under a running daemon's ignore checks invites a torn read.
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(body.as_str()) {
+        std::fs::write(&path, body)?;
+    }
     Ok(())
 }
 
@@ -181,4 +200,34 @@ pub fn commit_edit(
         None => repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[])?,
     };
     Ok(oid.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file listed in the project's own .git/info/exclude is one somebody has
+    /// already said never leaves this machine. Journaling it puts it in the next
+    /// published branch.
+    #[test]
+    fn the_projects_own_exclude_list_reaches_the_shadow_repo() {
+        let dir = std::env::temp_dir().join(format!("ortak-excludes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "SCRATCH*\n").unwrap();
+
+        let ws = Workspace::at(&dir);
+        let repo = init(&ws, &Config::default()).unwrap();
+        assert!(repo.is_path_ignored("SCRATCH.md").unwrap());
+        assert!(!repo.is_path_ignored("app.py").unwrap());
+
+        // Added after init, which is where this matters: `ortak init` returns
+        // early on a workspace that already exists, so opening the repo is the
+        // only thing left that can notice.
+        std::fs::write(dir.join(".git/info/exclude"), "SCRATCH*\nLATER*\n").unwrap();
+        let repo = open(&ws).unwrap();
+        assert!(repo.is_path_ignored("LATER.txt").unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
