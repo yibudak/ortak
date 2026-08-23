@@ -395,23 +395,21 @@ impl Db {
 
     // ---- publishes ------------------------------------------------------
 
-    /// What a session's last publish shipped, so the next one can start where
-    /// it stopped and name the branch that already carries the earlier work.
-    pub fn last_publish(&self, session_id: i64) -> Result<Option<PublishRow>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT branch, last_edit_id FROM publishes WHERE session_id = ?1
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |r| {
-                    Ok(PublishRow {
-                        branch: r.get(0)?,
-                        last_edit_id: r.get(1)?,
-                    })
-                },
-            )
-            .optional()?)
+    /// Every branch a session has published, newest first. An amend needs two
+    /// of these: the newest row says which branch it may rewrite, and the one
+    /// before it says where that branch's work began.
+    pub fn publishes(&self, session_id: i64) -> Result<Vec<PublishRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch, last_edit_id FROM publishes WHERE session_id = ?1
+             ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(PublishRow {
+                branch: r.get(0)?,
+                last_edit_id: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn record_publish(&self, session_id: i64, branch: &str, last_edit_id: i64) -> Result<()> {
@@ -419,6 +417,22 @@ impl Db {
             "INSERT INTO publishes (session_id, branch, last_edit_id, ts) VALUES (?1, ?2, ?3, ?4)",
             params![session_id, branch, last_edit_id, now_ts()],
         )?;
+        Ok(())
+    }
+
+    /// Move a branch's high-water mark instead of adding a row for it. An amend
+    /// republishes one branch, so the session must end up with the same list of
+    /// publishes it had before, or the next new deliverable starts from the
+    /// wrong place and ships work that has already gone out.
+    pub fn amend_publish(&self, session_id: i64, branch: &str, last_edit_id: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE publishes SET last_edit_id = ?3, ts = ?4
+             WHERE id = (SELECT MAX(id) FROM publishes WHERE session_id = ?1 AND branch = ?2)",
+            params![session_id, branch, last_edit_id, now_ts()],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("ortak-{} has no publish of {} to amend", session_id, branch);
+        }
         Ok(())
     }
 
@@ -734,7 +748,8 @@ mod tests {
 
         db.insert_edit(s, "second.rs", "create", None, &[]).unwrap();
 
-        let previous = db.last_publish(s).unwrap().expect("a publish was recorded");
+        let previous = db.publishes(s).unwrap();
+        let previous = previous.first().expect("a publish was recorded");
         assert_eq!(previous.branch, "task/ortak-2-first");
         assert_eq!(
             names(db.session_files(s, previous.last_edit_id).unwrap()),
@@ -760,7 +775,8 @@ mod tests {
             .unwrap();
         db.insert_edit(s, "shared.rs", "modify", None, &[]).unwrap();
 
-        let previous = db.last_publish(s).unwrap().unwrap();
+        let previous = db.publishes(s).unwrap();
+        let previous = previous.first().unwrap();
         assert_eq!(
             db.session_files(s, previous.last_edit_id).unwrap(),
             vec![("shared.rs".to_string(), "modify".to_string())]
