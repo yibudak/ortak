@@ -150,7 +150,16 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
-            publish::run(&ws, &cfg, &session, branch.as_deref(), &exclude, push)
+            publish::run(
+                &ws,
+                &cfg,
+                &session,
+                publish::PublishOpts {
+                    branch: branch.as_deref(),
+                    exclude: &exclude,
+                    push,
+                },
+            )
         }
         Command::Report {
             session,

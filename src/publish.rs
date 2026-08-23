@@ -5,18 +5,26 @@ use anyhow::{bail, Context, Result};
 use git2::{BranchType, Commit, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
 use std::path::Path;
 
+/// What one publish was asked to do. A struct because every branch that adds a
+/// flag adds an argument, and three of them together cross clippy's limit of
+/// seven at merge time rather than in the change that caused it. A field has no
+/// such limit.
+pub struct PublishOpts<'a> {
+    pub branch: Option<&'a str>,
+    pub exclude: &'a [String],
+    pub push: bool,
+}
+
 /// Assemble a session's net change into a real branch on the workspace's git
 /// repo: base tree + the session's own content, replayed from its shadow
 /// micro-commits so concurrent sessions' edits stay out of the branch.
 /// The live working directory is never touched (no checkout).
-pub fn run(
-    ws: &Workspace,
-    cfg: &Config,
-    session_ref: &str,
-    branch_override: Option<&str>,
-    exclude: &[String],
-    push: bool,
-) -> Result<()> {
+pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -> Result<()> {
+    let PublishOpts {
+        branch: branch_override,
+        exclude,
+        push,
+    } = opts;
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
     let mut files = db.session_files(session.id)?;
