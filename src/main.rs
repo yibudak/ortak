@@ -64,6 +64,9 @@ enum Command {
         /// Branch to build on, for this run only (default: [publish] base_branch)
         #[arg(long)]
         base: Option<String>,
+        /// Publish everything the session has touched, not just what is new
+        #[arg(long)]
+        all: bool,
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
@@ -211,6 +214,7 @@ fn run(cli: Cli) -> Result<()> {
             branch,
             exclude,
             base,
+            all,
             push,
         } => {
             let ws = Workspace::discover_from_cwd()?;
@@ -223,6 +227,7 @@ fn run(cli: Cli) -> Result<()> {
                     branch: branch.as_deref(),
                     base: base.as_deref(),
                     exclude: &exclude,
+                    all,
                     push,
                 },
             )

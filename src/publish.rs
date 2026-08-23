@@ -13,6 +13,7 @@ pub struct PublishOpts<'a> {
     pub branch: Option<&'a str>,
     pub base: Option<&'a str>,
     pub exclude: &'a [String],
+    pub all: bool,
     pub push: bool,
 }
 
@@ -25,16 +26,46 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         branch: branch_override,
         base: base_override,
         exclude,
+        all,
         push,
     } = opts;
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
-    let mut files = db.session_files(session.id)?;
+    // One session runs several tasks, so shipping everything it ever touched
+    // puts the finished work back into every later branch. Default to what came
+    // after the last publish; --all rebuilds a branch holding all of it.
+    let previous = db.last_publish(session.id)?;
+    let after = if all {
+        0
+    } else {
+        previous.as_ref().map_or(0, |p| p.last_edit_id)
+    };
+    // Read the high-water mark before the file list, never after: an edit that
+    // lands in between is then republished rather than silently dropped.
+    let head_edit = db.max_edit_id(session.id)?.unwrap_or(0);
+    let mut files = db.session_files(session.id, after)?;
     if files.is_empty() {
-        bail!(
-            "ortak-{} has no recorded file changes; nothing to publish",
-            session.id
+        match previous {
+            Some(p) if !all => bail!(
+                "ortak-{} has changed nothing since its last publish; branch {} already carries that work. Pass --all to rebuild a branch with everything the session has touched",
+                session.id,
+                p.branch
+            ),
+            _ => bail!(
+                "ortak-{} has no recorded file changes; nothing to publish",
+                session.id
+            ),
+        }
+    }
+
+    // Before the work that can fail, not after the success that does not need
+    // it: the publish that dies on the earlier task's lines is the one that has
+    // to hear which branch to stack on.
+    if let Some(p) = previous.as_ref().filter(|p| !all && p.branch != base) {
+        eprintln!(
+            "ortak-{}'s earlier work is on {}; if this publish cannot separate the two, pass --base {} to stack this branch on it.",
+            session.id, p.branch, p.branch
         );
     }
     for pattern in drop_excluded(&mut files, exclude) {
@@ -68,7 +99,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // can still fail to apply, and a file nobody asked to publish has no
     // business failing the publish.
     let commits: Vec<String> = db
-        .session_commits(session.id)?
+        .session_commits(session.id, after)?
         .into_iter()
         .filter(|(_, f)| files.iter().any(|(g, _)| g == f))
         .map(|(c, _)| c)
@@ -149,6 +180,8 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 branch_name
             )
         })?;
+    // Only now: a failed publish must not move the session's high-water mark.
+    db.record_publish(session.id, &branch_name, head_edit)?;
 
     println!(
         "branch ready: {} ({} files, commit {})",
@@ -179,10 +212,30 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     }
 
     if push {
+        let remote = remote_for(&repo, cfg);
+        // A stacked branch is unusable on the forge until its base is there too:
+        // GitHub and Forgejo both refuse a pull request whose base branch they
+        // cannot find, so --base builds the stack locally and then strands it.
+        // Only a branch --base named explicitly, and never the configured trunk,
+        // which is nobody's to push on a publish's initiative.
+        if let Some(stack) = base_override.filter(|b| !on_remote(ws, &remote, b)) {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.root)
+                .args(["push", "-u", &remote, stack])
+                .status()?;
+            if !status.success() {
+                bail!("git push of the base branch {} failed", stack);
+            }
+            println!(
+                "pushed base branch {} first; it did not exist on {}",
+                stack, remote
+            );
+        }
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&ws.root)
-            .args(["push", "-u", &remote_for(&repo, cfg), &branch_name])
+            .args(["push", "-u", &remote, &branch_name])
             .status()?;
         if !status.success() {
             bail!("git push failed");
@@ -414,6 +467,20 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
                 head
             )
         })
+}
+
+/// Whether the remote already carries this branch. Local refs go stale, and a
+/// wrong answer here either strands a stack or pushes a branch nobody asked for,
+/// so ask the remote.
+fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.root)
+        .args(["ls-remote", "--exit-code", "--heads", remote, branch])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The branch this publish builds on. `--base` is per invocation, so work that
@@ -813,5 +880,52 @@ mod tests {
             base_branch(&cfg, Some("task/ortak-3-parser")),
             "task/ortak-3-parser"
         );
+    }
+
+    /// The stack's base has to be pushed before the branch that stands on it,
+    /// so the question is whether the remote already has it.
+    #[test]
+    fn a_branch_the_remote_lacks_is_reported_missing() {
+        let root = std::env::temp_dir().join(format!("ortak-lsremote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bare = root.join("remote.git");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare", "."]);
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(work.join("f.txt"), "x\n").unwrap();
+        git(&work, &["add", "f.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+        git(&work, &["remote", "add", "up", bare.to_str().unwrap()]);
+        git(&work, &["push", "-q", "up", "main"]);
+
+        let ws = Workspace::at(&work);
+        assert!(on_remote(&ws, "up", "main"));
+        assert!(!on_remote(&ws, "up", "feat/never-pushed"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }
