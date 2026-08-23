@@ -3,7 +3,6 @@ use crate::db::Db;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{BranchType, Commit, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// What one publish was asked to do. A struct because every branch that adds a
@@ -659,10 +658,24 @@ mod tests {
             "app.py",
             &lines(&[(3, "ONE"), (9, "TWO")]),
         );
-        db.insert_edit(mine, "app.py", "modify", Some(&first.to_string()), &[])
-            .unwrap();
-        db.insert_edit(mine, "app.py", "modify", Some(&second.to_string()), &[])
-            .unwrap();
+        db.insert_edit(
+            mine,
+            "app.py",
+            "modify",
+            Some(&first.to_string()),
+            &[],
+            None,
+        )
+        .unwrap();
+        db.insert_edit(
+            mine,
+            "app.py",
+            "modify",
+            Some(&second.to_string()),
+            &[],
+            None,
+        )
+        .unwrap();
 
         let short = lines(&[(3, "ONE")]);
         let whole = lines(&[(3, "ONE"), (9, "TWO")]);
@@ -674,7 +687,7 @@ mod tests {
         let theirs = db
             .upsert_session("claude-b", "claude-b", "llm", None)
             .unwrap();
-        db.insert_edit(theirs, "app.py", "modify", None, &[])
+        db.insert_edit(theirs, "app.py", "modify", None, &[], None)
             .unwrap();
         assert!(!differs_from_last_write(&db, &repo, mine, "app.py", short.as_bytes()).unwrap());
         std::fs::remove_dir_all(&dir).ok();

@@ -4,7 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 
-/// Attribution hints older than this are considered stale (seconds).
+/// Attribution hints, and the snapshots hanging off them, are considered stale
+/// once older than this (seconds).
 pub const HINT_TTL_SECS: i64 = 15;
 /// Reserved `hints.file` value for a session's open Bash claim. A
 /// workspace-relative path is never `*`, so it cannot collide with a real file.
@@ -142,7 +143,8 @@ CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(file);
 CREATE TABLE IF NOT EXISTS hints (
   file       TEXT NOT NULL,
   session_id INTEGER NOT NULL REFERENCES sessions(id),
-  ts         INTEGER NOT NULL
+  ts         INTEGER NOT NULL,
+  blob       TEXT                      -- shadow object id of the content the hook meant to write
 );
 CREATE TABLE IF NOT EXISTS regions (
   id         INTEGER PRIMARY KEY,
@@ -179,6 +181,7 @@ impl Db {
         // Migrations for older databases; harmless if the column exists.
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunks TEXT", []);
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN attributed_by TEXT", []);
+        let _ = conn.execute("ALTER TABLE hints ADD COLUMN blob TEXT", []);
         Ok(Db { conn })
     }
 
@@ -292,15 +295,19 @@ impl Db {
 
     // ---- attribution hints ---------------------------------------------
 
-    pub fn insert_hint(&self, file: &str, session_id: i64) -> Result<()> {
+    /// Record that a session wrote a file. `blob` is the shadow object holding
+    /// that session's own result, rebuilt by the hook from the tool's input.
+    /// Without one the daemon falls back to reading the file off disk.
+    pub fn insert_hint(&self, file: &str, session_id: i64, blob: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO hints (file, session_id, ts) VALUES (?1, ?2, ?3)",
-            params![file, session_id, now_ts()],
+            "INSERT INTO hints (file, session_id, ts, blob) VALUES (?1, ?2, ?3, ?4)",
+            params![file, session_id, now_ts(), blob],
         )?;
         Ok(())
     }
 
-    /// Consume the freshest non-stale hint for a file, clearing all hints on it.
+    /// Consume the freshest non-stale blob-less hint for a file, clearing the
+    /// other blob-less hints on it while leaving snapshots for the daemon.
     /// Falls back to an open Bash claim: the harness hooks cover the edit tools
     /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
     /// the daemon unattributed and would otherwise land on the human session.
@@ -311,16 +318,19 @@ impl Db {
         let hit: Option<i64> = self
             .conn
             .query_row(
-                "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2
+                "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2 AND blob IS NULL
                  ORDER BY ts DESC LIMIT 1",
                 params![file, cutoff],
                 |r| r.get(0),
             )
             .optional()?;
-        self.conn
-            .execute("DELETE FROM hints WHERE file = ?1", params![file])?;
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND blob IS NULL",
+            params![file],
+        )?;
         // Opportunistic purge of stale hints on other files. Claims are exempt:
-        // a build or a test run outlives the TTL, and `post-bash` closes them.
+        // a build or test run outlives the TTL, and `post-bash` closes them.
+        // Expired snapshots are deliberately purged here as well.
         self.conn.execute(
             "DELETE FROM hints WHERE ts < ?1 AND file != ?2",
             params![cutoff, BASH_CLAIM],
@@ -358,6 +368,57 @@ impl Db {
             "DELETE FROM hints WHERE file = ?1 AND session_id = ?2",
             params![BASH_CLAIM, session_id],
         )?;
+        Ok(())
+    }
+
+    /// Files carrying a live snapshot the daemon has not journaled yet. The
+    /// journal, not the file watcher, is what tells the daemon a hook has
+    /// landed: the file's filesystem event may already have been flushed.
+    pub fn snapshot_files(&self) -> Result<Vec<String>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT file FROM hints WHERE blob IS NOT NULL AND ts >= ?1")?;
+        let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Live snapshots for a file, oldest first. Insertion order decides, since
+    /// `ts` only has second resolution.
+    ///
+    /// Reading does not consume: the next hook to run bases its own snapshot on
+    /// the newest row, so a row has to outlive the commit that records it. The
+    /// daemon calls `drop_snapshot` once that commit is in.
+    pub fn peek_snapshots(&self, file: &str) -> Result<Vec<(i64, i64, String)>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, session_id, blob FROM hints
+             WHERE file = ?1 AND ts >= ?2 AND blob IS NOT NULL
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![file, cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The newest live snapshot for a file: what a further edit builds on.
+    pub fn latest_snapshot(&self, file: &str) -> Result<Option<String>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT blob FROM hints WHERE file = ?1 AND ts >= ?2 AND blob IS NOT NULL
+                 ORDER BY rowid DESC LIMIT 1",
+                params![file, cutoff],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn drop_snapshot(&self, rowid: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM hints WHERE rowid = ?1", params![rowid])?;
         Ok(())
     }
 
@@ -776,7 +837,7 @@ mod tests {
         // Nothing claimed: this is where the work used to fall through to human.
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
 
-        db.insert_hint(BASH_CLAIM, agent).unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         assert_eq!(
             db.take_hint("src/x.rs").unwrap(),
             Some((agent, Attribution::Claim))
@@ -788,7 +849,7 @@ mod tests {
         );
 
         // A hint from the edit hooks still outranks the claim.
-        db.insert_hint("src/z.rs", human).unwrap();
+        db.insert_hint("src/z.rs", human, None).unwrap();
         assert_eq!(
             db.take_hint("src/z.rs").unwrap(),
             Some((human, Attribution::Hook))
@@ -808,7 +869,7 @@ mod tests {
             .upsert_session("sess-b", "claude-b", "llm", Some("claude-code"))
             .unwrap();
 
-        db.insert_hint(BASH_CLAIM, a).unwrap();
+        db.insert_hint(BASH_CLAIM, a, None).unwrap();
         assert_eq!(
             db.take_hint("src/x.rs").unwrap(),
             Some((a, Attribution::Claim))
@@ -816,11 +877,11 @@ mod tests {
 
         // b starts a command of its own. Whoever writes src/x.rs now, the
         // daemon cannot tell which of the two did it, so it does not guess.
-        db.insert_hint(BASH_CLAIM, b).unwrap();
+        db.insert_hint(BASH_CLAIM, b, None).unwrap();
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
 
         // A hook naming the file is evidence and still outranks both claims.
-        db.insert_hint("src/x.rs", b).unwrap();
+        db.insert_hint("src/x.rs", b, None).unwrap();
         assert_eq!(
             db.take_hint("src/x.rs").unwrap(),
             Some((b, Attribution::Hook))
@@ -869,7 +930,7 @@ mod tests {
         let agent = db
             .upsert_session("sess-b", "claude-sess", "llm", Some("claude-code"))
             .unwrap();
-        db.insert_hint(BASH_CLAIM, agent).unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         db.end_session("sess-b").unwrap();
         assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
     }

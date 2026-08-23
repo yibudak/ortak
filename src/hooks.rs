@@ -134,11 +134,68 @@ pub fn post_edit() -> Result<()> {
             "llm",
             Some(harness),
         )?;
+        // Record what THIS call wrote, rebuilt from the tool's own input rather
+        // than read back off disk. Another session can write the same file
+        // between the tool returning and this hook running.
+        let shadow = crate::shadow::open(&ws).ok();
         for rel in files {
-            db.insert_hint(&rel, session_id)?;
+            let blob = shadow.as_ref().and_then(|repo| {
+                let base = snapshot_base(repo, &db, &rel);
+                let data = intended_content(&base, tool_name, &tool_input)?;
+                Some(repo.blob(&data).ok()?.to_string())
+            });
+            db.insert_hint(&rel, session_id, blob.as_deref())?;
         }
     }
     Ok(())
+}
+
+/// The content this session's edit applies to: its own newest pending snapshot
+/// when it has one, else the last state the journal recorded, else nothing.
+fn snapshot_base(repo: &git2::Repository, db: &Db, rel: &str) -> Vec<u8> {
+    if let Ok(Some(id)) = db.latest_snapshot(rel) {
+        if let Some(blob) = git2::Oid::from_str(&id)
+            .ok()
+            .and_then(|oid| repo.find_blob(oid).ok())
+        {
+            return blob.content().to_vec();
+        }
+    }
+    crate::shadow::head_blob(repo, rel)
+        .map(|b| b.content().to_vec())
+        .unwrap_or_default()
+}
+
+/// Apply one tool call to `base`, giving this session's own result. `None` when
+/// the tool's input cannot reproduce it, and the caller then leaves a blob-less
+/// hint for the daemon to resolve by reading the file. `apply_patch` and
+/// NotebookEdit always land there: neither input can be replayed.
+fn intended_content(base: &[u8], tool_name: &str, tool_input: &Value) -> Option<Vec<u8>> {
+    if tool_name == "Write" {
+        return tool_input
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|c| c.as_bytes().to_vec());
+    }
+    let edits: Vec<&Value> = match tool_name {
+        "Edit" => vec![tool_input],
+        "MultiEdit" => tool_input.get("edits")?.as_array()?.iter().collect(),
+        _ => return None,
+    };
+    let mut text = String::from_utf8(base.to_vec()).ok()?;
+    for e in edits {
+        let old = e.get("old_string").and_then(|v| v.as_str())?;
+        let new = e.get("new_string").and_then(|v| v.as_str())?;
+        if !text.contains(old) {
+            return None;
+        }
+        text = if e.get("replace_all").and_then(|v| v.as_bool()) == Some(true) {
+            text.replace(old, new)
+        } else {
+            text.replacen(old, new, 1)
+        };
+    }
+    Some(text.into_bytes())
 }
 
 /// PreToolUse gate: deny an edit that targets another active session's hot
@@ -487,7 +544,7 @@ pub fn pre_bash() -> Result<()> {
     // ponytail: the claim covers every unhinted change until the command ends,
     // so a human editor save during a long build lands on this session too.
     // Coarse, but the alternative loses the agent's own work.
-    db.insert_hint(crate::db::BASH_CLAIM, me)?;
+    db.insert_hint(crate::db::BASH_CLAIM, me, None)?;
     Ok(())
 }
 
@@ -640,6 +697,53 @@ mod tests {
         let a = agent_name_for("63a2d8fa-3038-4728-874c-be1a21b07aab", "claude-code");
         let b = agent_name_for("63a2d8fb-1111-4728-874c-be1a21b07aab", "claude-code");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rebuilds_an_edit_from_its_own_input() {
+        let out = intended_content(
+            b"one\ntwo\nthree\n",
+            "Edit",
+            &serde_json::json!({"old_string": "two", "new_string": "TWO"}),
+        )
+        .expect("edit replays");
+        assert_eq!(out, b"one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn replace_all_reaches_every_occurrence() {
+        let out = intended_content(
+            b"x\nx\n",
+            "Edit",
+            &serde_json::json!({"old_string": "x", "new_string": "y", "replace_all": true}),
+        )
+        .expect("edit replays");
+        assert_eq!(out, b"y\ny\n");
+    }
+
+    #[test]
+    fn multiedit_applies_its_edits_in_order() {
+        let out = intended_content(
+            b"a\nb\n",
+            "MultiEdit",
+            &serde_json::json!({"edits": [
+                {"old_string": "a", "new_string": "A"},
+                {"old_string": "A\nb", "new_string": "A\nB"},
+            ]}),
+        )
+        .expect("edits replay");
+        assert_eq!(out, b"A\nB\n");
+    }
+
+    #[test]
+    fn unmatched_old_string_has_no_snapshot() {
+        // The daemon reads the file instead of trusting a guess.
+        assert!(intended_content(
+            b"one\ntwo\n",
+            "Edit",
+            &serde_json::json!({"old_string": "missing", "new_string": "x"}),
+        )
+        .is_none());
     }
 
     #[test]
