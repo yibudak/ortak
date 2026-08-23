@@ -105,7 +105,16 @@ fn claim(pidfile: &Path, alive: impl Fn(u32) -> bool) -> Result<()> {
 }
 
 fn read_pid(pidfile: &Path) -> Option<u32> {
-    std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()
+    let pid: u32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
+    plausible_pid(pid).then_some(pid)
+}
+
+/// A value that could be a process at all. Past `i32::MAX` it reaches `kill` as
+/// a negative number, and on Linux `kill -1 -0` means "every process you may
+/// signal" and succeeds, which would report a dead daemon as alive forever and
+/// lock the workspace with nothing to diagnose.
+fn plausible_pid(pid: u32) -> bool {
+    pid > 0 && pid <= i32::MAX as u32
 }
 
 /// `kill -0` is the portable way to ask whether a pid is alive without adding a
@@ -115,6 +124,9 @@ fn read_pid(pidfile: &Path) -> Option<u32> {
 /// asked about is another ortak daemon of the same user, so that cannot happen
 /// here; if it ever can, this needs a real `kill(2)` and errno.
 fn process_alive(pid: u32) -> bool {
+    if !plausible_pid(pid) {
+        return false;
+    }
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())
@@ -252,6 +264,18 @@ mod tests {
         let f = pidfile("junk");
         std::fs::write(&f, "not a pid").unwrap();
         claim(&f, |_| true).expect("garbage cannot hold a workspace");
+        assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn a_pid_that_would_wrap_negative_holds_nothing() {
+        // `kill -0 4294967295` reaches Linux as kill(-1, 0), "every process you
+        // may signal", and succeeds. Such a pidfile must not lock the daemon out.
+        let f = pidfile("wrap");
+        std::fs::write(&f, u32::MAX.to_string()).unwrap();
+        assert_eq!(read_pid(&f), None);
+        claim(&f, |_| true).expect("an impossible pid holds nothing");
         assert_eq!(read_pid(&f), Some(std::process::id()));
         let _ = std::fs::remove_file(&f);
     }
