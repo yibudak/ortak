@@ -612,19 +612,31 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// The shadow micro-commit behind a session's newest edit to a file: the
-    /// last content that session is known to have put there.
-    pub fn last_commit_for(&self, session_id: i64, file: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT shadow_commit FROM edits
-                 WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id, file],
-                |r| r.get(0),
-            )
-            .optional()?)
+    /// The shadow micro-commits either side of a publish's slice for one file:
+    /// the session's newest edit inside the slice, and its newest before it.
+    /// `after` is the high-water mark the slice starts from, exclusive, so
+    /// `after = 0` puts every edit inside it and leaves the second answer empty.
+    ///
+    /// Each is the content the session is known to have put in the file at that
+    /// point. Publish needs both because it replays the slice alone: the first
+    /// says what the branch should end up with, and the second says what the
+    /// base branch has to already carry for that to be true.
+    pub fn slice_commits(
+        &self,
+        session_id: i64,
+        file: &str,
+        after: i64,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT shadow_commit FROM edits
+                      WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
+                        AND id > ?3 ORDER BY id DESC LIMIT 1),
+                    (SELECT shadow_commit FROM edits
+                      WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
+                        AND id <= ?3 ORDER BY id DESC LIMIT 1)",
+            params![session_id, file, after],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     /// Whether any other session has journaled an edit to this file.

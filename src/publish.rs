@@ -172,7 +172,20 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             .get_path(Path::new(file))
             .with_context(|| format!("{} is missing from this session's replayed history", file))?;
         let data = shadow.find_blob(tracked.id())?.content().to_vec();
-        if differs_from_last_write(&db, &shadow, session.id, file, &data)? {
+        let on_base = base_tree
+            .get_path(Path::new(file))
+            .ok()
+            .and_then(|e| repo.find_blob(e.id()).ok())
+            .map(|b| b.content().to_vec());
+        if differs_from_last_write(
+            &db,
+            &shadow,
+            session.id,
+            file,
+            &data,
+            after,
+            on_base.as_deref(),
+        )? {
             stale.push(file.clone());
         }
         let mode = tracked.filemode() as u32;
@@ -451,14 +464,23 @@ fn session_only_tree<'r>(
 }
 
 /// Whether the branch's content for a file differs from what the session last
-/// wrote to it.
+/// wrote to it inside this publish's slice.
 ///
 /// The replay rebuilds each file from the session's own micro-commits. Lose one
 /// in the middle and the replay still succeeds, quietly producing a file the
 /// session never had: round 1 shipped exactly that, and `cargo clippy` in a
-/// verify worktree was the first thing to notice. The session's newest
-/// micro-commit holds the content it last put in the file, so the two should
-/// agree.
+/// verify worktree was the first thing to notice. The newest micro-commit of
+/// the slice holds the content the session last put in the file, so the two
+/// should agree.
+///
+/// They only agree while the base branch already carries what the session wrote
+/// *before* the slice. Since publish went incremental, a second deliverable
+/// ships the edits after the first one's branch and is built on `main`, which
+/// does not have that branch yet, so its replay is supposed to lack those
+/// lines. Comparing anyway told both sessions their branch was incomplete every
+/// time they came back to a file, which is a false alarm expensive enough to
+/// send someone reading `ortak log` against `git diff --stat` for a row that
+/// was never lost.
 ///
 /// ponytail: only a file this session alone has journaled edits on can be
 /// checked. Where another session also touched it the replay is supposed to
@@ -471,13 +493,26 @@ fn differs_from_last_write(
     session_id: i64,
     file: &str,
     replayed: &[u8],
+    after: i64,
+    on_base: Option<&[u8]>,
 ) -> Result<bool> {
     if db.shared_file(session_id, file)? {
         return Ok(false);
     }
-    let Some(commit) = db.last_commit_for(session_id, file)? else {
+    let (in_slice, before_slice) = db.slice_commits(session_id, file, after)?;
+    // No edit to this file inside the slice, so this branch makes no claim
+    // about its content and there is nothing to check.
+    let Some(commit) = in_slice else {
         return Ok(false);
     };
+    // The branch is built on the base tree. Unless the base carries what the
+    // session left in the file before the slice, the difference below is the
+    // earlier slice and not a missing row.
+    if let Some(earlier) = before_slice {
+        if blob_at(shadow, &earlier, file).as_deref() != on_base {
+            return Ok(false);
+        }
+    }
     let Some(last) = blob_at(shadow, &commit, file) else {
         return Ok(false);
     };
@@ -868,8 +903,21 @@ mod tests {
 
         let short = lines(&[(3, "ONE")]);
         let whole = lines(&[(3, "ONE"), (9, "TWO")]);
-        assert!(differs_from_last_write(&db, &repo, mine, "app.py", short.as_bytes()).unwrap());
-        assert!(!differs_from_last_write(&db, &repo, mine, "app.py", whole.as_bytes()).unwrap());
+        let base = lines(&[]);
+        let check = |replayed: &str| {
+            differs_from_last_write(
+                &db,
+                &repo,
+                mine,
+                "app.py",
+                replayed.as_bytes(),
+                0,
+                Some(base.as_bytes()),
+            )
+            .unwrap()
+        };
+        assert!(check(&short));
+        assert!(!check(&whole));
 
         // Once another session is in the file too, the replay is meant to
         // differ and there is nothing left to assert.
@@ -878,7 +926,68 @@ mod tests {
             .unwrap();
         db.insert_edit(theirs, "app.py", "modify", None, &[], None)
             .unwrap();
-        assert!(!differs_from_last_write(&db, &repo, mine, "app.py", short.as_bytes()).unwrap());
+        assert!(!check(&short));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second deliverable that comes back to a file ships only the edits made
+    /// since the first one's branch, so its replay lacks what that branch
+    /// carries. That is the design, and the missing-row warning called it a
+    /// broken journal every time until the check was given the slice.
+    #[test]
+    fn a_later_slice_is_not_a_missing_row() {
+        let (dir, repo) = scratch("slice");
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db
+            .upsert_session("claude-a", "claude-a", "llm", None)
+            .unwrap();
+
+        // Three edits to one file: the first shipped on its own branch, the
+        // other two are this publish's slice.
+        let mut parent = None;
+        let mut published = 0;
+        for content in [
+            lines(&[(3, "ONE")]),
+            lines(&[(3, "ONE"), (9, "TWO")]),
+            lines(&[(3, "ONE"), (9, "TWO"), (20, "THREE")]),
+        ] {
+            let oid = commit_file(&repo, parent.as_ref(), "app.py", &content);
+            db.insert_edit(mine, "app.py", "modify", Some(&oid.to_string()), &[], None)
+                .unwrap();
+            // The first of the three shipped on its own branch, so the slice
+            // this publish carries starts after it.
+            if published == 0 {
+                published = db.max_edit_id(mine).unwrap().unwrap();
+            }
+            parent = Some(repo.find_commit(oid).unwrap());
+        }
+        let check = |replayed: &str, on_base: &str| {
+            differs_from_last_write(
+                &db,
+                &repo,
+                mine,
+                "app.py",
+                replayed.as_bytes(),
+                published,
+                Some(on_base.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        // Built on main, which has neither the first branch nor the file's
+        // first edit. The replay carries the slice alone and says nothing.
+        let trunk = lines(&[]);
+        assert!(!check(&lines(&[(9, "TWO"), (20, "THREE")]), &trunk));
+
+        // Stacked on the first branch, the check works again: the base has the
+        // earlier write, so the replay owes the slice's last write exactly.
+        let stacked = lines(&[(3, "ONE")]);
+        assert!(!check(
+            &lines(&[(3, "ONE"), (9, "TWO"), (20, "THREE")]),
+            &stacked
+        ));
+        // The row behind "TWO" went missing, so the replay skipped it.
+        assert!(check(&lines(&[(3, "ONE"), (20, "THREE")]), &stacked));
         std::fs::remove_dir_all(&dir).ok();
     }
 
