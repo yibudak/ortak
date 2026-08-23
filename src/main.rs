@@ -285,9 +285,77 @@ fn init() -> Result<()> {
     print!("capturing baseline... ");
     let oid = shadow::baseline(&repo)?;
     println!("done ({})", &oid.to_string()[..8]);
+    warn_about_ignored_repos(&repo, &ws.root);
     println!("\nworkspace ready: {}", ws.root.display());
     println!("next: run `ortak daemon` in another terminal or in the background");
     Ok(())
+}
+
+/// How deep to look for hidden repositories. A repo-of-repos keeps them one or
+/// two levels down; past three this is walking somebody's node_modules.
+const SUBREPO_DEPTH: usize = 3;
+/// How many to name before summarizing. The point is that they exist.
+const SUBREPO_LISTED: usize = 10;
+
+/// A directory the project's git ignores is invisible to the journal, so a
+/// layout that keeps other repositories behind one ignore rule gets a workspace
+/// that reports success and then records nothing anybody does in them. Name them
+/// once, here, while somebody is reading the output.
+fn warn_about_ignored_repos(repo: &git2::Repository, root: &std::path::Path) {
+    let mut found = Vec::new();
+    collect_ignored_repos(repo, root, root, 0, &mut found);
+    if found.is_empty() {
+        return;
+    }
+    found.sort();
+    eprintln!(
+        "\nwarning: these directories are ignored by this project's .gitignore and hold their own\n\
+         git repositories, so ortak will not journal anything inside them:"
+    );
+    for dir in found.iter().take(SUBREPO_LISTED) {
+        eprintln!("  {}", dir);
+    }
+    if found.len() > SUBREPO_LISTED {
+        eprintln!("  and {} more", found.len() - SUBREPO_LISTED);
+    }
+    eprintln!("Run `ortak init` inside each one you actually work in.");
+}
+
+fn collect_ignored_repos(
+    repo: &git2::Repository,
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth >= SUBREPO_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name == ".git" || name == workspace::ORTAK_DIR {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if path.join(".git").exists() {
+            if repo.is_path_ignored(&rel).unwrap_or(false) {
+                out.push(rel);
+            }
+            // Whatever a nested repository holds is that repository's business.
+            continue;
+        }
+        collect_ignored_repos(repo, root, &path, depth + 1, out);
+    }
 }
 
 fn status() -> Result<()> {

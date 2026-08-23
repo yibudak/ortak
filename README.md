@@ -79,6 +79,18 @@ registers, everything it writes lands on `human` in the journal, and
 `ortak publish` has no branch to build for it. Restart or resume it to pick the
 hooks up.
 
+## Workspaces and repository layout
+
+One workspace belongs to one git repository. `ortak publish` builds its branch in the repository at the workspace root, so run `ortak init` at the root of the repository the work should land in.
+
+A directory your project's `.gitignore` excludes is invisible to the journal. The daemon skips it, nobody gets credit for what they do inside it, and `ortak publish` leaves it out of the branch. The case that hurts is a repository keeping other repositories behind one ignore rule, `repos/` or `vendor/` or `addons/`. Running `ortak init` at the top succeeds and then records nothing anybody does in any of them, so init names those directories when it finds them. Each one you work in needs its own `ortak init`.
+
+Nested workspaces are fine. ortak walks up from your session's directory and stops at the first `.ortak` it finds, so a session inside the inner workspace journals there and a session further up journals into the outer one.
+
+Each workspace needs its own `ortak daemon`. One daemon watches one root and writes to that root's `.ortak`.
+
+`ortak init` writes `ortak.toml` at the root, where it shows up as an untracked file. Commit it if its settings suit everyone working in the repository. If they do not, `echo ortak.toml >> .git/info/exclude` keeps it out of the way in your clone alone.
+
 ## Use
 
 ```bash
