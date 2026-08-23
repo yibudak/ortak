@@ -27,6 +27,33 @@ struct Suspect {
     score: u32,
 }
 
+/// How recently another session must have written a file for a failure naming
+/// it to read as a file caught mid-edit rather than a breakage. Long enough to
+/// cover the pause between two edits of one refactor, short enough that running
+/// the command a second time clears it.
+const MID_WRITE_SECONDS: i64 = 90;
+
+/// The files an error excerpt names that another session was writing seconds
+/// ago. A build that catches a file half-written fails for a reason that fixes
+/// itself, and stopping the line over it halts everyone else until somebody
+/// notices and clears it.
+fn still_being_written(
+    excerpt: &str,
+    reporter: i64,
+    recent: &[(i64, String, String, i64)],
+    now: i64,
+) -> Vec<(String, i64, String, i64)> {
+    let mut fresh: Vec<(String, i64, String, i64)> = recent
+        .iter()
+        .filter(|(sid, _, file, ts)| {
+            *sid != reporter && now - *ts <= MID_WRITE_SECONDS && blame_score(excerpt, file) > 0
+        })
+        .map(|(sid, agent, file, ts)| (file.clone(), *sid, agent.clone(), (now - *ts).max(0)))
+        .collect();
+    fresh.sort_by_key(|(_, _, _, secs)| *secs);
+    fresh
+}
+
 fn blame_score(excerpt: &str, file: &str) -> u32 {
     if excerpt.contains(file) {
         return 2;
@@ -55,6 +82,26 @@ pub fn report(
 
     // Deterministic hunt: whose recently-edited files appear in the output?
     let recent = db.recent_session_files(cfg.line.blame_lookback_minutes * 60)?;
+
+    // Stopping the line is the heaviest thing this tool does: every other
+    // session is held until an owner clears it. A file that was being written
+    // while the command ran is the one case where it is nearly always wrong,
+    // and it is not rare. Declining rather than warning, because the reporter
+    // was going to run the command again anyway, and because waiting is the
+    // whole escape: nothing new to remember, no flag, and a file nobody has
+    // touched for a minute and a half stops the line exactly as it always did.
+    let fresh = still_being_written(&excerpt, reporter.id, &recent, crate::db::now_ts());
+    if let Some((file, sid, agent, secs)) = fresh.first() {
+        bail!(
+            "not stopping the line: {file} was written {secs}s ago by ortak-{sid} {agent}, so this \
+             command caught it mid-edit. A half-written file fails and then builds again on its \
+             own. Run the command again: after {MID_WRITE_SECONDS}s untouched the same report goes \
+             through. If it keeps failing while that session works, say so with \
+             `ortak tell ortak-{sid} \"<what broke>\" --from ortak-{}`",
+            reporter.id
+        );
+    }
+
     let mut per_session: Vec<Suspect> = Vec::new();
     for (sid, agent, file, _ts) in &recent {
         let entry = match per_session.iter_mut().find(|s| s.id == *sid) {
@@ -222,5 +269,43 @@ mod tests {
         assert_eq!(blame_score(excerpt, "src/api/views.py"), 0);
         // Basenames this short match too much to mean anything.
         assert_eq!(blame_score("cannot open db", "src/db"), 0);
+    }
+
+    /// The round-6 case: `cargo build` caught the other session mid-edit twice
+    /// in ten minutes, and one of those compiled again five seconds later with
+    /// nobody touching it.
+    #[test]
+    fn a_file_still_being_written_is_not_a_breakage() {
+        let excerpt =
+            "error[E0433]: failed to resolve: use of undeclared type\n --> src/db.rs:412:9";
+        let now = 1_000_000;
+        let mid_edit = vec![
+            (2, "claude-a".to_string(), "src/db.rs".to_string(), now - 5),
+            // Fresh, but the failure does not name it.
+            (
+                2,
+                "claude-a".to_string(),
+                "src/daemon.rs".to_string(),
+                now - 5,
+            ),
+        ];
+        let held = still_being_written(excerpt, 3, &mid_edit, now);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, "src/db.rs");
+        assert_eq!(held[0].3, 5);
+
+        // The same file an hour later is finished work, and a failure naming it
+        // stops the line exactly as it did before this rule existed.
+        let finished = vec![(
+            2,
+            "claude-a".to_string(),
+            "src/db.rs".to_string(),
+            now - 3600,
+        )];
+        assert!(still_being_written(excerpt, 3, &finished, now).is_empty());
+
+        // The reporter's own half-written file is its own problem to fix.
+        let mine = vec![(3, "claude-b".to_string(), "src/db.rs".to_string(), now - 5)];
+        assert!(still_being_written(excerpt, 3, &mine, now).is_empty());
     }
 }
