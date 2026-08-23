@@ -472,6 +472,27 @@ fn status(as_json: bool) -> Result<()> {
         Some(age) => println!("daemon: NOT RUNNING (last heartbeat {}s ago)", age),
         None => println!("daemon: never started"),
     }
+    // Working out what a stopped daemon cost used to be a manual job: read the
+    // heartbeat, work out the window, warn the other session in prose. Every
+    // part of that is a lookup, and it only matters while the window is still
+    // within reach of what someone was doing.
+    if let Some(o) = db.last_outage()?.filter(|o| o.recent(db::now_ts())) {
+        let recovered = match o.journaled {
+            0 => "the startup scan found nothing to recover".to_string(),
+            n => format!(
+                "the startup scan recovered {} file(s) into the human session",
+                n
+            ),
+        };
+        println!(
+            "last outage: {} to {} ({}s); {}",
+            db::fmt_local(o.start, "%H:%M:%S"),
+            db::fmt_local(o.end, "%H:%M:%S"),
+            o.secs(),
+            recovered
+        );
+        println!("  changes in that window the scan did not pick up are not in the journal; touch those files again to record them");
+    }
     // Silent while the journal is healthy, which is nearly always, so the
     // section is a signal rather than another line to scroll past.
     let failing = db.journal_failures()?;
