@@ -67,6 +67,14 @@ impl ErrorRow {
     }
 }
 
+/// What one recorded publish carries: the branch it created, and the newest
+/// edit of the session's that the branch includes.
+#[derive(Debug, Clone)]
+pub struct PublishRow {
+    pub branch: String,
+    pub last_edit_id: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Conflict {
     pub session_id: i64,
@@ -130,6 +138,13 @@ CREATE TABLE IF NOT EXISTS errors (
   fix_brief        TEXT,
   ts_opened        INTEGER NOT NULL,
   ts_resolved      INTEGER
+);
+CREATE TABLE IF NOT EXISTS publishes (
+  id           INTEGER PRIMARY KEY,
+  session_id   INTEGER NOT NULL REFERENCES sessions(id),
+  branch       TEXT NOT NULL,
+  last_edit_id INTEGER NOT NULL,          -- highest edits.id the branch carries
+  ts           INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -327,15 +342,25 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Files a session touched, with the last change kind per file.
-    pub fn session_files(&self, session_id: i64) -> Result<Vec<(String, String)>> {
+    /// Files a session touched after edit `after`, with the last change kind
+    /// per file. `after = 0` is every edit the session ever made.
+    pub fn session_files(&self, session_id: i64, after: i64) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file, change_kind FROM edits WHERE session_id = ?1 AND id IN
-               (SELECT MAX(id) FROM edits WHERE session_id = ?1 GROUP BY file)
+            "SELECT file, change_kind FROM edits WHERE session_id = ?1 AND id > ?2 AND id IN
+               (SELECT MAX(id) FROM edits WHERE session_id = ?1 AND id > ?2 GROUP BY file)
              ORDER BY file",
         )?;
-        let rows = stmt.query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![session_id, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The newest edit a session has recorded, if it has recorded any.
+    pub fn max_edit_id(&self, session_id: i64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(id) FROM edits WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Other sessions that also touched any of the given files.
@@ -366,6 +391,35 @@ impl Db {
             params![session_id],
             |r| r.get(0),
         )?)
+    }
+
+    // ---- publishes ------------------------------------------------------
+
+    /// What a session's last publish shipped, so the next one can start where
+    /// it stopped and name the branch that already carries the earlier work.
+    pub fn last_publish(&self, session_id: i64) -> Result<Option<PublishRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT branch, last_edit_id FROM publishes WHERE session_id = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |r| {
+                    Ok(PublishRow {
+                        branch: r.get(0)?,
+                        last_edit_id: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn record_publish(&self, session_id: i64, branch: &str, last_edit_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO publishes (session_id, branch, last_edit_id, ts) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, branch, last_edit_id, now_ts()],
+        )?;
+        Ok(())
     }
 
     // ---- regions --------------------------------------------------------
@@ -645,4 +699,71 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: r.get(6)?,
         started_at: r.get(7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "ortak-db-test-{}-{}.sqlite",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&path);
+        Db::open(&path).unwrap()
+    }
+
+    fn names(files: Vec<(String, String)>) -> Vec<String> {
+        files.into_iter().map(|(f, _)| f).collect()
+    }
+
+    /// One session, two tasks: the second publish must carry only the second
+    /// task's file, and `--all` must still be able to rebuild everything.
+    #[test]
+    fn a_second_publish_ships_only_the_newer_work() {
+        let db = temp_db("publishes");
+        let s = db
+            .upsert_session("sess-a", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+
+        db.insert_edit(s, "first.rs", "create", None, &[]).unwrap();
+        let shipped = db.max_edit_id(s).unwrap().expect("an edit was recorded");
+        db.record_publish(s, "task/ortak-2-first", shipped).unwrap();
+
+        db.insert_edit(s, "second.rs", "create", None, &[]).unwrap();
+
+        let previous = db.last_publish(s).unwrap().expect("a publish was recorded");
+        assert_eq!(previous.branch, "task/ortak-2-first");
+        assert_eq!(
+            names(db.session_files(s, previous.last_edit_id).unwrap()),
+            vec!["second.rs"]
+        );
+        assert_eq!(
+            names(db.session_files(s, 0).unwrap()),
+            vec!["first.rs", "second.rs"]
+        );
+    }
+
+    /// A file touched in both tasks belongs to the second branch too: the
+    /// branch is built from the file's whole current content, not a patch.
+    #[test]
+    fn a_file_edited_again_after_a_publish_comes_back() {
+        let db = temp_db("republish");
+        let s = db
+            .upsert_session("sess-b", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+
+        db.insert_edit(s, "shared.rs", "create", None, &[]).unwrap();
+        db.record_publish(s, "task/one", db.max_edit_id(s).unwrap().unwrap())
+            .unwrap();
+        db.insert_edit(s, "shared.rs", "modify", None, &[]).unwrap();
+
+        let previous = db.last_publish(s).unwrap().unwrap();
+        assert_eq!(
+            db.session_files(s, previous.last_edit_id).unwrap(),
+            vec![("shared.rs".to_string(), "modify".to_string())]
+        );
+    }
 }

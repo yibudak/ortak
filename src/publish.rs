@@ -15,17 +15,38 @@ pub fn run(
     session_ref: &str,
     branch_override: Option<&str>,
     base_override: Option<&str>,
+    all: bool,
     push: bool,
 ) -> Result<()> {
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
-    let files = db.session_files(session.id)?;
+
+    // One session runs several tasks, so shipping everything it ever touched
+    // puts the finished work back into every later branch. Default to what came
+    // after the last publish; --all rebuilds a branch holding all of it.
+    let previous = db.last_publish(session.id)?;
+    let after = if all {
+        0
+    } else {
+        previous.as_ref().map_or(0, |p| p.last_edit_id)
+    };
+    // Read the high-water mark before the file list, never after: an edit that
+    // lands in between is then republished rather than silently dropped.
+    let head_edit = db.max_edit_id(session.id)?.unwrap_or(0);
+    let files = db.session_files(session.id, after)?;
     if files.is_empty() {
-        bail!(
-            "ortak-{} has no recorded file changes; nothing to publish",
-            session.id
-        );
+        match previous {
+            Some(p) if !all => bail!(
+                "ortak-{} has changed nothing since its last publish; branch {} already carries that work. Pass --all to rebuild a branch with everything the session has touched",
+                session.id,
+                p.branch
+            ),
+            _ => bail!(
+                "ortak-{} has no recorded file changes; nothing to publish",
+                session.id
+            ),
+        }
     }
 
     // Layer 0 has no gate, so overlapping edits are possible; surface them.
@@ -131,6 +152,8 @@ pub fn run(
                 branch_name
             )
         })?;
+    // Only now: a failed publish must not move the session's high-water mark.
+    db.record_publish(session.id, &branch_name, head_edit)?;
 
     println!(
         "branch ready: {} ({} files, commit {})",
@@ -140,6 +163,14 @@ pub fn run(
     );
     for (f, k) in &files {
         println!("  {} {}", k, f);
+    }
+    // A file touched by both tasks ships whole, so a branch built on the plain
+    // base carries the earlier task's changes to it as well.
+    if let Some(p) = previous.filter(|p| !all && p.branch != base) {
+        println!(
+            "\nortak-{}'s earlier work is on {}; pass --base {} to stack this branch on it.",
+            session.id, p.branch, p.branch
+        );
     }
 
     if push {
