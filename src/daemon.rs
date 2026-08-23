@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::shadow::{self, Change};
 use crate::workspace::Workspace;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,7 +53,12 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // The watcher thread is gone, so nothing will be journaled again.
+            // Returning Ok here made that look like a clean shutdown, and the
+            // only symptom was a heartbeat that stopped advancing.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("the filesystem watcher stopped; no further changes will be journaled")
+            }
         }
 
         let due: Vec<String> = pending
@@ -68,7 +73,6 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 /// Cheap pre-filter before ignore rules: workspace-relative path, skipping
