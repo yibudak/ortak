@@ -112,8 +112,51 @@ enum HookEvent {
     SessionEnd,
 }
 
+/// What to do when the arguments do not parse.
+///
+/// The plugin's hooks.json and the installed binary update independently, so a
+/// build can be handed a hook it has never heard of. Clap answers that with
+/// exit code 2, which is exactly the code the harness reads as "block this tool
+/// call", and the hook is registered for every session whether or not the
+/// project is an ortak workspace. One stale binary therefore takes Bash away
+/// everywhere until the user rebuilds, including in the shell they would
+/// rebuild from. Nothing under `hook` may exit non-zero.
+#[derive(Debug, PartialEq)]
+enum ParseFailure {
+    /// Print the message and exit non-zero, clap's usual behaviour.
+    Report,
+    /// Print the message, but succeed: someone asked for help.
+    PrintAndSucceed,
+    /// Say nothing and succeed. Hook output reaches the agent's context, so a
+    /// usage error does not belong there.
+    SilentSuccess,
+}
+
+fn classify_parse_failure(kind: clap::error::ErrorKind, first_arg: Option<&str>) -> ParseFailure {
+    use clap::error::ErrorKind as K;
+    let wants_output = matches!(
+        kind,
+        K::DisplayHelp | K::DisplayVersion | K::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    match (first_arg == Some("hook"), wants_output) {
+        (false, _) => ParseFailure::Report,
+        (true, true) => ParseFailure::PrintAndSucceed,
+        (true, false) => ParseFailure::SilentSuccess,
+    }
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => match classify_parse_failure(e.kind(), std::env::args().nth(1).as_deref()) {
+            ParseFailure::Report => e.exit(),
+            ParseFailure::PrintAndSucceed => {
+                let _ = e.print();
+                return;
+            }
+            ParseFailure::SilentSuccess => return,
+        },
+    };
     // Hook adapters must never break the agent's session: swallow errors, exit 0.
     if let Command::Hook { event } = &cli.command {
         let res = match event {
@@ -309,4 +352,40 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     db.set_intent(session.id, text)?;
     println!("recorded intent for ortak-{}: {}", session.id, text);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind as K;
+
+    #[test]
+    fn a_hook_never_exits_non_zero() {
+        use ParseFailure::*;
+        // A hooks.json from a newer plugin than this binary.
+        assert_eq!(
+            classify_parse_failure(K::InvalidSubcommand, Some("hook")),
+            SilentSuccess
+        );
+        // A future release adding a flag to a hook this binary already knows.
+        assert_eq!(
+            classify_parse_failure(K::UnknownArgument, Some("hook")),
+            SilentSuccess
+        );
+        // `ortak hook` and `ortak hook --help` still print, and still succeed.
+        assert_eq!(
+            classify_parse_failure(K::DisplayHelp, Some("hook")),
+            PrintAndSucceed
+        );
+        assert_eq!(
+            classify_parse_failure(K::DisplayHelpOnMissingArgumentOrSubcommand, Some("hook")),
+            PrintAndSucceed
+        );
+        // Someone typing at a terminal still gets told what went wrong.
+        assert_eq!(
+            classify_parse_failure(K::InvalidSubcommand, Some("publsh")),
+            Report
+        );
+        assert_eq!(classify_parse_failure(K::InvalidSubcommand, None), Report);
+    }
 }
