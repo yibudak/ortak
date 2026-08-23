@@ -1,9 +1,21 @@
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, PublishRow};
 use crate::workspace::Workspace;
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{BranchType, Commit, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
 use std::path::Path;
+
+/// Which of a session's edits one publish carries. The three are exclusive:
+/// each names a different point to start reading the journal from.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scope {
+    /// Everything since the session's last publish.
+    New,
+    /// Everything the session has ever touched.
+    All,
+    /// Everything the named branch already carried, plus what came after it.
+    Amend,
+}
 
 /// What one publish was asked to do. A struct because every branch that adds a
 /// flag adds an argument, and three of them together cross clippy's limit of
@@ -13,7 +25,7 @@ pub struct PublishOpts<'a> {
     pub branch: Option<&'a str>,
     pub base: Option<&'a str>,
     pub exclude: &'a [String],
-    pub all: bool,
+    pub scope: Scope,
     pub push: bool,
 }
 
@@ -26,7 +38,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         branch: branch_override,
         base: base_override,
         exclude,
-        all,
+        scope,
         push,
     } = opts;
     let base = base_branch(cfg, base_override);
@@ -35,11 +47,17 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // One session runs several tasks, so shipping everything it ever touched
     // puts the finished work back into every later branch. Default to what came
     // after the last publish; --all rebuilds a branch holding all of it.
-    let previous = db.last_publish(session.id)?;
-    let after = if all {
-        0
-    } else {
-        previous.as_ref().map_or(0, |p| p.last_edit_id)
+    let history = db.publishes(session.id)?;
+    let previous = history.first().cloned();
+    // An amend goes back further, to where the branch it is rewriting began.
+    let amending = match scope {
+        Scope::Amend => Some(amend_target(&history, branch_override, session.id)?),
+        _ => None,
+    };
+    let after = match amending {
+        Some((mark, _)) => mark,
+        None if scope == Scope::All => 0,
+        None => previous.as_ref().map_or(0, |p| p.last_edit_id),
     };
     // Read the high-water mark before the file list, never after: an edit that
     // lands in between is then republished rather than silently dropped.
@@ -47,7 +65,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     let mut files = db.session_files(session.id, after)?;
     if files.is_empty() {
         match previous {
-            Some(p) if !all => bail!(
+            Some(p) if scope == Scope::New => bail!(
                 "ortak-{} has changed nothing since its last publish; branch {} already carries that work. Pass --all to rebuild a branch with everything the session has touched",
                 session.id,
                 p.branch
@@ -62,7 +80,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // Before the work that can fail, not after the success that does not need
     // it: the publish that dies on the earlier task's lines is the one that has
     // to hear which branch to stack on.
-    if let Some(p) = previous.as_ref().filter(|p| !all && p.branch != base) {
+    if let Some(p) = previous
+        .as_ref()
+        .filter(|p| scope == Scope::New && p.branch != base)
+    {
         eprintln!(
             "ortak-{}'s earlier work is on {}; if this publish cannot separate the two, pass --base {} to stack this branch on it.",
             session.id, p.branch, p.branch
@@ -87,7 +108,22 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             ws.root.display()
         )
     })?;
-    let base_commit = base_commit_for(&repo, base)?;
+    // An amend rebuilds the branch where it already stands: its tip's parent is
+    // the commit it was published on, so leaving --base off does not quietly
+    // rebase a stacked branch onto the trunk and pull its base's work into the
+    // diff. An explicit --base still wins, which is how a branch moves.
+    let base_commit = match (amending, base_override) {
+        (Some((_, branch)), None) => repo
+            .find_branch(branch, BranchType::Local)
+            .with_context(|| {
+                format!("ortak published {branch}, but this repository has no such branch now")
+            })?
+            .get()
+            .peel_to_commit()?
+            .parent(0)
+            .with_context(|| format!("{branch} has no parent commit to rebuild it on"))?,
+        _ => base_commit_for(&repo, base)?,
+    };
     let base_tree = base_commit.tree()?;
 
     // The gate lets two sessions edit distant lines of one file, so the file on
@@ -173,7 +209,8 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             session.task_intent.as_deref(),
         ),
     };
-    repo.branch(&branch_name, &repo.find_commit(commit_oid)?, false)
+    let amend = amending.is_some();
+    repo.branch(&branch_name, &repo.find_commit(commit_oid)?, amend)
         .with_context(|| {
             format!(
                 "could not create branch {} (does it already exist?)",
@@ -181,7 +218,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             )
         })?;
     // Only now: a failed publish must not move the session's high-water mark.
-    db.record_publish(session.id, &branch_name, head_edit)?;
+    // An amend moves the branch's own mark instead of adding a second row for
+    // it, so the next new deliverable still starts after everything published.
+    if amend {
+        db.amend_publish(session.id, &branch_name, head_edit)?;
+    } else {
+        db.record_publish(session.id, &branch_name, head_edit)?;
+    }
 
     // The work is out, so the lines are free. Until now only presence_minutes
     // ever cooled a region, and a session that had published and moved on kept
@@ -192,7 +235,8 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     }
 
     println!(
-        "branch ready: {} ({} files, commit {})",
+        "branch {}: {} ({} files, commit {})",
+        if amend { "rewritten" } else { "ready" },
         branch_name,
         files.len(),
         &commit_oid.to_string()[..8]
@@ -258,18 +302,34 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 stack, remote
             );
         }
+        // An amended branch is not a fast-forward, so the push has to say so.
+        // --force-with-lease rather than --force: if the branch on the remote
+        // has moved since this session last saw it, that is somebody else's
+        // commit and no amend was ever meant to drop it.
+        let mut args = vec!["push", "-u", remote.as_str(), branch_name.as_str()];
+        if amend {
+            args.insert(1, "--force-with-lease");
+        }
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(&ws.root)
-            .args(["push", "-u", &remote, &branch_name])
+            .args(&args)
             .status()?;
         if !status.success() {
             bail!("git push failed");
         }
-        println!("\ncreate the PR with:");
+        if !amend {
+            println!("\ncreate the PR with:");
+            println!(
+                "  tea pr create --base {} --head {} --title \"{}\"",
+                base, branch_name, intent
+            );
+        }
+    } else if amend {
+        let remote = remote_for(&repo, cfg);
         println!(
-            "  tea pr create --base {} --head {} --title \"{}\"",
-            base, branch_name, intent
+            "\n{} moved, so it is no longer a fast-forward. Push it with:\n  git push --force-with-lease {} {}",
+            branch_name, remote, branch_name
         );
     } else {
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
@@ -507,6 +567,42 @@ fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Where an amend starts reading the journal, and the branch it rewrites.
+///
+/// A branch carries the edits between the publish before it and its own, so
+/// rebuilding it means starting from the mark the publish before it left. That
+/// is only true while the branch is the session's newest publish: rewriting an
+/// older one would sweep every deliverable published since into it, which is
+/// the bug `--base` was added to avoid rather than one to introduce here.
+fn amend_target<'a>(
+    history: &[PublishRow],
+    branch: Option<&'a str>,
+    session_id: i64,
+) -> Result<(i64, &'a str)> {
+    let Some(branch) = branch else {
+        bail!("--amend rewrites one branch; name it with --branch <branch>");
+    };
+    let Some(newest) = history.first() else {
+        bail!(
+            "ortak-{} has published nothing yet, so it has no branch to amend",
+            session_id
+        );
+    };
+    if newest.branch != branch {
+        if history.iter().any(|p| p.branch == branch) {
+            bail!(
+                "ortak-{} published {} after {}; amending {} now would sweep that later work into it. Publish the fix as its own branch instead",
+                session_id, newest.branch, branch, branch
+            );
+        }
+        bail!(
+            "ortak-{} did not publish {}; its last branch was {}, and --amend only rewrites a branch this session published",
+            session_id, branch, newest.branch
+        );
+    }
+    Ok((history.get(1).map_or(0, |p| p.last_edit_id), branch))
 }
 
 /// The branch this publish builds on. `--base` is per invocation, so work that
@@ -895,6 +991,67 @@ mod tests {
         assert!(err.contains("'main' does not exist"), "{err}");
         assert!(err.contains("HEAD is on 'master'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The arithmetic an amend rests on: rebuilding a branch reaches back to
+    /// where its own work began, and the deliverable after it still starts from
+    /// everything that has shipped. Getting the second half wrong re-publishes
+    /// work that already went out, which is the bug incremental publish exists
+    /// to fix.
+    #[test]
+    fn an_amend_rebuilds_one_branch_and_leaves_the_next_where_it_was() {
+        let dir = std::env::temp_dir().join(format!("ortak-amend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let s = db
+            .upsert_session("sess", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+        let files = |after: i64| -> Vec<String> {
+            db.session_files(s, after)
+                .unwrap()
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect()
+        };
+        let head = || db.max_edit_id(s).unwrap().unwrap();
+
+        // The first deliverable ships.
+        db.insert_edit(s, "one.rs", "create", None, &[], None)
+            .unwrap();
+        db.record_publish(s, "task/one", head()).unwrap();
+
+        // Review lands, so the fix goes into the same branch.
+        db.insert_edit(s, "one.rs", "modify", None, &[], None)
+            .unwrap();
+        let (after, branch) = amend_target(&db.publishes(s).unwrap(), Some("task/one"), s).unwrap();
+        assert_eq!((after, branch), (0, "task/one"));
+        assert_eq!(files(after), vec!["one.rs"]);
+        db.amend_publish(s, "task/one", head()).unwrap();
+        assert_eq!(
+            db.publishes(s).unwrap().len(),
+            1,
+            "an amend must not add a second publish row"
+        );
+
+        // The next deliverable is its own branch and carries only its own work.
+        db.insert_edit(s, "two.rs", "create", None, &[], None)
+            .unwrap();
+        let history = db.publishes(s).unwrap();
+        assert_eq!(files(history[0].last_edit_id), vec!["two.rs"]);
+        db.record_publish(s, "task/two", head()).unwrap();
+
+        // task/one is behind the newest publish now, so it is out of reach, and
+        // amending task/two reaches back only as far as task/one shipped.
+        let history = db.publishes(s).unwrap();
+        assert!(amend_target(&history, Some("task/one"), s).is_err());
+        assert!(amend_target(&history, Some("never/published"), s).is_err());
+        assert!(amend_target(&history, None, s).is_err());
+        assert_eq!(
+            files(amend_target(&history, Some("task/two"), s).unwrap().0),
+            vec!["two.rs"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

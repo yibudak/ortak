@@ -207,7 +207,7 @@ mod tests {
         };
         db.apply_edit_regions(me, "config.rs", &[first_line])
             .unwrap();
-        db.insert_edit(them, "hooks.rs", "modify", None, &[])
+        db.insert_edit(them, "hooks.rs", "modify", None, &[], None)
             .unwrap();
 
         let (defs, refs) = scan(&ws, &Config::default(), &db, me).unwrap();

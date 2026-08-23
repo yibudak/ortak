@@ -122,6 +122,9 @@ enum Command {
         /// Publish everything the session has touched, not just what is new
         #[arg(long)]
         all: bool,
+        /// Rebuild the branch --branch names, instead of starting a new one
+        #[arg(long, conflicts_with = "all")]
+        amend: bool,
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
@@ -299,10 +302,18 @@ fn run(cli: Cli) -> Result<()> {
             exclude,
             base,
             all,
+            amend,
             push,
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
+            // clap keeps --all and --amend apart, so the three are exclusive by
+            // the time they get here.
+            let scope = match (all, amend) {
+                (_, true) => publish::Scope::Amend,
+                (true, _) => publish::Scope::All,
+                _ => publish::Scope::New,
+            };
             publish::run(
                 &ws,
                 &cfg,
@@ -311,7 +322,7 @@ fn run(cli: Cli) -> Result<()> {
                     branch: branch.as_deref(),
                     base: base.as_deref(),
                     exclude: &exclude,
-                    all,
+                    scope,
                     push,
                 },
             )
