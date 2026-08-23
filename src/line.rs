@@ -167,9 +167,12 @@ pub fn resolved(ws: &Workspace, session_ref: Option<&str>, all: bool) -> Result<
     Ok(())
 }
 
-pub fn list(ws: &Workspace) -> Result<()> {
+pub fn list(ws: &Workspace, as_json: bool) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let rows = db.list_errors(20)?;
+    if as_json {
+        return crate::json::print(&crate::json::errors(&rows));
+    }
     if rows.is_empty() {
         println!("no errors recorded; line is open.");
         return Ok(());

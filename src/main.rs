@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod db;
 mod hooks;
+mod json;
 mod line;
 mod orchestrator;
 mod publish;
@@ -33,7 +34,11 @@ enum Command {
     /// Run the journal daemon (file watcher and shadow repository) in the foreground
     Daemon,
     /// Show daemon and session status
-    Status,
+    Status {
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
+    },
     /// Show recent journal entries
     Log {
         /// Session reference (ortak-3, human, or agent name)
@@ -41,6 +46,9 @@ enum Command {
         session: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// List sessions
     Sessions,
@@ -90,7 +98,11 @@ enum Command {
         all: bool,
     },
     /// List error records
-    Errors,
+    Errors {
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
+    },
     /// Reassign an open error
     Assign { error_id: i64, session: String },
     /// Harness hook adapters (read hook JSON from stdin)
@@ -205,8 +217,12 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = Config::load(&ws.config_path)?;
             daemon::run(&ws, &cfg)
         }
-        Command::Status => status(),
-        Command::Log { session, limit } => log(session.as_deref(), limit),
+        Command::Status { json } => status(json),
+        Command::Log {
+            session,
+            limit,
+            json,
+        } => log(session.as_deref(), limit, json),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
         Command::Publish {
@@ -245,9 +261,9 @@ fn run(cli: Cli) -> Result<()> {
             let ws = Workspace::discover_from_cwd()?;
             line::resolved(&ws, session.as_deref(), all)
         }
-        Command::Errors => {
+        Command::Errors { json } => {
             let ws = Workspace::discover_from_cwd()?;
-            line::list(&ws)
+            line::list(&ws, json)
         }
         Command::Assign { error_id, session } => {
             let ws = Workspace::discover_from_cwd()?;
@@ -358,10 +374,13 @@ fn collect_ignored_repos(
     }
 }
 
-fn status() -> Result<()> {
+fn status(as_json: bool) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let cfg = Config::load(&ws.config_path)?;
     let db = Db::open(&ws.db_path)?;
+    if as_json {
+        return json::print(&json::status(&db, cfg.gate.presence_minutes * 60)?);
+    }
     match db.heartbeat_age()? {
         Some(age) if age <= HEARTBEAT_ALIVE_SECS => {
             println!("daemon: running (last heartbeat {}s ago)", age)
@@ -411,13 +430,16 @@ fn print_sessions(db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn log(session: Option<&str>, limit: u32) -> Result<()> {
+fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
     let session_id = match session {
         Some(r) => Some(db.resolve_session(r)?.id),
         None => None,
     };
+    if as_json {
+        return json::print(&json::edits(db.recent_edits(session_id, limit)?));
+    }
     for e in db.recent_edits(session_id, limit)? {
         let t = chrono::DateTime::from_timestamp(e.ts, 0)
             .map(|d| d.format("%m-%d %H:%M:%S").to_string())
