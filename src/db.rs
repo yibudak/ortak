@@ -376,28 +376,24 @@ impl Db {
         Ok(())
     }
 
-    /// Consume the freshest non-stale blob-less hint for a file, clearing the
-    /// other blob-less hints on it while leaving snapshots for the daemon.
+    /// Read the freshest non-stale blob-less hint without consuming it.
+    /// The daemon clears it only after the edit and regions are recorded.
     /// Falls back to an open Bash claim: the harness hooks cover the edit tools
     /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
     /// the daemon unattributed and would otherwise land on the human session.
     /// That fallback applies only while exactly one session has a command
     /// running; see below for why a second claim cancels the guess.
-    pub fn take_hint(&self, file: &str) -> Result<Option<(i64, Attribution)>> {
+    pub fn peek_hint(&self, file: &str) -> Result<Option<(i64, Attribution)>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
             .conn
             .query_row(
                 "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2 AND blob IS NULL
-                 ORDER BY ts DESC LIMIT 1",
+                 ORDER BY ts DESC, rowid DESC LIMIT 1",
                 params![file, cutoff],
                 |r| r.get(0),
             )
             .optional()?;
-        self.conn.execute(
-            "DELETE FROM hints WHERE file = ?1 AND blob IS NULL",
-            params![file],
-        )?;
         // Opportunistic purge of stale hints on other files. Claims are exempt:
         // a build or test run outlives the TTL, and `post-bash` closes them.
         // Expired snapshots are deliberately purged here as well.
@@ -489,6 +485,16 @@ impl Db {
     pub fn drop_snapshot(&self, rowid: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM hints WHERE rowid = ?1", params![rowid])?;
+        Ok(())
+    }
+
+    /// Drop blob-less hints on a file once its disk edit is recorded. Snapshot
+    /// rows are committed and removed independently.
+    pub fn clear_hints(&self, file: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND blob IS NULL",
+            params![file],
+        )?;
         Ok(())
     }
 
@@ -1107,28 +1113,28 @@ mod tests {
             .unwrap();
 
         // Nothing claimed: this is where the work used to fall through to human.
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
 
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         assert_eq!(
-            db.take_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs").unwrap(),
             Some((agent, Attribution::Claim))
         );
         // The claim survives, because one command can write many files.
         assert_eq!(
-            db.take_hint("src/y.rs").unwrap(),
+            db.peek_hint("src/y.rs").unwrap(),
             Some((agent, Attribution::Claim))
         );
 
         // A hint from the edit hooks still outranks the claim.
         db.insert_hint("src/z.rs", human, None).unwrap();
         assert_eq!(
-            db.take_hint("src/z.rs").unwrap(),
+            db.peek_hint("src/z.rs").unwrap(),
             Some((human, Attribution::Hook))
         );
 
         db.clear_bash_claim(agent).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
     }
 
     #[test]
@@ -1143,26 +1149,27 @@ mod tests {
 
         db.insert_hint(BASH_CLAIM, a, None).unwrap();
         assert_eq!(
-            db.take_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs").unwrap(),
             Some((a, Attribution::Claim))
         );
 
         // b starts a command of its own. Whoever writes src/x.rs now, the
         // daemon cannot tell which of the two did it, so it does not guess.
         db.insert_hint(BASH_CLAIM, b, None).unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
 
         // A hook naming the file is evidence and still outranks both claims.
         db.insert_hint("src/x.rs", b, None).unwrap();
         assert_eq!(
-            db.take_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs").unwrap(),
             Some((b, Attribution::Hook))
         );
+        db.clear_hints("src/x.rs").unwrap();
 
         // b's command finishes and a is an unambiguous guess again.
         db.clear_bash_claim(b).unwrap();
         assert_eq!(
-            db.take_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs").unwrap(),
             Some((a, Attribution::Claim))
         );
     }
@@ -1204,7 +1211,7 @@ mod tests {
             .unwrap();
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         db.end_session("sess-b").unwrap();
-        assert_eq!(db.take_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
     }
 
     fn names(files: Vec<(String, String)>) -> Vec<String> {
@@ -1313,5 +1320,72 @@ mod tests {
             texts(db.take_messages(b).unwrap()),
             vec!["publish.rs is mid-refactor, do not start anything there"]
         );
+    }
+
+    fn db() -> Db {
+        Db::open(Path::new(":memory:")).expect("in-memory database")
+    }
+
+    fn session(db: &Db, name: &str) -> i64 {
+        db.upsert_session(name, name, "llm", Some("claude-code"))
+            .expect("session")
+    }
+
+    #[test]
+    fn a_hint_outlives_a_commit_that_failed() {
+        let db = db();
+        let agent = session(&db, "claude-a");
+        db.insert_hint("src/lib.rs", agent, None).unwrap();
+
+        // The daemon reads the hint, its shadow commit fails, and it never
+        // reaches clear_hints. The retry has to find the same owner.
+        assert_eq!(
+            db.peek_hint("src/lib.rs").unwrap(),
+            Some((agent, Attribution::Hook))
+        );
+        assert_eq!(
+            db.peek_hint("src/lib.rs").unwrap(),
+            Some((agent, Attribution::Hook))
+        );
+
+        db.clear_hints("src/lib.rs").unwrap();
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+    }
+
+    #[test]
+    fn clearing_one_file_leaves_the_rest_alone() {
+        let db = db();
+        let agent = session(&db, "claude-a");
+        db.insert_hint("src/lib.rs", agent, None).unwrap();
+        db.insert_hint("src/main.rs", agent, None).unwrap();
+
+        db.clear_hints("src/lib.rs").unwrap();
+
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+        assert_eq!(
+            db.peek_hint("src/main.rs").unwrap(),
+            Some((agent, Attribution::Hook))
+        );
+    }
+
+    #[test]
+    fn the_newest_hint_wins_and_a_stale_one_is_ignored() {
+        let db = db();
+        let first = session(&db, "claude-a");
+        let second = session(&db, "claude-b");
+        db.insert_hint("src/lib.rs", first, None).unwrap();
+        db.insert_hint("src/lib.rs", second, None).unwrap();
+        assert_eq!(
+            db.peek_hint("src/lib.rs").unwrap(),
+            Some((second, Attribution::Hook))
+        );
+
+        db.conn
+            .execute(
+                "UPDATE hints SET ts = ?1 WHERE file = 'src/lib.rs'",
+                params![now_ts() - HINT_TTL_SECS - 1],
+            )
+            .unwrap();
+        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
     }
 }

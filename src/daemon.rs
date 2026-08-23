@@ -306,7 +306,7 @@ fn process(
     // Keep how the owner was found alongside the row. Nothing else in the
     // journal separates a session naming its own file from the daemon guessing
     // off a running command, and the two are worth different amounts of trust.
-    let (session_id, attributed_by) = match db.take_hint(rel)? {
+    let (session_id, attributed_by) = match db.peek_hint(rel)? {
         Some((id, how)) => (id, Some(how)),
         None => (human_id, None),
     };
@@ -328,6 +328,13 @@ fn process(
         attributed_by,
     )?;
     db.apply_edit_regions(session_id, rel, &hunks)?;
+    // Only now. Everything above can fail, and a hint consumed ahead of its
+    // commit is not there for the retry.
+    db.clear_hints(rel)?;
+    // Only now. Everything above can fail, and a hint consumed ahead of its
+    // commit is not there for the retry: the change lands on the human and the
+    // regions of every session working in this file stop being shifted.
+    db.clear_hints(rel)?;
     log(&format!(
         "{} {} - {} (ortak-{})",
         change.as_str(),
