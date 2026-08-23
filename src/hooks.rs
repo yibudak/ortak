@@ -88,41 +88,32 @@ pub fn session_start() -> Result<()> {
 
 pub fn post_edit() -> Result<()> {
     let input = read_stdin_json()?;
-    let ws = workspace_for(&input)?;
-    let db = Db::open(&ws.db_path)?;
+    let cwd_ws = workspace_for(&input).ok();
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
     let harness = harness_for(&input);
-    // Session may be unknown if the daemon/plugin were enabled mid-session.
-    let session_id = db.upsert_session(
-        &external_id,
-        &agent_name_for(&external_id, harness),
-        "llm",
-        Some(harness),
-    )?;
     let tool_name = input
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
-    let files = if tool_name == "apply_patch" {
-        patch_command(&tool_input)
-            .map(|patch| patch_files(&ws, patch))
-            .unwrap_or_default()
-    } else {
-        tool_input
-            .get("file_path")
-            .or_else(|| tool_input.get("notebook_path"))
-            .and_then(|v| v.as_str())
-            .and_then(|file| workspace_file(&ws, file))
-            .into_iter()
-            .collect()
-    };
-    for rel in files {
-        db.insert_hint(&rel, session_id)?;
+    for (ws, files) in group_by_workspace(cwd_ws.as_ref(), &target_paths(tool_name, &tool_input)) {
+        let db = Db::open(&ws.db_path)?;
+        // Session may be unknown if the daemon/plugin were enabled mid-session,
+        // and is always unknown the first time this session reaches into a
+        // workspace other than its own.
+        let session_id = db.upsert_session(
+            &external_id,
+            &agent_name_for(&external_id, harness),
+            "llm",
+            Some(harness),
+        )?;
+        for rel in files {
+            db.insert_hint(&rel, session_id)?;
+        }
     }
     Ok(())
 }
@@ -131,17 +122,56 @@ pub fn post_edit() -> Result<()> {
 /// region. Deterministic first-toucher-wins; on any doubt or error, allow.
 pub fn pre_edit() -> Result<()> {
     let input = read_stdin_json()?;
-    // Outside an ortak workspace, stay silent and allow the edit.
-    let Ok(ws) = workspace_for(&input) else {
-        return Ok(());
-    };
-    let cfg = Config::load(&ws.config_path).unwrap_or_default();
-    let db = Db::open(&ws.db_path)?;
+    let cwd_ws = workspace_for(&input).ok();
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let harness = harness_for(&input);
+    let tool_name = input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    let mut groups = group_by_workspace(cwd_ws.as_ref(), &target_paths(tool_name, &tool_input));
+    // The session's own workspace answers even when the call targets nothing in
+    // it, so a stopped line there still holds the session still.
+    if let Some(ws) = cwd_ws {
+        if !groups.iter().any(|(w, _)| w.root == ws.root) {
+            groups.push((ws, Vec::new()));
+        }
+    }
+    for (ws, files) in groups {
+        let Some(reason) = verdict(&ws, external_id, harness, &files, tool_name, &tool_input)?
+        else {
+            continue;
+        };
+        let out = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        });
+        println!("{}", out);
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// One workspace's ruling on a tool call. `Some(reason)` denies the edit;
+/// `None` allows it, which is also what any doubt or error resolves to.
+fn verdict(
+    ws: &Workspace,
+    external_id: &str,
+    harness: &str,
+    files: &[String],
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<Option<String>> {
+    let cfg = Config::load(&ws.config_path).unwrap_or_default();
+    let db = Db::open(&ws.db_path)?;
     let me = db.upsert_session(
         external_id,
         &agent_name_for(external_id, harness),
@@ -168,44 +198,31 @@ pub fn pre_edit() -> Result<()> {
                 .unwrap_or_default(),
             e0.responsible(),
         );
-        let out = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        });
-        println!("{}", out);
-        return Ok(());
+        return Ok(Some(reason));
     }
 
     if !cfg.gate.enabled {
-        return Ok(());
+        return Ok(None);
     }
-    let tool_name = input
-        .get("tool_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
-    let Some(file_targets) = target_files(&ws, tool_name, &tool_input) else {
-        return Ok(());
-    };
     let mut blocked = None;
-    for (rel, targets) in file_targets {
+    for rel in files {
+        let Some(targets) = target_regions(ws, rel, tool_name, tool_input) else {
+            continue;
+        };
         let conflicts = db.conflicts(
-            &rel,
+            rel,
             &targets,
             me,
             cfg.gate.margin_lines,
             cfg.gate.presence_minutes * 60,
         )?;
         if !conflicts.is_empty() {
-            blocked = Some((rel, conflicts));
+            blocked = Some((rel.clone(), conflicts));
             break;
         }
     }
     let Some((rel, conflicts)) = blocked else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Layer 3: with the referee enabled, an intent-aware ruling can overrule
@@ -220,21 +237,13 @@ pub fn pre_edit() -> Result<()> {
             &conflicts,
         ) {
             if allow {
-                return Ok(());
+                return Ok(None);
             }
             let reason = format!(
                 "The ortak arbiter denied this edit in {}: {} Do not bypass the denial by writing through Bash. Status: ortak log --session ortak-{}",
                 rel, message, conflicts[0].session_id
             );
-            let out = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            });
-            println!("{}", out);
-            return Ok(());
+            return Ok(Some(reason));
         }
     }
 
@@ -259,40 +268,78 @@ pub fn pre_edit() -> Result<()> {
         cfg.gate.presence_minutes,
         conflicts[0].session_id
     ));
-    let out = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    });
-    println!("{}", out);
-    Ok(())
+    Ok(Some(reason))
 }
 
-/// Which files and line ranges is this tool call about to touch?
-/// `None` means nothing can be checked, so allow. Conservative fallbacks return a
-/// whole-file range.
-fn target_files(
+/// Every file path a tool call names, as written in the tool input. An empty
+/// result means there is nothing to journal or check.
+fn target_paths(tool_name: &str, tool_input: &Value) -> Vec<String> {
+    match tool_name {
+        "apply_patch" => patch_command(tool_input)
+            .map(patch_paths)
+            .unwrap_or_default(),
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => tool_input
+            .get("file_path")
+            .or_else(|| tool_input.get("notebook_path"))
+            .and_then(|v| v.as_str())
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Group a tool call's targets by the ortak workspace that owns each file,
+/// which is the workspace whose journal, gate and config govern that edit. It
+/// is not always the one the session runs in: an agent working in an app repo
+/// reaches into the backend repo next to it, and one call can legitimately
+/// span both. Relative paths resolve against `base`, the session's own
+/// workspace, as before. A file that belongs to no workspace is skipped in
+/// silence.
+///
+/// A session that edits across workspaces gets a session row, and a different
+/// `ortak-N`, in each of them. Session numbering is per workspace, so that is
+/// correct, but the SessionStart context only ever names the id of the
+/// workspace the session started in.
+fn group_by_workspace(base: Option<&Workspace>, paths: &[String]) -> Vec<(Workspace, Vec<String>)> {
+    let mut out: Vec<(Workspace, Vec<String>)> = Vec::new();
+    for p in paths {
+        let raw = Path::new(p);
+        let abs = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else if let Some(ws) = base {
+            ws.root.join(raw)
+        } else {
+            continue;
+        };
+        let Ok(ws) = Workspace::discover(&abs) else {
+            continue;
+        };
+        let Some(rel) = ws.relativize(&abs) else {
+            continue;
+        };
+        match out.iter_mut().find(|(w, _)| w.root == ws.root) {
+            Some((_, files)) => files.push(rel),
+            None => out.push((ws, vec![rel])),
+        }
+    }
+    out
+}
+
+/// Which line ranges is this tool call about to touch inside `rel`?
+/// `None` means nothing can be checked, so leave the file alone. Conservative
+/// fallbacks return a whole-file range.
+fn target_regions(
     ws: &Workspace,
+    rel: &str,
     tool_name: &str,
     tool_input: &Value,
-) -> Option<Vec<(String, Vec<Region>)>> {
+) -> Option<Vec<Region>> {
     let whole = vec![Region {
         start: 1,
         end: WHOLE_FILE,
     }];
     match tool_name {
-        "Write" => {
-            let rel = rel_file(ws, tool_input, "file_path")?;
-            Some(vec![(rel, whole)])
-        }
-        "NotebookEdit" => {
-            let rel = rel_file(ws, tool_input, "notebook_path")?;
-            Some(vec![(rel, whole)])
-        }
         "Edit" => {
-            let rel = rel_file(ws, tool_input, "file_path")?;
             let old = tool_input
                 .get("old_string")
                 .and_then(|v| v.as_str())
@@ -301,10 +348,9 @@ fn target_files(
                 .get("replace_all")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            Some(vec![ranged(ws, rel, &[(old, all)], whole)?])
+            ranged(ws, rel, &[(old, all)], whole)
         }
         "MultiEdit" => {
-            let rel = rel_file(ws, tool_input, "file_path")?;
             let edits: Vec<(&str, bool)> = tool_input
                 .get("edits")
                 .and_then(|v| v.as_array())
@@ -321,33 +367,10 @@ fn target_files(
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(vec![ranged(ws, rel, &edits, whole)?])
+            ranged(ws, rel, &edits, whole)
         }
-        "apply_patch" => {
-            let files = patch_files(ws, patch_command(tool_input)?);
-            if files.is_empty() {
-                None
-            } else {
-                Some(files.into_iter().map(|rel| (rel, whole.clone())).collect())
-            }
-        }
-        _ => None,
+        _ => Some(whole),
     }
-}
-
-fn rel_file(ws: &Workspace, tool_input: &Value, key: &str) -> Option<String> {
-    let p = tool_input.get(key)?.as_str()?;
-    workspace_file(ws, p)
-}
-
-fn workspace_file(ws: &Workspace, file: &str) -> Option<String> {
-    let path = Path::new(file);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        ws.root.join(path)
-    };
-    ws.relativize(&abs)
 }
 
 fn patch_command(tool_input: &Value) -> Option<&str> {
@@ -358,7 +381,7 @@ fn patch_command(tool_input: &Value) -> Option<&str> {
         .or_else(|| tool_input.as_str())
 }
 
-fn patch_files(ws: &Workspace, patch: &str) -> Vec<String> {
+fn patch_paths(patch: &str) -> Vec<String> {
     const PATH_PREFIXES: [&str; 4] = [
         "*** Add File: ",
         "*** Update File: ",
@@ -373,9 +396,7 @@ fn patch_files(ws: &Workspace, patch: &str) -> Vec<String> {
         else {
             continue;
         };
-        if let Some(rel) = workspace_file(ws, file.trim()) {
-            files.insert(rel);
-        }
+        files.insert(file.trim().to_string());
     }
     files.into_iter().collect()
 }
@@ -385,15 +406,15 @@ fn patch_files(ws: &Workspace, patch: &str) -> Vec<String> {
 /// An unreadable binary file gets a conservative whole-file range.
 fn ranged(
     ws: &Workspace,
-    rel: String,
+    rel: &str,
     needles: &[(&str, bool)],
     whole: Vec<Region>,
-) -> Option<(String, Vec<Region>)> {
-    let abs = ws.root.join(&rel);
+) -> Option<Vec<Region>> {
+    let abs = ws.root.join(rel);
     let content = match std::fs::read_to_string(&abs) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return Some((rel, whole)),
+        Err(_) => return Some(whole),
     };
     let mut targets = Vec::new();
     for (needle, all) in needles {
@@ -415,7 +436,7 @@ fn ranged(
     if targets.is_empty() {
         return None;
     }
-    Some((rel, targets))
+    Some(targets)
 }
 
 /// PostToolUse on Bash: when a command fails and the line is open, nudge the
@@ -564,17 +585,15 @@ mod tests {
     }
 
     #[test]
-    fn extracts_all_workspace_paths_from_codex_patch() {
-        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
+    fn extracts_all_paths_from_codex_patch() {
         let patch = "*** Begin Patch\n\
 *** Update File: src/main.rs\n\
 *** Move to: src/bin/main.rs\n\
 *** Add File: tests/smoke.rs\n\
 *** Delete File: old.rs\n\
-*** Update File: /outside/not-ours.rs\n\
 *** End Patch";
         assert_eq!(
-            patch_files(&ws, patch),
+            patch_paths(patch),
             vec![
                 "old.rs".to_string(),
                 "src/bin/main.rs".to_string(),
@@ -586,24 +605,50 @@ mod tests {
 
     #[test]
     fn codex_patch_targets_whole_files() {
-        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
-        let targets = target_files(
-            &ws,
-            "apply_patch",
-            &serde_json::json!({
-                "command": "*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch"
-            }),
-        )
-        .expect("patch target");
+        let input = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch"
+        });
         assert_eq!(
-            targets,
-            vec![(
-                "src/main.rs".to_string(),
-                vec![Region {
-                    start: 1,
-                    end: WHOLE_FILE,
-                }],
-            )]
+            target_paths("apply_patch", &input),
+            vec!["src/main.rs".to_string()]
         );
+        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
+        assert_eq!(
+            target_regions(&ws, "src/main.rs", "apply_patch", &input),
+            Some(vec![Region {
+                start: 1,
+                end: WHOLE_FILE,
+            }])
+        );
+    }
+
+    /// A tool call is grouped by the workspace that owns each file, not by the
+    /// one the session runs in, and a file outside every workspace is dropped.
+    #[test]
+    fn groups_targets_by_the_workspace_that_owns_them() {
+        let base = std::env::temp_dir().join(format!("ortak-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (one, two) = (base.join("one"), base.join("two"));
+        std::fs::create_dir_all(one.join(crate::workspace::ORTAK_DIR)).unwrap();
+        std::fs::create_dir_all(two.join(crate::workspace::ORTAK_DIR)).unwrap();
+        std::fs::create_dir_all(base.join("neither")).unwrap();
+
+        let paths = vec![
+            one.join("src/app.py").to_string_lossy().into_owned(),
+            two.join("api.rs").to_string_lossy().into_owned(),
+            base.join("neither/stray.txt")
+                .to_string_lossy()
+                .into_owned(),
+            "notes.md".to_string(),
+        ];
+        let groups = group_by_workspace(Some(&Workspace::at(&one)), &paths);
+
+        assert_eq!(groups.len(), 2, "expected one group per owning workspace");
+        assert_eq!(groups[0].0.root, one);
+        // The relative path resolves against the session's own workspace.
+        assert_eq!(groups[0].1, vec!["src/app.py", "notes.md"]);
+        assert_eq!(groups[1].0.root, two);
+        assert_eq!(groups[1].1, vec!["api.rs"]);
+        std::fs::remove_dir_all(&base).ok();
     }
 }
