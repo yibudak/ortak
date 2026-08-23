@@ -140,7 +140,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         .filter(|(_, f)| files.iter().any(|(g, _)| g == f))
         .map(|(c, _)| c)
         .collect();
-    let (session_tree, unreplayable) = session_only_tree(&shadow, &seed, &base_tree, &commits)?;
+    // A file another session has journaled and not released is genuinely built
+    // on work that has not shipped. One it has released is not, whatever the
+    // shadow history still looks like. Erring towards "theirs" keeps today's
+    // behaviour when the lookup fails.
+    let still_theirs = |file: &str| -> bool { db.shared_file(session.id, file).unwrap_or(true) };
+    let (session_tree, unreplayable) =
+        session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs)?;
 
     // A file whose history cannot be replayed has no correct content to ship, so
     // it leaves the branch and the rest of the session's work still goes out.
@@ -398,6 +404,7 @@ fn session_only_tree<'r>(
     seed: &Commit<'r>,
     base_tree: &Tree,
     commits: &[String],
+    still_theirs: &dyn Fn(&str) -> bool,
 ) -> Result<(Tree<'r>, Vec<String>)> {
     let mut head = seed.clone();
     let mut unreplayable: Vec<String> = Vec::new();
@@ -419,29 +426,54 @@ fn session_only_tree<'r>(
             // session built on another session's work that has not shipped yet.
             // Drop the commit and keep replaying, so one such file costs its own
             // file and nothing else; `run` reports what was left out.
-            let unshipped: Vec<&String> = paths
+            let unshipped: Vec<String> = paths
                 .iter()
                 .filter(|p| base_tree.get_path(Path::new(p)).is_err())
+                .cloned()
                 .collect();
             if !unshipped.is_empty() && unshipped.len() == paths.len() {
-                for p in unshipped {
-                    if !unreplayable.contains(p) {
-                        unreplayable.push(p.clone());
+                // Only while somebody else still claims the file. Once they have
+                // released it the conflict is this session's own history with a
+                // hole in it, left by a write that was credited to the wrong
+                // session, and the session's own content is the answer. Dropping
+                // the commit there stranded the file for good: every later
+                // commit conflicted the same way, so the whole file left the
+                // branch and no release, `--all` or rewrite brought it back.
+                let held: Vec<String> = unshipped
+                    .iter()
+                    .filter(|p| still_theirs(p))
+                    .cloned()
+                    .collect();
+                if !held.is_empty() {
+                    for p in held {
+                        if !unreplayable.contains(&p) {
+                            unreplayable.push(p);
+                        }
+                    }
+                    continue;
+                }
+                let pick_tree = pick.tree()?;
+                for p in &unshipped {
+                    let path = Path::new(p);
+                    merged.remove_path(path)?;
+                    if let Ok(entry) = pick_tree.get_path(path) {
+                        let len = shadow.find_blob(entry.id())?.content().len();
+                        merged.add(&entry_for(p, entry.id(), entry.filemode() as u32, len))?;
                     }
                 }
-                continue;
+            } else {
+                // Whose edits are already at those lines is not something the
+                // merge reports, and the old message guessed "another session".
+                // Often it is the publishing session's own work from an earlier
+                // branch, and the guess sends the reader looking for a
+                // collaborator who is not there.
+                let flags = format!("--exclude {}", paths.join(" --exclude "));
+                bail!(
+                    "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
+                    paths.join(", "),
+                    flags
+                );
             }
-            // Whose edits are already at those lines is not something the merge
-            // reports, and the old message guessed "another session". Often it
-            // is the publishing session's own work from an earlier branch, and
-            // the guess sends the reader looking for a collaborator who is not
-            // there.
-            let flags = format!("--exclude {}", paths.join(" --exclude "));
-            bail!(
-                "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
-                paths.join(", "),
-                flags
-            );
         }
         let tree = shadow.find_tree(merged.write_tree_to(shadow)?)?;
         let next = shadow.commit(None, &sig, &sig, "replay", &tree, &[&head])?;
@@ -633,6 +665,12 @@ fn slug(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The replay's question about each file: does another session still claim
+    /// it? In every test but one, nobody does.
+    fn shared_none(_: &str) -> bool {
+        false
+    }
+
     fn lines(edits: &[(usize, &str)]) -> String {
         let mut v: Vec<String> = (1..=40).map(|i| format!("line_{i}")).collect();
         for (n, text) in edits {
@@ -722,7 +760,7 @@ mod tests {
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
         let picks = vec![a1.to_string(), a2.to_string()];
-        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks, &shared_none).unwrap();
         assert!(skipped.is_empty());
         let out = file_in(&tree, &repo);
 
@@ -740,7 +778,7 @@ mod tests {
         let (dir, repo) = scratch("empty");
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
-        let (tree, _) = session_only_tree(&repo, &seed, &base, &[]).unwrap();
+        let (tree, _) = session_only_tree(&repo, &seed, &base, &[], &shared_none).unwrap();
         assert_eq!(file_in(&tree, &repo), lines(&[]));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -765,8 +803,51 @@ mod tests {
         // Session A's file has since been merged, so the base branch carries it.
         let base = tree_with(&repo, Some(&lines(&[(3, "AAA-created")])));
         let seed = parentless(&repo, &base);
-        let (tree, _) = session_only_tree(&repo, &seed, &base, &[edited.to_string()]).unwrap();
+        let (tree, _) =
+            session_only_tree(&repo, &seed, &base, &[edited.to_string()], &shared_none).unwrap();
         assert!(file_in(&tree, &repo).contains("BBB-edit"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write credited to the wrong session leaves a foreign commit in the
+    /// middle of a file's shadow history, and every later commit of the real
+    /// author's then conflicts against it. While the other session still claims
+    /// the file that is honest; once it has released it, dropping the author's
+    /// own work is not, and used to be permanent.
+    #[test]
+    fn a_released_file_replays_again() {
+        let (dir, repo) = scratch("released");
+        let mine1 = commit_file(&repo, None, "mine.py", &lines(&[(1, "MINE-1")]));
+        let mine1_c = repo.find_commit(mine1).unwrap();
+        // Somebody else's write lands in the middle: a formatter run, credited
+        // to whichever session had a command open.
+        let theirs = commit_file(
+            &repo,
+            Some(&mine1_c),
+            "mine.py",
+            &lines(&[(1, "MINE-1"), (2, "REFORMATTED")]),
+        );
+        let theirs_c = repo.find_commit(theirs).unwrap();
+        let mine2 = commit_file(
+            &repo,
+            Some(&theirs_c),
+            "mine.py",
+            &lines(&[(1, "MINE-2"), (2, "REFORMATTED")]),
+        );
+
+        let base = tree_with(&repo, None); // mine.py is on no branch
+        let seed = parentless(&repo, &base);
+        let picks = vec![mine1.to_string(), mine2.to_string()];
+
+        // Still theirs: the old answer, and the right one while it is true.
+        let (_, skipped) =
+            session_only_tree(&repo, &seed, &base, &picks, &|f: &str| f == "mine.py").unwrap();
+        assert_eq!(skipped, vec!["mine.py".to_string()]);
+
+        // Released: the file is the author's own history with a hole in it.
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks, &shared_none).unwrap();
+        assert!(skipped.is_empty(), "a released file is publishable again");
+        assert!(named_file_in(&tree, &repo, "mine.py").contains("MINE-2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -796,7 +877,9 @@ mod tests {
         let base = tree_with(&repo, None); // nothing shipped
         let seed = parentless(&repo, &base);
         let picks = vec![touched.to_string(), own.to_string()];
-        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
+        let theirs_still = |f: &str| f == "dep.py";
+        let (tree, skipped) =
+            session_only_tree(&repo, &seed, &base, &picks, &theirs_still).unwrap();
 
         assert_eq!(skipped, vec!["dep.py".to_string()]);
         assert!(named_file_in(&tree, &repo, "mine.py").contains("MINE-new"));
@@ -819,7 +902,7 @@ mod tests {
         // The base branch has its own line 3, so the pick has nowhere to land.
         let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
         let seed = parentless(&repo, &base);
-        let err = session_only_tree(&repo, &seed, &base, &[mine.to_string()])
+        let err = session_only_tree(&repo, &seed, &base, &[mine.to_string()], &shared_none)
             .unwrap_err()
             .to_string();
 
@@ -928,7 +1011,8 @@ mod tests {
 
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
-        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &commits).unwrap();
+        let (tree, skipped) =
+            session_only_tree(&repo, &seed, &base, &commits, &shared_none).unwrap();
         assert!(skipped.is_empty());
         assert!(file_in(&tree, &repo).contains("KEPT-edit"));
         assert!(tree.get_path(Path::new("drop.py")).is_err());
