@@ -69,3 +69,25 @@ ortak publish ortak-2 --push
 ```
 
 Publishing requires a Git repository with at least one commit and a configured remote.
+
+### Set `base_branch` before the first publish
+
+`ortak publish` builds every branch on top of `[publish] base_branch` from `ortak.toml`,
+which defaults to `main`:
+
+```toml
+[publish]
+base_branch = "main"
+```
+
+That default is wrong for any repository whose trunk goes by another name, and plenty do:
+`master`, `develop`, or a version branch like `16.0`. Point it at the branch these tasks
+merge into. Until you do, publishing refuses and names what it could not find:
+
+```
+error: base branch '16.0' does not exist in this repository (HEAD is on 'task/ortak-2-fix-login').
+Set [publish] base_branch in ortak.toml to the branch these tasks merge into
+```
+
+It refuses instead of guessing. The obvious guess is HEAD, and HEAD in a shared workspace
+is whatever branch the tree happens to sit on, which can be another session's task branch.
