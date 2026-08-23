@@ -77,6 +77,17 @@ pub struct Conflict {
     pub last_ts: i64,
 }
 
+/// A session's claim on a range of one file, as `blame` reads it back out.
+#[derive(Debug, Clone)]
+pub struct Owner {
+    pub session_id: i64,
+    pub agent_name: String,
+    pub intent: Option<String>,
+    pub start: i64,
+    pub end: i64,
+    pub last_ts: i64,
+}
+
 pub type FreshRegion = (String, i64, i64, String, i64, i64);
 
 pub struct Db {
@@ -474,6 +485,32 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Every region recorded on one file, ordered down the file. Unlike
+    /// `fresh_regions` this ignores presence and session status: the point of
+    /// blame is that a line still belongs to whoever wrote it long after that
+    /// session ended.
+    pub fn file_regions(&self, file: &str) -> Result<Vec<Owner>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
+                    COALESCE((SELECT MAX(e.ts) FROM edits e
+                               WHERE e.session_id = r.session_id AND e.file = r.file), 0)
+             FROM regions r JOIN sessions s ON s.id = r.session_id
+             WHERE r.file = ?1
+             ORDER BY r.start_line, r.end_line",
+        )?;
+        let rows = stmt.query_map(params![file], |r| {
+            Ok(Owner {
+                session_id: r.get(0)?,
+                agent_name: r.get(1)?,
+                intent: r.get(2)?,
+                start: r.get(3)?,
+                end: r.get(4)?,
+                last_ts: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// All hot regions in the workspace (for `status`).

@@ -42,6 +42,11 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Show which session owns the lines of a file
+    Blame {
+        /// File, or file and line: src/db.rs or src/db.rs:143
+        target: String,
+    },
     /// List sessions
     Sessions,
     /// Record a session's task intent
@@ -137,6 +142,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Status => status(),
         Command::Log { session, limit } => log(session.as_deref(), limit),
+        Command::Blame { target } => blame(&target),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
         Command::Publish {
@@ -229,6 +235,115 @@ fn status() -> Result<()> {
     Ok(())
 }
 
+/// Read line ownership back out of the journal. git history records the human
+/// who committed; `regions` records the session that wrote the lines, and keeps
+/// shifting them as later edits move the code around, so this is the one place
+/// that can answer for an agent.
+fn blame(target: &str) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    let (file, line) = split_target(target);
+    let rel = relativize_arg(&ws, file);
+    let owners = db.file_regions(&rel)?;
+    let now = db::now_ts();
+
+    if let Some(line) = line {
+        let Some(o) = owners.iter().find(|o| o.start <= line && line <= o.end) else {
+            println!(
+                "no session has touched line {} of {}; it is as the base branch left it",
+                line, rel
+            );
+            return Ok(());
+        };
+        println!(
+            "{}:{} - ortak-{} {}, {}",
+            rel,
+            line,
+            o.session_id,
+            o.agent_name,
+            ago(now - o.last_ts)
+        );
+        println!(
+            "  owns {}, intent: {}",
+            range(o),
+            o.intent.as_deref().unwrap_or("(not reported)")
+        );
+        return Ok(());
+    }
+
+    if owners.is_empty() {
+        println!(
+            "no session has touched {}; it is as the base branch left it",
+            rel
+        );
+        return Ok(());
+    }
+    println!("{}", rel);
+    for o in &owners {
+        println!(
+            "  {:>12}  ortak-{} {}, {}",
+            range(o),
+            o.session_id,
+            o.agent_name,
+            ago(now - o.last_ts)
+        );
+        println!(
+            "                intent: {}",
+            o.intent.as_deref().unwrap_or("(not reported)")
+        );
+    }
+    Ok(())
+}
+
+fn range(o: &db::Owner) -> String {
+    if o.end >= regions::WHOLE_FILE {
+        "whole file".to_string()
+    } else if o.start == o.end {
+        format!("{}", o.start)
+    } else {
+        format!("{}-{}", o.start, o.end)
+    }
+}
+
+/// Split `src/db.rs:143` into its file and line. Anything after the last colon
+/// that is not a line number belongs to the filename.
+fn split_target(target: &str) -> (&str, Option<i64>) {
+    match target.rsplit_once(':') {
+        Some((file, line)) => match line.parse::<i64>() {
+            Ok(n) if n > 0 => (file, Some(n)),
+            _ => (target, None),
+        },
+        None => (target, None),
+    }
+}
+
+/// The journal keys files on their workspace-relative path, so an argument
+/// typed from a subdirectory or as an absolute path has to be brought back to
+/// that. A path from outside the workspace is passed through and simply matches
+/// nothing.
+fn relativize_arg(ws: &Workspace, file: &str) -> String {
+    let path = std::path::Path::new(file);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return file.to_string(),
+        }
+    };
+    ws.relativize(&abs).unwrap_or_else(|| file.to_string())
+}
+
+/// Rough age for someone reading a list: whichever unit keeps it short.
+fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 90 => format!("{}s ago", s),
+        s if s < 5400 => format!("{} min ago", s / 60),
+        s if s < 172_800 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86400),
+    }
+}
+
 fn sessions() -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
@@ -276,4 +391,58 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     db.set_intent(session.id, text)?;
     println!("recorded intent for ortak-{}: {}", session.id, text);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use regions::Hunk;
+
+    fn hunk(start: i64, lines: i64) -> Hunk {
+        Hunk {
+            old_start: start,
+            old_lines: lines,
+            new_start: start,
+            new_lines: lines,
+        }
+    }
+
+    #[test]
+    fn a_line_belongs_to_the_session_whose_region_covers_it() {
+        let path = std::env::temp_dir().join(format!("ortak-blame-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let a = db
+            .upsert_session("sess-a", "claude-aaaa", "llm", Some("claude-code"))
+            .unwrap();
+        let b = db
+            .upsert_session("sess-b", "claude-bbbb", "llm", Some("claude-code"))
+            .unwrap();
+        db.set_intent(a, "rewrite the header").unwrap();
+        db.insert_edit(a, "src/db.rs", "modify", None, &[]).unwrap();
+        db.apply_edit_regions(a, "src/db.rs", &[hunk(1, 3)])
+            .unwrap();
+        db.insert_edit(b, "src/db.rs", "modify", None, &[]).unwrap();
+        db.apply_edit_regions(b, "src/db.rs", &[hunk(40, 2)])
+            .unwrap();
+
+        let owners = db.file_regions("src/db.rs").unwrap();
+        let owner_of = |line: i64| owners.iter().find(|o| o.start <= line && line <= o.end);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owner_of(2).map(|o| o.session_id), Some(a));
+        assert_eq!(
+            owner_of(2).and_then(|o| o.intent.clone()).as_deref(),
+            Some("rewrite the header")
+        );
+        assert_eq!(owner_of(41).map(|o| o.session_id), Some(b));
+        assert!(owner_of(20).is_none(), "the gap belongs to nobody");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_trailing_line_number_is_not_part_of_the_filename() {
+        assert_eq!(split_target("src/db.rs:143"), ("src/db.rs", Some(143)));
+        assert_eq!(split_target("src/db.rs"), ("src/db.rs", None));
+        assert_eq!(split_target("odd:name.rs"), ("odd:name.rs", None));
+    }
 }
