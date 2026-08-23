@@ -200,7 +200,10 @@ CREATE TABLE IF NOT EXISTS edits (
   shadow_commit TEXT,
   ts            INTEGER NOT NULL,
   hunks         TEXT,                     -- JSON [{old_start,old_lines,new_start,new_lines}]
-  attributed_by TEXT                      -- 'hook' | 'claim'; NULL when nothing claimed the file
+  attributed_by TEXT,                     -- 'hook' | 'claim'; NULL when nothing claimed the file
+  -- Set by `ortak release`: the session says the row is not its work. Every
+  -- query that answers "what has this session done" skips these.
+  disowned      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_edits_session ON edits(session_id);
 CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(file);
@@ -281,6 +284,10 @@ impl Db {
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunks TEXT", []);
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN attributed_by TEXT", []);
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN blob TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE edits ADD COLUMN disowned INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Db { conn })
     }
 
@@ -558,7 +565,7 @@ impl Db {
         let sql = "SELECT e.id, e.session_id, s.agent_name, e.file, e.change_kind, e.shadow_commit,
                           e.ts, e.attributed_by
                    FROM edits e JOIN sessions s ON s.id = e.session_id
-                   WHERE (?1 IS NULL OR e.session_id = ?1)
+                   WHERE (?1 IS NULL OR e.session_id = ?1) AND e.disowned = 0
                    ORDER BY e.id DESC LIMIT ?2";
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![session_id, limit], |r| {
@@ -578,10 +585,15 @@ impl Db {
 
     /// Files a session touched after edit `after`, with the last change kind
     /// per file. `after = 0` is every edit the session ever made.
+    ///
+    /// Both halves skip disowned rows, so a disowned newest row can never hide
+    /// an owned older one.
     pub fn session_files(&self, session_id: i64, after: i64) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT file, change_kind FROM edits WHERE session_id = ?1 AND id > ?2 AND id IN
-               (SELECT MAX(id) FROM edits WHERE session_id = ?1 AND id > ?2 GROUP BY file)
+            "SELECT file, change_kind FROM edits
+             WHERE session_id = ?1 AND id > ?2 AND disowned = 0 AND id IN
+               (SELECT MAX(id) FROM edits
+                 WHERE session_id = ?1 AND id > ?2 AND disowned = 0 GROUP BY file)
              ORDER BY file",
         )?;
         let rows = stmt.query_map(params![session_id, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -605,7 +617,7 @@ impl Db {
     pub fn session_commits(&self, session_id: i64, after: i64) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT shadow_commit, file FROM edits
-             WHERE session_id = ?1 AND id > ?2 AND shadow_commit IS NOT NULL
+             WHERE session_id = ?1 AND id > ?2 AND shadow_commit IS NOT NULL AND disowned = 0
              ORDER BY id",
         )?;
         let rows = stmt.query_map(params![session_id, after], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -620,6 +632,7 @@ impl Db {
             .query_row(
                 "SELECT shadow_commit FROM edits
                  WHERE session_id = ?1 AND file = ?2 AND shadow_commit IS NOT NULL
+                   AND disowned = 0
                  ORDER BY id DESC LIMIT 1",
                 params![session_id, file],
                 |r| r.get(0),
@@ -632,7 +645,8 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT 1 FROM edits WHERE file = ?1 AND session_id != ?2 LIMIT 1",
+                "SELECT 1 FROM edits
+                 WHERE file = ?1 AND session_id != ?2 AND disowned = 0 LIMIT 1",
                 params![file, session_id],
                 |r| r.get::<_, i64>(0),
             )
@@ -642,7 +656,7 @@ impl Db {
 
     pub fn edit_count(&self, session_id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM edits WHERE session_id = ?1",
+            "SELECT COUNT(*) FROM edits WHERE session_id = ?1 AND disowned = 0",
             params![session_id],
             |r| r.get(0),
         )?)
@@ -705,6 +719,25 @@ impl Db {
             "DELETE FROM regions WHERE session_id = ?1 AND (?2 IS NULL OR file = ?2)",
             params![session_id, file],
         )?)
+    }
+
+    /// Give a file back entirely: the regions the gate defends and the journal
+    /// rows `log` and `publish` read. Returns (regions dropped, edits disowned).
+    ///
+    /// One without the other is how the journal came to contradict itself, so
+    /// they go together or not at all. The rows are marked rather than deleted,
+    /// so a release by mistake has not destroyed the work and writing the file
+    /// again takes it back.
+    pub fn disown(&self, session_id: i64, file: Option<&str>) -> Result<(usize, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let regions = self.release_regions(session_id, file)?;
+        let edits = tx.execute(
+            "UPDATE edits SET disowned = 1
+             WHERE session_id = ?1 AND (?2 IS NULL OR file = ?2) AND disowned = 0",
+            params![session_id, file],
+        )?;
+        tx.commit()?;
+        Ok((regions, edits))
     }
 
     /// After journaling an edit: shift every existing region on the file
@@ -1089,7 +1122,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT e.session_id, s.agent_name, e.file, MAX(e.ts)
              FROM edits e JOIN sessions s ON s.id = e.session_id
-             WHERE e.ts >= ?1
+             WHERE e.ts >= ?1 AND e.disowned = 0
              GROUP BY e.session_id, e.file
              ORDER BY MAX(e.ts) DESC",
         )?;
@@ -1570,5 +1603,44 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(_, _, _, _, sid, _)| *sid == second));
+    }
+
+    #[test]
+    fn a_released_file_leaves_everything_the_session_claims() {
+        let db = db();
+        let wrong = session(&db, "claude-a");
+        let onlooker = session(&db, "claude-b");
+        owns(&db, wrong, "src/impact.rs", 1, 195);
+        owns(&db, wrong, "src/db.rs", 10, 4);
+
+        assert_eq!(db.disown(wrong, Some("src/impact.rs")).unwrap(), (1, 1));
+
+        // The gate, the publish file list and the log read three different
+        // queries. Release used to quiet the first and leave the other two
+        // holding a file the session had just said was not its work.
+        let at = Region { start: 40, end: 40 };
+        assert!(db
+            .conflicts("src/impact.rs", &[at], onlooker, 3, 1800)
+            .unwrap()
+            .is_empty());
+        let published: Vec<String> = db
+            .session_files(wrong, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(published, ["src/db.rs"]);
+        let logged: Vec<String> = db
+            .recent_edits(Some(wrong), 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file)
+            .collect();
+        assert_eq!(logged, ["src/db.rs"]);
+        assert_eq!(db.edit_count(wrong).unwrap(), 1);
+
+        // Writing the file again is how a session takes it back.
+        owns(&db, wrong, "src/impact.rs", 1, 195);
+        assert_eq!(db.session_files(wrong, 0).unwrap().len(), 2);
     }
 }

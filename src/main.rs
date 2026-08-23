@@ -96,7 +96,7 @@ enum Command {
         /// Session reference (ortak-3)
         session: String,
     },
-    /// Give up this session's claim on a file's lines, freeing them for others
+    /// Give a file back: free its lines and drop it from this session's work
     Release {
         /// Session reference (ortak-3)
         session: String,
@@ -676,16 +676,20 @@ fn release(session_ref: &str, file: Option<&str>, all: bool) -> Result<()> {
         (None, true) => None,
         _ => anyhow::bail!("name a file to release, or pass --all to release every file"),
     };
-    let dropped = db.release_regions(session.id, rel.as_deref())?;
-    match rel {
-        Some(f) => println!(
-            "released {} region(s) held by ortak-{} on {}",
-            dropped, session.id, f
-        ),
-        None => println!(
-            "released {} region(s) held by ortak-{}",
-            dropped, session.id
-        ),
+    let (regions, edits) = db.disown(session.id, rel.as_deref())?;
+    let scope = match &rel {
+        Some(f) => format!(" on {}", f),
+        None => String::new(),
+    };
+    println!(
+        "released {} region(s) and {} journal row(s) held by ortak-{}{}",
+        regions, edits, session.id, scope
+    );
+    if edits > 0 {
+        println!(
+            "those files are no longer part of what ortak-{} publishes",
+            session.id
+        );
     }
     Ok(())
 }
