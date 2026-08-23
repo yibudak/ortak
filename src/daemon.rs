@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Wait this long after the last fs event on a path before journaling it.
-/// Also gives the harness hook time to land its attribution hint.
-const DEBOUNCE: Duration = Duration::from_millis(400);
+/// How long a path must sit quiet before a change no hook claimed is journaled
+/// against the human. Snapshots do not wait: they go in the moment a hook lands
+/// one. The gap is generous on purpose, so a slow hook is not overtaken and its
+/// session's work credited to somebody else.
+const UNATTRIBUTED_QUIET: Duration = Duration::from_millis(1500);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
@@ -56,12 +58,21 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        let due: Vec<String> = pending
+        // Attributed work goes in as soon as its hook lands, one micro-commit
+        // per snapshot, so two sessions writing one file inside one window stay
+        // separate.
+        for rel in db.snapshot_files()? {
+            if let Err(e) = process_snapshots(&db, &repo, &rel) {
+                log(&format!("ERROR {}: {}", rel, e));
+            }
+        }
+
+        let quiet: Vec<String> = pending
             .iter()
-            .filter(|(_, t)| t.elapsed() >= DEBOUNCE)
+            .filter(|(_, t)| t.elapsed() >= UNATTRIBUTED_QUIET)
             .map(|(p, _)| p.clone())
             .collect();
-        for rel in due {
+        for rel in quiet {
             pending.remove(&rel);
             if let Err(e) = process(&db, &repo, ws, human_id, &rel) {
                 log(&format!("ERROR {}: {}", rel, e));
@@ -97,9 +108,12 @@ fn process(
     if abs.is_dir() {
         return Ok(false);
     }
+    let recorded = process_snapshots(db, repo, rel)?;
+
+    // Whatever is left is what no hook claimed: a Bash write, or the human.
     let change = shadow::classify(repo, &ws.root, rel)?;
     if change == Change::None {
-        return Ok(false);
+        return Ok(recorded);
     }
     // Hunks must be computed against shadow HEAD *before* the micro-commit.
     let old_blob = shadow::head_blob(repo, rel);
@@ -112,7 +126,14 @@ fn process(
     drop(old_blob);
     let session_id = db.take_hint(rel)?.unwrap_or(human_id);
     let session = db.get_session(session_id)?;
-    let oid = shadow::commit_edit(repo, rel, change, &session.agent_name, &session.external_id)?;
+    let oid = shadow::commit_edit(
+        repo,
+        rel,
+        change,
+        &session.agent_name,
+        &session.external_id,
+        None,
+    )?;
     db.insert_edit(session_id, rel, change.as_str(), Some(&oid), &hunks)?;
     db.apply_edit_regions(session_id, rel, &hunks)?;
     log(&format!(
@@ -123,6 +144,62 @@ fn process(
         session.id
     ));
     Ok(true)
+}
+
+/// Journal every snapshot a hook recorded for this path, oldest first. Each one
+/// holds one session's file as that session left it, so two sessions writing the
+/// same file inside one debounce window still get one commit each.
+fn process_snapshots(db: &Db, repo: &git2::Repository, rel: &str) -> Result<bool> {
+    let snapshots = db.peek_snapshots(rel)?;
+    if repo.is_path_ignored(rel).unwrap_or(false) {
+        for (rowid, _, _) in snapshots {
+            db.drop_snapshot(rowid)?;
+        }
+        return Ok(false);
+    }
+    let mut recorded = false;
+    for (rowid, session_id, blob) in snapshots {
+        let Some(snapshot) = git2::Oid::from_str(&blob)
+            .ok()
+            .and_then(|id| repo.find_blob(id).ok())
+        else {
+            db.drop_snapshot(rowid)?;
+            continue;
+        };
+        let change = shadow::classify_snapshot(repo, rel, snapshot.id());
+        if change == Change::None {
+            db.drop_snapshot(rowid)?;
+            continue;
+        }
+        // Hunks must be computed against shadow HEAD *before* the micro-commit.
+        let old_blob = shadow::head_blob(repo, rel);
+        let hunks = shadow::compute_hunks(old_blob.as_ref(), Some(snapshot.content()))?;
+        drop(old_blob);
+        let session = db.get_session(session_id)?;
+        let oid = shadow::commit_edit(
+            repo,
+            rel,
+            change,
+            &session.agent_name,
+            &session.external_id,
+            Some(snapshot.id()),
+        )?;
+        db.insert_edit(session_id, rel, change.as_str(), Some(&oid), &hunks)?;
+        db.apply_edit_regions(session_id, rel, &hunks)?;
+        // Only now: a hook reading between the select above and this point must
+        // still find the row, or it bases its own snapshot on pre-commit content
+        // and the change this commit just recorded is undone by the next one.
+        db.drop_snapshot(rowid)?;
+        log(&format!(
+            "{} {} - {} (ortak-{})",
+            change.as_str(),
+            rel,
+            session.agent_name,
+            session.id
+        ));
+        recorded = true;
+    }
+    Ok(recorded)
 }
 
 /// Catch up on changes made while the daemon was down. Attribution hints are

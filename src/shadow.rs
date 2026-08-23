@@ -146,18 +146,54 @@ pub fn classify(repo: &Repository, root: &Path, rel: &str) -> Result<Change> {
     }
 }
 
-/// Record one file change as a micro-commit on the shadow history.
+/// What a recorded snapshot changed, relative to shadow HEAD. The disk-based
+/// `classify` cannot answer this: by the time the daemon looks, the file may
+/// already carry another session's write.
+pub fn classify_snapshot(repo: &Repository, rel: &str, blob: Oid) -> Change {
+    match head_blob(repo, rel).map(|b| b.id()) {
+        Some(old) if old == blob => Change::None,
+        Some(_) => Change::Modify,
+        None => Change::Create,
+    }
+}
+
+/// Record one file change as a micro-commit on the shadow history. Given a
+/// `blob`, the commit stores that content rather than whatever is on disk now.
 pub fn commit_edit(
     repo: &Repository,
     rel: &str,
     change: Change,
     agent_name: &str,
     external_id: &str,
+    blob: Option<Oid>,
 ) -> Result<String> {
     let mut index = repo.index()?;
-    match change {
-        Change::Delete => index.remove_path(Path::new(rel))?,
-        _ => index.add_path(Path::new(rel))?,
+    match (change, blob) {
+        (Change::Delete, _) => index.remove_path(Path::new(rel))?,
+        (_, Some(id)) => {
+            let size = repo.find_blob(id)?.content().len() as u32;
+            // Keep whatever mode the file already has: recording a snapshot
+            // must not flip the executable bit off.
+            let mode = index
+                .get_path(Path::new(rel), 0)
+                .map(|e| e.mode)
+                .unwrap_or(0o100644);
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                file_size: size,
+                id,
+                flags: 0,
+                flags_extended: 0,
+                path: rel.as_bytes().to_vec(),
+            })?
+        }
+        (_, None) => index.add_path(Path::new(rel))?,
     }
     index.write()?;
     let tree_id = index.write_tree()?;

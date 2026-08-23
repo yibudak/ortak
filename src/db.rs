@@ -4,7 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 
-/// Attribution hints older than this are considered stale (seconds).
+/// Attribution hints, and the snapshots hanging off them, are considered stale
+/// once older than this (seconds).
 pub const HINT_TTL_SECS: i64 = 15;
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
@@ -109,7 +110,8 @@ CREATE INDEX IF NOT EXISTS idx_edits_file ON edits(file);
 CREATE TABLE IF NOT EXISTS hints (
   file       TEXT NOT NULL,
   session_id INTEGER NOT NULL REFERENCES sessions(id),
-  ts         INTEGER NOT NULL
+  ts         INTEGER NOT NULL,
+  blob       TEXT                      -- shadow object id of the content the hook meant to write
 );
 CREATE TABLE IF NOT EXISTS regions (
   id         INTEGER PRIMARY KEY,
@@ -143,8 +145,9 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
-        // Migration for pre-region databases; harmless if the column exists.
+        // Migrations for older databases; harmless if the column exists.
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunks TEXT", []);
+        let _ = conn.execute("ALTER TABLE hints ADD COLUMN blob TEXT", []);
         Ok(Db { conn })
     }
 
@@ -253,32 +256,90 @@ impl Db {
 
     // ---- attribution hints ---------------------------------------------
 
-    pub fn insert_hint(&self, file: &str, session_id: i64) -> Result<()> {
+    /// Record that a session wrote a file. `blob` is the shadow object holding
+    /// that session's own result, rebuilt by the hook from the tool's input.
+    /// Without one the daemon falls back to reading the file off disk.
+    pub fn insert_hint(&self, file: &str, session_id: i64, blob: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO hints (file, session_id, ts) VALUES (?1, ?2, ?3)",
-            params![file, session_id, now_ts()],
+            "INSERT INTO hints (file, session_id, ts, blob) VALUES (?1, ?2, ?3, ?4)",
+            params![file, session_id, now_ts(), blob],
         )?;
         Ok(())
     }
 
-    /// Consume the freshest non-stale hint for a file, clearing all hints on it.
+    /// Consume the freshest non-stale blob-less hint for a file, clearing the
+    /// rest. Snapshots are left for `peek_snapshots`, which journals them one
+    /// commit each rather than collapsing them into a single attribution.
     pub fn take_hint(&self, file: &str) -> Result<Option<i64>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
             .conn
             .query_row(
-                "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2
+                "SELECT session_id FROM hints WHERE file = ?1 AND ts >= ?2 AND blob IS NULL
                  ORDER BY ts DESC LIMIT 1",
                 params![file, cutoff],
                 |r| r.get(0),
             )
             .optional()?;
-        self.conn
-            .execute("DELETE FROM hints WHERE file = ?1", params![file])?;
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND blob IS NULL",
+            params![file],
+        )?;
         // Opportunistic purge of stale hints on other files.
         self.conn
             .execute("DELETE FROM hints WHERE ts < ?1", params![cutoff])?;
         Ok(hit)
+    }
+
+    /// Files carrying a live snapshot the daemon has not journaled yet. The
+    /// journal, not the file watcher, is what tells the daemon a hook has
+    /// landed: the file's filesystem event may already have been flushed.
+    pub fn snapshot_files(&self) -> Result<Vec<String>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT file FROM hints WHERE blob IS NOT NULL AND ts >= ?1")?;
+        let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Live snapshots for a file, oldest first. Insertion order decides, since
+    /// `ts` only has second resolution.
+    ///
+    /// Reading does not consume: the next hook to run bases its own snapshot on
+    /// the newest row, so a row has to outlive the commit that records it. The
+    /// daemon calls `drop_snapshot` once that commit is in.
+    pub fn peek_snapshots(&self, file: &str) -> Result<Vec<(i64, i64, String)>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, session_id, blob FROM hints
+             WHERE file = ?1 AND ts >= ?2 AND blob IS NOT NULL
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![file, cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The newest live snapshot for a file: what a further edit builds on.
+    pub fn latest_snapshot(&self, file: &str) -> Result<Option<String>> {
+        let cutoff = now_ts() - HINT_TTL_SECS;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT blob FROM hints WHERE file = ?1 AND ts >= ?2 AND blob IS NOT NULL
+                 ORDER BY rowid DESC LIMIT 1",
+                params![file, cutoff],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn drop_snapshot(&self, rowid: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM hints WHERE rowid = ?1", params![rowid])?;
+        Ok(())
     }
 
     // ---- edits ----------------------------------------------------------
