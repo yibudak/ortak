@@ -183,6 +183,14 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // Only now: a failed publish must not move the session's high-water mark.
     db.record_publish(session.id, &branch_name, head_edit)?;
 
+    // The work is out, so the lines are free. Until now only presence_minutes
+    // ever cooled a region, and a session that had published and moved on kept
+    // the gate pointed at code it was finished with.
+    let mut released = 0;
+    for (file, _) in &files {
+        released += db.release_regions(session.id, Some(file))?;
+    }
+
     println!(
         "branch ready: {} ({} files, commit {})",
         branch_name,
@@ -191,6 +199,12 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     );
     for (f, k) in &files {
         println!("  {} {}", k, f);
+    }
+    if released > 0 {
+        println!(
+            "released {} protected region(s) on those files; other sessions may edit them now",
+            released
+        );
     }
     // After the file list, never before it: someone skimming the output has to
     // read what the branch does contain before they can judge what is missing.

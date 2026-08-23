@@ -96,6 +96,16 @@ enum Command {
         /// Session reference (ortak-3)
         session: String,
     },
+    /// Give up this session's claim on a file's lines, freeing them for others
+    Release {
+        /// Session reference (ortak-3)
+        session: String,
+        /// File to release
+        file: Option<String>,
+        /// Release every file this session holds
+        #[arg(long)]
+        all: bool,
+    },
     /// Publish a session's net changes as a branch
     Publish {
         /// Session reference (ortak-3, human, or agent name)
@@ -282,6 +292,7 @@ fn run(cli: Cli) -> Result<()> {
             stdin,
         } => tell(&to, &text, from.as_deref(), stdin),
         Command::Inbox { session } => inbox(&session),
+        Command::Release { session, file, all } => release(&session, file.as_deref(), all),
         Command::Publish {
             session,
             branch,
@@ -645,6 +656,45 @@ fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn release(session_ref: &str, file: Option<&str>, all: bool) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    let session = db.resolve_session(session_ref)?;
+    let rel = match (file, all) {
+        (Some(f), false) => Some(workspace_path(&ws, f)?),
+        (None, true) => None,
+        _ => anyhow::bail!("name a file to release, or pass --all to release every file"),
+    };
+    let dropped = db.release_regions(session.id, rel.as_deref())?;
+    match rel {
+        Some(f) => println!(
+            "released {} region(s) held by ortak-{} on {}",
+            dropped, session.id, f
+        ),
+        None => println!(
+            "released {} region(s) held by ortak-{}",
+            dropped, session.id
+        ),
+    }
+    Ok(())
+}
+
+/// A path argument as the journal stores it: relative to the workspace root,
+/// whatever directory the command was run from.
+fn workspace_path(ws: &Workspace, arg: &str) -> Result<String> {
+    let path = std::path::Path::new(arg);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // `sub/../f.txt` is not the path the journal stores, and without this the
+    // release matches nothing and still reports that it worked.
+    let abs = abs.canonicalize().unwrap_or(abs);
+    ws.relativize(&abs)
+        .ok_or_else(|| anyhow::anyhow!("{} is outside the workspace {}", arg, ws.root.display()))
 }
 
 fn intent(session_ref: &str, text: &str) -> Result<()> {
