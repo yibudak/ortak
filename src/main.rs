@@ -99,6 +99,8 @@ enum HookEvent {
     PreEdit,
     /// Claude Code PostToolUse (Edit|Write|MultiEdit|NotebookEdit)
     PostEdit,
+    /// Claude Code PreToolUse (Bash): claim files the command writes
+    PreBash,
     /// Claude Code PostToolUse (Bash): error-reporting reminder
     PostBash,
     /// Claude Code UserPromptSubmit: hat durumu enjeksiyonu
@@ -115,6 +117,7 @@ fn main() {
             HookEvent::SessionStart => hooks::session_start(),
             HookEvent::PreEdit => hooks::pre_edit(),
             HookEvent::PostEdit => hooks::post_edit(),
+            HookEvent::PreBash => hooks::pre_bash(),
             HookEvent::PostBash => hooks::post_bash(),
             HookEvent::PromptContext => hooks::prompt_context(),
             HookEvent::SessionEnd => hooks::session_end(),
@@ -283,9 +286,14 @@ fn log(session: Option<&str>, limit: u32) -> Result<()> {
         let t = chrono::DateTime::from_timestamp(e.ts, 0)
             .map(|d| d.format("%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
+        let how = if e.inferred() {
+            ", inferred from a running command"
+        } else {
+            ""
+        };
         println!(
-            "[{}] {:6} {} - {} (ortak-{})",
-            t, e.change_kind, e.file, e.agent_name, e.session_id
+            "[{}] {:6} {} - {} (ortak-{}{})",
+            t, e.change_kind, e.file, e.agent_name, e.session_id, how
         );
     }
     Ok(())
