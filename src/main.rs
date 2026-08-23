@@ -533,12 +533,13 @@ fn blame(target: &str) -> Result<()> {
             return Ok(());
         };
         println!(
-            "{}:{} - ortak-{} {}, {}",
+            "{}:{} - ortak-{} {}, {}{}",
             rel,
             line,
             o.session_id,
             o.agent_name,
-            ago(now - o.last_ts)
+            ago(now - o.last_ts),
+            owner_note(o)
         );
         println!(
             "  owns {}, intent: {}",
@@ -558,11 +559,12 @@ fn blame(target: &str) -> Result<()> {
     println!("{}", rel);
     for o in &owners {
         println!(
-            "  {:>12}  ortak-{} {}, {}",
+            "  {:>12}  ortak-{} {}, {}{}",
             range(o),
             o.session_id,
             o.agent_name,
-            ago(now - o.last_ts)
+            ago(now - o.last_ts),
+            owner_note(o)
         );
         println!(
             "                intent: {}",
@@ -570,6 +572,16 @@ fn blame(target: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A session, a time and an intent read as a complete account of a line whether
+/// or not anybody reported the edit behind it. `ortak log` marks the same rows
+/// in the same words.
+fn owner_note(o: &db::Owner) -> String {
+    match db::attribution_note(o.attributed_by.as_deref()) {
+        "" => String::new(),
+        note => format!("   ({})", note),
+    }
 }
 
 fn range(o: &db::Owner) -> String {
@@ -654,10 +666,9 @@ fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
     }
     for e in db.recent_edits(session_id, limit)? {
         let t = db::fmt_local(e.ts, "%m-%d %H:%M:%S");
-        let how = if e.inferred() {
-            ", inferred from a running command"
-        } else {
-            ""
+        let how = match db::attribution_note(e.attributed_by.as_deref()) {
+            "" => String::new(),
+            note => format!(", {}", note),
         };
         println!(
             "[{}] {:6} {} - {} (ortak-{}{})",

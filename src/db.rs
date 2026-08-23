@@ -47,12 +47,17 @@ pub struct Session {
 
 /// How the daemon worked out who owns an edit. An edit hook naming the file is
 /// evidence; a Bash claim is an inference, and one the daemon is allowed to
-/// decline. Absent on a row means neither applied and the change fell to the
-/// human session.
+/// decline. Absent on a row means nothing claimed the file at all and the
+/// change is the human's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attribution {
     Hook,
     Claim,
+    /// Two sessions had commands open, so the daemon declined to choose and the
+    /// edit went to the human. Its own value rather than a NULL: an unclaimed
+    /// write and a refused guess both land on the human session and read the
+    /// same in the journal, and only one of them is worth a reader's attention.
+    Contested,
 }
 
 impl Attribution {
@@ -60,7 +65,20 @@ impl Attribution {
         match self {
             Attribution::Hook => "hook",
             Attribution::Claim => "claim",
+            Attribution::Contested => "contested",
         }
+    }
+}
+
+/// What `log` and `blame` say about a row the daemon worked out rather than was
+/// told, as stored in `edits.attributed_by`. Empty for a hook and for an
+/// unclaimed write: the agent column already answers those, and a marker on
+/// every row is a marker nobody reads.
+pub fn attribution_note(attributed_by: Option<&str>) -> &'static str {
+    match attributed_by {
+        Some(s) if s == Attribution::Claim.as_str() => "inferred from a running command",
+        Some(s) if s == Attribution::Contested.as_str() => "two sessions had commands open",
+        _ => "",
     }
 }
 
@@ -76,15 +94,6 @@ pub struct EditRow {
     pub shadow_commit: Option<String>,
     pub ts: i64,
     pub attributed_by: Option<String>,
-}
-
-impl EditRow {
-    /// Whether the owner was guessed rather than reported. Rare once a claim
-    /// only speaks for an unambiguous command, and that rarity is the point:
-    /// a marked row is the one worth a second look.
-    pub fn inferred(&self) -> bool {
-        self.attributed_by.as_deref() == Some(Attribution::Claim.as_str())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +160,10 @@ pub struct Owner {
     pub start: i64,
     pub end: i64,
     pub last_ts: i64,
+    /// How the edit behind `last_ts` was attributed, as `edits.attributed_by`
+    /// stores it. Blame is read to settle who wrote a line, so the two answers
+    /// it must not give plainly are the guess and the refusal to guess.
+    pub attributed_by: Option<String>,
 }
 
 /// Why one session made a change, kept against the range it owned at the time.
@@ -450,7 +463,9 @@ impl Db {
         // `cargo fmt --all` was credited to the other, taking the region and
         // the publishable content with it. Nothing reported it. A wrong owner
         // is worse than no owner, so an ambiguous write falls through to the
-        // human session, where it is at least honest.
+        // human session, where it is at least honest. It says `contested` on
+        // the way through: falling to the human is the same outcome as an
+        // ordinary human edit, and only one of the two is a decision.
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
              WHERE h.file = ?1 AND s.status = 'active' LIMIT 2",
@@ -460,7 +475,8 @@ impl Db {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
             [only] => Some((*only, Attribution::Claim)),
-            _ => None,
+            [] => None,
+            _ => Some((self.ensure_human()?, Attribution::Contested)),
         })
     }
 
@@ -848,7 +864,10 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
                     COALESCE((SELECT MAX(e.ts) FROM edits e
-                               WHERE e.session_id = r.session_id AND e.file = r.file), 0)
+                               WHERE e.session_id = r.session_id AND e.file = r.file), 0),
+                    (SELECT e.attributed_by FROM edits e
+                      WHERE e.session_id = r.session_id AND e.file = r.file
+                      ORDER BY e.ts DESC, e.id DESC LIMIT 1)
              FROM regions r JOIN sessions s ON s.id = r.session_id
              WHERE r.file = ?1
              ORDER BY r.start_line, r.end_line",
@@ -861,6 +880,10 @@ impl Db {
                 start: r.get(3)?,
                 end: r.get(4)?,
                 last_ts: r.get(5)?,
+                // The same edit `last_ts` came from, so the marker and the age
+                // describe one row. `id` breaks the tie because two edits in
+                // the same second are common enough to have caused a bug once.
+                attributed_by: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1281,9 +1304,14 @@ mod tests {
         );
 
         // b starts a command of its own. Whoever writes src/x.rs now, the
-        // daemon cannot tell which of the two did it, so it does not guess.
+        // daemon cannot tell which of the two did it, so it does not guess. It
+        // says that it did not, rather than leaving a row that reads like an
+        // edit the human made.
         db.insert_hint(BASH_CLAIM, b, None).unwrap();
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((db.ensure_human().unwrap(), Attribution::Contested))
+        );
 
         // A hook naming the file is evidence and still outranks both claims.
         db.insert_hint("src/x.rs", b, None).unwrap();
@@ -1320,14 +1348,33 @@ mod tests {
         .unwrap();
         db.insert_edit(a, "orphan.rs", "modify", None, &[], None)
             .unwrap();
+        db.insert_edit(
+            a,
+            "contested.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Contested),
+        )
+        .unwrap();
 
         let rows = db.recent_edits(None, 10).unwrap();
-        let row = |f: &str| rows.iter().find(|r| r.file == f).unwrap();
-        assert!(!row("named.rs").inferred(), "a hook named this file");
-        assert!(row("guessed.rs").inferred(), "a claim guessed this one");
+        let note = |f: &str| {
+            let row = rows.iter().find(|r| r.file == f).unwrap();
+            attribution_note(row.attributed_by.as_deref())
+        };
+        assert_eq!(note("named.rs"), "", "a hook named this file");
+        assert_eq!(
+            note("guessed.rs"),
+            "inferred from a running command",
+            "a claim guessed this one"
+        );
         // Nothing claimed it, so it went to the human by rule rather than by
         // inference. The agent column already says so; do not mark it twice.
-        assert!(!row("orphan.rs").inferred());
+        assert_eq!(note("orphan.rs"), "");
+        // This one also went to the human, but because the daemon refused to
+        // pick between two claims. That is a decision, and it shows.
+        assert_eq!(note("contested.rs"), "two sessions had commands open");
     }
 
     #[test]
@@ -1654,5 +1701,35 @@ mod tests {
             1
         );
         assert!(db.file_regions("src/publish.rs").unwrap().is_empty());
+    }
+
+    /// Blame answers for a line, so it has to carry the same warning `log` does
+    /// about how its answer was arrived at.
+    #[test]
+    fn blame_carries_how_the_owner_was_worked_out() {
+        let db = db();
+        let human = db.ensure_human().unwrap();
+        let agent = session(&db, "claude-a");
+        let wrote = |who: i64, start: i64, how: Option<Attribution>| {
+            let hunks = [Hunk {
+                old_start: start,
+                old_lines: 5,
+                new_start: start,
+                new_lines: 5,
+            }];
+            db.insert_edit(who, "src/impact.rs", "modify", None, &hunks, how)
+                .unwrap();
+            db.apply_edit_regions(who, "src/impact.rs", &hunks).unwrap();
+        };
+        wrote(agent, 1, Some(Attribution::Hook));
+        wrote(human, 40, Some(Attribution::Contested));
+
+        let note_for = |sid: i64| {
+            let owners = db.file_regions("src/impact.rs").unwrap();
+            let o = owners.iter().find(|o| o.session_id == sid).expect("owner");
+            attribution_note(o.attributed_by.as_deref())
+        };
+        assert_eq!(note_for(agent), "", "a hook reported this one");
+        assert_eq!(note_for(human), "two sessions had commands open");
     }
 }
