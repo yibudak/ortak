@@ -58,6 +58,9 @@ enum Command {
         /// Branch name (default: <prefix>ortak-<id>-<slug>)
         #[arg(long)]
         branch: Option<String>,
+        /// Branch to build on, for this run only (default: [publish] base_branch)
+        #[arg(long)]
+        base: Option<String>,
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
@@ -142,11 +145,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Publish {
             session,
             branch,
+            base,
             push,
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
-            publish::run(&ws, &cfg, &session, branch.as_deref(), push)
+            publish::run(
+                &ws,
+                &cfg,
+                &session,
+                branch.as_deref(),
+                base.as_deref(),
+                push,
+            )
         }
         Command::Report {
             session,

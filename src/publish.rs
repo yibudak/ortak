@@ -14,8 +14,10 @@ pub fn run(
     cfg: &Config,
     session_ref: &str,
     branch_override: Option<&str>,
+    base_override: Option<&str>,
     push: bool,
 ) -> Result<()> {
+    let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
     let files = db.session_files(session.id)?;
@@ -42,7 +44,7 @@ pub fn run(
             ws.root.display()
         )
     })?;
-    let base_commit = match repo.find_branch(&cfg.publish.base_branch, BranchType::Local) {
+    let base_commit = match repo.find_branch(base, BranchType::Local) {
         Ok(b) => b.get().peel_to_commit()?,
         Err(_) => repo
             .head()
@@ -50,7 +52,7 @@ pub fn run(
             .with_context(|| {
                 format!(
                     "base branch '{}' does not exist and HEAD could not be resolved; the repository needs at least one commit",
-                    cfg.publish.base_branch
+                    base
                 )
             })?,
     };
@@ -152,12 +154,19 @@ pub fn run(
         println!("\ncreate the PR with:");
         println!(
             "  tea pr create --base {} --head {} --title \"{}\"",
-            cfg.publish.base_branch, branch_name, intent
+            base, branch_name, intent
         );
     } else {
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
     }
     Ok(())
+}
+
+/// The branch this publish builds on. `--base` is per invocation, so work that
+/// sits on another session's unmerged branch can ship without every session in
+/// the workspace having to agree on a new `[publish] base_branch`.
+fn base_branch<'a>(cfg: &'a Config, base_override: Option<&'a str>) -> &'a str {
+    base_override.unwrap_or(&cfg.publish.base_branch)
 }
 
 fn slug(text: &str) -> String {
@@ -174,5 +183,21 @@ fn slug(text: &str) -> String {
         "task".into()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_flag_overrides_the_configured_branch() {
+        let mut cfg = Config::default();
+        cfg.publish.base_branch = "main".into();
+        assert_eq!(base_branch(&cfg, None), "main");
+        assert_eq!(
+            base_branch(&cfg, Some("task/ortak-3-parser")),
+            "task/ortak-3-parser"
+        );
     }
 }
