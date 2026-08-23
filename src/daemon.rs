@@ -27,14 +27,32 @@ struct PidfileGuard(PathBuf);
 
 impl Drop for PidfileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Only while it is still ours. Once a reset has handed the workspace
+        // to another daemon, the file on disk is that daemon's claim, and
+        // deleting it on the way out would let a third start beside it.
+        if still_ours(&self.0) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
+}
+
+/// Whether the workspace's pidfile still names this process.
+///
+/// `claim` reads it once at startup, so it sees a daemon that was already
+/// running and nothing after. The record of who owns a workspace lives inside
+/// `.ortak`, which is what a reset deletes: `rm -rf .ortak && ortak init`
+/// leaves this daemon watching a workspace nothing says it owns, and the next
+/// `ortak daemon` claims it without knowing this one is here. Both alive,
+/// neither refusing, taking turns losing the shadow index lock and dropping
+/// whichever edit they were journaling.
+fn still_ours(pidfile: &Path) -> bool {
+    read_pid(pidfile) == Some(std::process::id())
 }
 
 pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
     let pidfile = ws.ortak_dir.join(PIDFILE);
     claim(&pidfile, process_alive)?;
-    let _pidfile_guard = PidfileGuard(pidfile);
+    let _pidfile_guard = PidfileGuard(pidfile.clone());
     let db = Db::open(&ws.db_path)?;
     let repo = shadow::open(ws)?;
     let human_id = db.ensure_human()?;
@@ -65,6 +83,18 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
     let mut last_beat = Instant::now();
 
     loop {
+        // Before anything is written, not on the heartbeat's timer: every pass
+        // through here can journal, and the seconds a heartbeat would wait are
+        // the seconds two daemons spend racing.
+        if !still_ours(&pidfile) {
+            bail!(
+                "the workspace was reset under this daemon: {} no longer names pid {}. \
+                 Stopping, rather than journaling into a database and a shadow repository \
+                 it no longer owns.",
+                pidfile.display(),
+                std::process::id()
+            );
+        }
         if last_beat.elapsed() >= HEARTBEAT_EVERY {
             db.heartbeat()?;
             last_beat = Instant::now();
@@ -497,6 +527,42 @@ mod tests {
         claim(&f, |_| false).expect("the pid it names is gone");
         assert_eq!(read_pid(&f), Some(std::process::id()));
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// The reset this project has run at the start of every round, and the one
+    /// shape `claim` cannot see: the pidfile is deleted with the rest of
+    /// `.ortak` while its daemon is still watching, and `ortak init` builds a
+    /// workspace the next daemon claims for itself.
+    #[test]
+    fn a_reset_workspace_stops_belonging_to_the_daemon_watching_it() {
+        let f = pidfile("reset");
+        claim(&f, |_| true).expect("nothing holds it");
+        assert!(still_ours(&f));
+
+        // rm -rf .ortak
+        std::fs::remove_file(&f).unwrap();
+        assert!(!still_ours(&f), "nothing on disk says this daemon owns it");
+
+        // ortak init, then a second daemon claims the new workspace.
+        std::fs::write(&f, "424242").unwrap();
+        assert!(!still_ours(&f), "and now somebody else does");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// The other half: a daemon leaving must not take the claim of whichever
+    /// daemon owns the workspace now, or a third would be free to start.
+    #[test]
+    fn a_leaving_daemon_clears_only_its_own_claim() {
+        let mine = pidfile("guard-mine");
+        claim(&mine, |_| true).unwrap();
+        drop(PidfileGuard(mine.clone()));
+        assert!(!mine.exists(), "its own claim goes with it");
+
+        let theirs = pidfile("guard-theirs");
+        std::fs::write(&theirs, "424242").unwrap();
+        drop(PidfileGuard(theirs.clone()));
+        assert_eq!(read_pid(&theirs), Some(424242), "somebody else's stays");
+        let _ = std::fs::remove_file(&theirs);
     }
 
     #[test]
