@@ -108,6 +108,17 @@ pub struct PublishRow {
     pub last_edit_id: i64,
 }
 
+/// One message waiting for, or already handed to, a session.
+#[derive(Debug, Clone)]
+pub struct Message {
+    #[allow(dead_code)]
+    pub id: i64,
+    pub from_session: i64,
+    pub from_name: String,
+    pub text: String,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Conflict {
     pub session_id: i64,
@@ -181,6 +192,18 @@ CREATE TABLE IF NOT EXISTS publishes (
   last_edit_id INTEGER NOT NULL,          -- highest edits.id the branch carries
   ts           INTEGER NOT NULL
 );
+-- One row per recipient. A broadcast fans out when it is sent, which keeps
+-- delivered_at meaningful per session and drops the message for sessions that
+-- start later; a message about what is happening right now is stale by then.
+CREATE TABLE IF NOT EXISTS messages (
+  id           INTEGER PRIMARY KEY,
+  from_session INTEGER NOT NULL REFERENCES sessions(id),
+  to_session   INTEGER NOT NULL REFERENCES sessions(id),
+  text         TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session);
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -721,6 +744,61 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    // ---- messages -------------------------------------------------------
+
+    pub fn send_message(&self, from: i64, to: i64, text: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO messages (from_session, to_session, text, ts) VALUES (?1, ?2, ?3, ?4)",
+            params![from, to, text, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Send to every other active agent session. The sender never gets its own
+    /// broadcast, and the human session has no prompt hook to deliver through.
+    pub fn broadcast_message(&self, from: i64, text: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "INSERT INTO messages (from_session, to_session, text, ts)
+             SELECT ?1, id, ?2, ?3 FROM sessions
+              WHERE id != ?1 AND status = 'active' AND kind != 'human'",
+            params![from, text, now_ts()],
+        )?)
+    }
+
+    /// Undelivered messages for a session, stamped delivered on the way out so
+    /// the next prompt does not repeat them.
+    pub fn take_messages(&self, session_id: i64) -> Result<Vec<Message>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = {
+            let mut stmt = tx.prepare(
+                "SELECT m.id, m.from_session, s.agent_name, m.text, m.ts
+                 FROM messages m JOIN sessions s ON s.id = m.from_session
+                 WHERE m.to_session = ?1 AND m.delivered_at IS NULL
+                 ORDER BY m.id",
+            )?;
+            let rows = stmt.query_map(params![session_id], row_to_message)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "UPDATE messages SET delivered_at = ?2
+             WHERE to_session = ?1 AND delivered_at IS NULL",
+            params![session_id, now_ts()],
+        )?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Everything a session has been sent, oldest first, for a person looking.
+    pub fn inbox(&self, session_id: i64) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.from_session, s.agent_name, m.text, m.ts
+             FROM messages m JOIN sessions s ON s.id = m.from_session
+             WHERE m.to_session = ?1 ORDER BY m.id",
+        )?;
+        let rows = stmt.query_map(params![session_id], row_to_message)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- errors / stop-the-line ----------------------------------------
 
     pub fn insert_error(
@@ -851,6 +929,16 @@ impl Db {
             .optional()?;
         Ok(v.and_then(|s| s.parse::<i64>().ok()).map(|t| now_ts() - t))
     }
+}
+
+fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: r.get(0)?,
+        from_session: r.get(1)?,
+        from_name: r.get(2)?,
+        text: r.get(3)?,
+        ts: r.get(4)?,
+    })
 }
 
 fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -1042,6 +1130,58 @@ mod tests {
         assert_eq!(
             db.session_files(s, previous.last_edit_id).unwrap(),
             vec![("shared.rs".to_string(), "modify".to_string())]
+        );
+    }
+
+    fn agent(db: &Db, ext: &str) -> i64 {
+        db.upsert_session(ext, ext, "llm", Some("claude-code"))
+            .unwrap()
+    }
+
+    fn texts(messages: Vec<Message>) -> Vec<String> {
+        messages.into_iter().map(|m| m.text).collect()
+    }
+
+    #[test]
+    fn a_message_reaches_its_recipient_once() {
+        let db = temp_db("messages-direct");
+        let a = agent(&db, "sess-a");
+        let b = agent(&db, "sess-b");
+
+        db.send_message(a, b, "I renamed take_hint to peek_snapshots")
+            .unwrap();
+
+        assert!(texts(db.take_messages(a).unwrap()).is_empty());
+        assert_eq!(
+            texts(db.take_messages(b).unwrap()),
+            vec!["I renamed take_hint to peek_snapshots"]
+        );
+        // Delivered once: the next prompt must not repeat it.
+        assert!(texts(db.take_messages(b).unwrap()).is_empty());
+        // The person looking still sees it afterwards.
+        assert_eq!(db.inbox(b).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_broadcast_skips_its_sender_and_the_human() {
+        let db = temp_db("messages-broadcast");
+        let human = db.ensure_human().unwrap();
+        let a = agent(&db, "sess-a");
+        let b = agent(&db, "sess-b");
+        let c = agent(&db, "sess-c");
+        db.end_session("sess-c").unwrap();
+
+        let sent = db
+            .broadcast_message(a, "publish.rs is mid-refactor, do not start anything there")
+            .unwrap();
+
+        assert_eq!(sent, 1, "only the one other active agent session");
+        assert!(texts(db.take_messages(a).unwrap()).is_empty());
+        assert!(texts(db.take_messages(human).unwrap()).is_empty());
+        assert!(texts(db.take_messages(c).unwrap()).is_empty());
+        assert_eq!(
+            texts(db.take_messages(b).unwrap()),
+            vec!["publish.rs is mid-refactor, do not start anything there"]
         );
     }
 }

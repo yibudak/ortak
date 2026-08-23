@@ -59,6 +59,24 @@ enum Command {
         /// Task description
         text: Vec<String>,
     },
+    /// Send a message to another session, or to all of them
+    Tell {
+        /// Recipient: ortak-3, an agent name, or "all"
+        to: String,
+        /// Message text
+        text: Vec<String>,
+        /// Sending session (default: the human session)
+        #[arg(long)]
+        from: Option<String>,
+        /// Read the message from standard input instead of the arguments
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show the messages a session has been sent
+    Inbox {
+        /// Session reference (ortak-3)
+        session: String,
+    },
     /// Publish a session's net changes as a branch
     Publish {
         /// Session reference (ortak-3, human, or agent name)
@@ -225,6 +243,13 @@ fn run(cli: Cli) -> Result<()> {
         } => log(session.as_deref(), limit, json),
         Command::Sessions => sessions(),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
+        Command::Tell {
+            to,
+            text,
+            from,
+            stdin,
+        } => tell(&to, &text, from.as_deref(), stdin),
+        Command::Inbox { session } => inbox(&session),
         Command::Publish {
             session,
             branch,
@@ -500,4 +525,77 @@ mod tests {
         );
         assert_eq!(classify_parse_failure(K::InvalidSubcommand, None), Report);
     }
+}
+
+fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()> {
+    // The messages worth sending are the ones with a signature, a path or a
+    // command in them, and the shell rewrites exactly those before ortak sees
+    // a word of it: backticks get substituted, quotes get eaten, newlines
+    // split the argument list. --stdin takes the body as it was written.
+    let text = if stdin {
+        if !text.is_empty() {
+            anyhow::bail!(
+                "--stdin reads the message from standard input; do not also pass it as arguments"
+            );
+        }
+        std::io::read_to_string(std::io::stdin())?
+            .trim()
+            .to_string()
+    } else {
+        text.join(" ")
+    };
+    if text.is_empty() {
+        anyhow::bail!(
+            "nothing to send; give the message as the remaining arguments, or pass --stdin"
+        );
+    }
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    // No sender named means a person at a terminal typed this.
+    let sender = match from {
+        Some(r) => db.resolve_session(r)?.id,
+        None => db.ensure_human()?,
+    };
+    if to == "all" {
+        match db.broadcast_message(sender, &text)? {
+            0 => println!("no other active sessions; nothing was sent."),
+            1 => println!("sent to 1 other active session."),
+            n => println!("sent to {} other active sessions.", n),
+        }
+        return Ok(());
+    }
+    let recipient = db.resolve_session(to)?;
+    db.send_message(sender, recipient.id, &text)?;
+    println!(
+        "sent to ortak-{} {}; it arrives at the start of that session's next turn.",
+        recipient.id, recipient.agent_name
+    );
+    Ok(())
+}
+
+fn inbox(session_ref: &str) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    let session = db.resolve_session(session_ref)?;
+    let messages = db.inbox(session.id)?;
+    if messages.is_empty() {
+        println!("ortak-{} has no messages.", session.id);
+        return Ok(());
+    }
+    for m in messages {
+        // The daemon logs on the local clock, so an inbox on UTC reads as
+        // hours old next to it and the message looks stale enough to skip.
+        let t = chrono::DateTime::from_timestamp(m.ts, 0)
+            .map(|d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        println!(
+            "[{}] ortak-{} {}: {}",
+            t, m.from_session, m.from_name, m.text
+        );
+    }
+    Ok(())
 }

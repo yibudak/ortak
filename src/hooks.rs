@@ -616,8 +616,9 @@ pub fn post_bash() -> Result<()> {
     Ok(())
 }
 
-/// UserPromptSubmit: while the line is stopped, push its status into every
-/// session's context so the responsible session sees its assignment.
+/// UserPromptSubmit: hand this session anything waiting for it, and while the
+/// line is stopped, push its status in so the responsible session sees its
+/// assignment.
 pub fn prompt_context() -> Result<()> {
     let input = read_stdin_json()?;
     let Ok(ws) = workspace_for(&input) else {
@@ -625,16 +626,6 @@ pub fn prompt_context() -> Result<()> {
     };
     let db = Db::open(&ws.db_path)?;
     let warning = daemon_warning(&db);
-    let open = db.open_errors()?;
-    if open.is_empty() {
-        if let Some(w) = warning {
-            let out = serde_json::json!({
-                "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": w }
-            });
-            println!("{}", out);
-        }
-        return Ok(());
-    }
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -646,7 +637,31 @@ pub fn prompt_context() -> Result<()> {
         "llm",
         Some(harness),
     )?;
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(warning) = warning {
+        parts.push(warning);
+    }
+
+    // Messages ride this hook so one session's news reaches the other at the
+    // top of its next turn, with nobody polling for it.
+    let waiting = db.take_messages(me)?;
+    if !waiting.is_empty() {
+        let mut block = String::from("ortak MESSAGES from other sessions in this workspace:");
+        for m in &waiting {
+            block.push_str(&format!(
+                "\n- ortak-{} {}: {}",
+                m.from_session, m.from_name, m.text
+            ));
+        }
+        parts.push(block);
+    }
+
+    let open = db.open_errors()?;
     let mine: Vec<&crate::db::ErrorRow> = open.iter().filter(|e| e.responsible() == me).collect();
+    if open.is_empty() {
+        return emit_prompt_context(parts);
+    }
     let context = if !mine.is_empty() {
         let e = mine[0];
         format!(
@@ -674,12 +689,19 @@ pub fn prompt_context() -> Result<()> {
             e.responsible_name()
         )
     };
-    let context = match warning {
-        Some(w) => format!("{w}\n\n{context}"),
-        None => context,
-    };
+    parts.push(context);
+    emit_prompt_context(parts)
+}
+
+fn emit_prompt_context(parts: Vec<String>) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
     let out = serde_json::json!({
-        "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": context }
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": parts.join("\n\n"),
+        }
     });
     println!("{}", out);
     Ok(())
