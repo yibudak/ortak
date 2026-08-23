@@ -573,8 +573,10 @@ pub fn post_bash() -> Result<()> {
         "llm",
         Some(harness),
     )?;
-    // The command has finished, so whatever it wrote has already reached the
-    // daemon. Close the claim before the early returns below.
+    // The command has finished, but what it wrote has not reached the daemon
+    // yet: an unhinted change waits out a quiet window first. Closing the claim
+    // stamps it rather than deleting it, so it still answers for that window.
+    // Before the early returns below, so a failing command closes it too.
     db.clear_bash_claim(me)?;
 
     let resp = input.get("tool_response").cloned().unwrap_or(Value::Null);
