@@ -106,6 +106,16 @@ ortak publish ortak-2 --push
 
 Publishing requires a Git repository with at least one commit and a configured remote.
 
+Sessions that cannot see each other's work still have to talk. `ortak tell` puts a
+message in another session's hands, `ortak inbox` shows what you have been sent, and
+`ortak blame` answers who owns the lines you were just refused:
+
+```bash
+ortak tell ortak-3 "remote_for takes a timeout now" --from ortak-2
+ortak inbox ortak-2
+ortak blame src/publish.rs
+```
+
 ### Where `ortak publish --push` pushes
 
 To `origin`, unless you say otherwise. Set your own remote once per clone:
@@ -125,24 +135,26 @@ committed, so it is the wrong place for an answer that is different for each per
 holding a checkout. `ortak.toml` still accepts a `remote` key for a team that genuinely
 does share one, and git config wins where both are set.
 
-### Set `base_branch` before the first publish
+### Check `base_branch` before the first publish
 
-`ortak publish` builds every branch on top of `[publish] base_branch` from `ortak.toml`,
-which defaults to `main`:
+`ortak publish` builds every branch on top of `[publish] base_branch` from `ortak.toml`.
+`ortak init` fills that in with the trunk it finds, preferring an existing `main` or
+`master` over whatever branch happens to be checked out, and prints the one it picked:
 
-```toml
-[publish]
-base_branch = "main"
+```
+publishing onto master; change [publish] base_branch if that is not your trunk
 ```
 
-That default is wrong for any repository whose trunk goes by another name, and plenty do:
-`master`, `develop`, or a version branch like `16.0`. Point it at the branch these tasks
-merge into. Until you do, publishing refuses and names what it could not find:
+Read that line. It is wrong wherever your trunk goes by another name, and plenty do:
+`develop`, or a version branch like `16.0`. Point it at the branch these tasks merge
+into. Until you do, publishing refuses and names what it could not find:
 
 ```
 error: base branch '16.0' does not exist in this repository (HEAD is on 'task/ortak-2-fix-login').
 Set [publish] base_branch in ortak.toml to the branch these tasks merge into
 ```
 
-It refuses instead of guessing. The obvious guess is HEAD, and HEAD in a shared workspace
-is whatever branch the tree happens to sit on, which can be another session's task branch.
+It refuses instead of guessing at that point. The obvious guess is HEAD, and HEAD in a
+shared workspace is whatever branch the tree happens to sit on, which can be another
+session's task branch. `init` guesses because it runs once, in a workspace nobody is
+publishing from yet, and it says out loud what it guessed.
