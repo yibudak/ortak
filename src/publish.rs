@@ -226,7 +226,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         db.record_publish(session.id, &branch_name, head_edit)?;
     }
 
-    let (released, affected) = free_lines_and_scan(ws, cfg, &db, session.id, &files)?;
+    let (cooled, affected) = free_lines_and_scan(ws, cfg, &db, session.id, &files)?;
 
     println!(
         "branch {}: {} ({} files, commit {})",
@@ -238,10 +238,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     for (f, k) in &files {
         println!("  {} {}", k, f);
     }
-    if released > 0 {
+    if cooled > 0 {
         println!(
-            "released {} protected region(s) on those files; other sessions may edit them now",
-            released
+            "freed {} protected region(s) on those files; other sessions may edit them now, and `ortak blame` still names this session",
+            cooled
         );
     }
     // After the file list, never before it: someone skimming the output has to
@@ -331,7 +331,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
 ///
 /// The two are one function because they are ordered, and nothing else says so.
 /// Both read the same `regions` rows: the scan asks which lines this session
-/// owns so it can read the names they define, and the release hands those very
+/// owns so it can read the names they define, and the cooling hands those very
 /// lines back. Taken in the other order the scan sees a session that owns
 /// nothing and reports nothing, which is what it did from the round it shipped
 /// in until the row happened to survive a publish.
@@ -347,11 +347,11 @@ fn free_lines_and_scan(
     files: &[(String, String)],
 ) -> Result<(usize, Vec<crate::impact::Ref>)> {
     let (_, affected) = crate::impact::scan(ws, cfg, db, session_id).unwrap_or_default();
-    let mut released = 0;
+    let mut cooled = 0;
     for (file, _) in files {
-        released += db.release_regions(session_id, Some(file))?;
+        cooled += db.cool_regions(session_id, file)?;
     }
-    Ok((released, affected))
+    Ok((cooled, affected))
 }
 
 fn entry_for(path: &str, id: Oid, mode: u32, size: usize) -> IndexEntry {
