@@ -288,9 +288,7 @@ fn log(session: Option<&str>, limit: u32) -> Result<()> {
         None => None,
     };
     for e in db.recent_edits(session_id, limit)? {
-        let t = chrono::DateTime::from_timestamp(e.ts, 0)
-            .map(|d| d.format("%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
+        let t = db::fmt_local(e.ts, "%m-%d %H:%M:%S");
         println!(
             "[{}] {:6} {} - {} (ortak-{})",
             t, e.change_kind, e.file, e.agent_name, e.session_id
