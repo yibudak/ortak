@@ -333,8 +333,14 @@ fn inbox(session_ref: &str) -> Result<()> {
         return Ok(());
     }
     for m in messages {
+        // The daemon logs on the local clock, so an inbox on UTC reads as
+        // hours old next to it and the message looks stale enough to skip.
         let t = chrono::DateTime::from_timestamp(m.ts, 0)
-            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .map(|d| {
+                d.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
             .unwrap_or_default();
         println!(
             "[{}] ortak-{} {}: {}",
