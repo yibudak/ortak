@@ -88,3 +88,25 @@ to upstream, and both are working in the same repository. `ortak.toml` is shared
 committed, so it is the wrong place for an answer that is different for each person
 holding a checkout. `ortak.toml` still accepts a `remote` key for a team that genuinely
 does share one, and git config wins where both are set.
+
+### Set `base_branch` before the first publish
+
+`ortak publish` builds every branch on top of `[publish] base_branch` from `ortak.toml`,
+which defaults to `main`:
+
+```toml
+[publish]
+base_branch = "main"
+```
+
+That default is wrong for any repository whose trunk goes by another name, and plenty do:
+`master`, `develop`, or a version branch like `16.0`. Point it at the branch these tasks
+merge into. Until you do, publishing refuses and names what it could not find:
+
+```
+error: base branch '16.0' does not exist in this repository (HEAD is on 'task/ortak-2-fix-login').
+Set [publish] base_branch in ortak.toml to the branch these tasks merge into
+```
+
+It refuses instead of guessing. The obvious guess is HEAD, and HEAD in a shared workspace
+is whatever branch the tree happens to sit on, which can be another session's task branch.
