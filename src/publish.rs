@@ -302,9 +302,16 @@ fn session_only_tree<'r>(
                 }
                 continue;
             }
+            // Whose edits are already at those lines is not something the merge
+            // reports, and the old message guessed "another session". Often it
+            // is the publishing session's own work from an earlier branch, and
+            // the guess sends the reader looking for a collaborator who is not
+            // there.
+            let flags = format!("--exclude {}", paths.join(" --exclude "));
             bail!(
-                "cannot replay this session's changes to {}: another session's edits sit too close to separate them automatically",
-                paths.join(", ")
+                "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
+                paths.join(", "),
+                flags
             );
         }
         let tree = shadow.find_tree(merged.write_tree_to(shadow)?)?;
@@ -564,6 +571,28 @@ mod tests {
             tree.get_path(Path::new("dep.py")).is_err(),
             "an unshipped dependency leaked into the branch"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A genuine content clash, which the replay cannot resolve and cannot
+    /// attribute either. The message has to name the file and stop there.
+    #[test]
+    fn a_conflict_names_the_file_and_not_a_culprit() {
+        let (dir, repo) = scratch("conflict");
+        let root = commit(&repo, None, Some(&lines(&[(3, "EARLIER")])));
+        let root = repo.find_commit(root).unwrap();
+        let mine = commit(&repo, Some(&root), Some(&lines(&[(3, "MINE")])));
+
+        // The base branch has its own line 3, so the pick has nowhere to land.
+        let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
+        let seed = parentless(&repo, &base);
+        let err = session_only_tree(&repo, &seed, &base, &[mine.to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("app.py"), "{err}");
+        assert!(err.contains("--exclude app.py"), "{err}");
+        assert!(!err.contains("another session's edits"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
