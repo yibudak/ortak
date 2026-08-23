@@ -17,6 +17,19 @@ pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Render a stored timestamp on the machine's local clock.
+///
+/// Timestamps are stored as UTC seconds and were printed as UTC too, while the
+/// daemon logs its own lines with `chrono::Local`. The same event therefore
+/// read as 07:37 in `ortak log` and 10:37 in the daemon window, which is a
+/// miserable thing to hit while reconstructing what another session did.
+/// Machine-readable output keeps the unix seconds and stays unambiguous.
+pub fn fmt_local(ts: i64, fmt: &str) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format(fmt).to_string())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: i64,
@@ -1482,6 +1495,23 @@ mod tests {
         let failing = db.journal_failures().unwrap();
         assert_eq!(failing.len(), 1);
         assert_eq!(failing[0].file, "src/main.rs");
+    }
+
+    #[test]
+    fn a_stored_timestamp_prints_on_the_local_clock() {
+        use chrono::{Offset, TimeZone};
+        let ts = 1_700_000_000;
+        let offset = chrono::Local
+            .timestamp_opt(ts, 0)
+            .unwrap()
+            .offset()
+            .fix()
+            .local_minus_utc() as i64;
+        let same_instant_shifted = chrono::DateTime::from_timestamp(ts + offset, 0)
+            .unwrap()
+            .format("%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(fmt_local(ts, "%m-%d %H:%M:%S"), same_instant_shifted);
     }
 
     /// Give a session a region on `file` by journaling an edit to it, the way

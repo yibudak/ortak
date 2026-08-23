@@ -178,9 +178,7 @@ pub fn list(ws: &Workspace, as_json: bool) -> Result<()> {
         return Ok(());
     }
     for e in &rows {
-        let t = chrono::DateTime::from_timestamp(e.ts_opened, 0)
-            .map(|d| d.format("%m-%d %H:%M").to_string())
-            .unwrap_or_default();
+        let t = crate::db::fmt_local(e.ts_opened, "%m-%d %H:%M");
         println!(
             "#{} [{}] {} - reporter ortak-{} {}, owner ortak-{} {}",
             e.id,

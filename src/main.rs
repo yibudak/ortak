@@ -642,9 +642,7 @@ fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
         return json::print(&json::edits(db.recent_edits(session_id, limit)?));
     }
     for e in db.recent_edits(session_id, limit)? {
-        let t = chrono::DateTime::from_timestamp(e.ts, 0)
-            .map(|d| d.format("%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
+        let t = db::fmt_local(e.ts, "%m-%d %H:%M:%S");
         let how = if e.inferred() {
             ", inferred from a running command"
         } else {
