@@ -16,8 +16,21 @@ use std::time::{Duration, Instant};
 /// session's work credited to somebody else.
 const UNATTRIBUTED_QUIET: Duration = Duration::from_millis(1500);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+/// Names the daemon that owns this workspace, inside `.ortak`.
+const PIDFILE: &str = "daemon.pid";
+
+struct PidfileGuard(PathBuf);
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
+    let pidfile = ws.ortak_dir.join(PIDFILE);
+    claim(&pidfile, process_alive)?;
+    let _pidfile_guard = PidfileGuard(pidfile);
     let db = Db::open(&ws.db_path)?;
     let repo = shadow::open(ws)?;
     let human_id = db.ensure_human()?;
@@ -84,6 +97,66 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
             }
         }
     }
+}
+
+/// Claim this workspace for the current process. Refuses when the pidfile names
+/// a daemon that is still alive: two daemons race each other on the shadow
+/// repository's index and refs, and the loser of each race drops the edit it was
+/// journaling. Nothing downstream can tell that happened.
+///
+/// A pidfile left behind by a killed daemon is replaced without complaint. That
+/// is the normal way this file ends up on disk, since the daemon runs in the
+/// foreground and is usually stopped with Ctrl-C.
+fn claim(pidfile: &Path, alive: impl Fn(u32) -> bool) -> Result<()> {
+    let me = std::process::id();
+    if let Some(pid) = read_pid(pidfile) {
+        if pid != me && alive(pid) {
+            bail!(
+                "another ortak daemon is already running on this workspace (pid {}). \
+                 Two daemons drop each other's edits, so this one will not start. \
+                 Stop it first, or delete {} if you know it is gone.",
+                pid,
+                pidfile.display()
+            );
+        }
+    }
+    if let Some(dir) = pidfile.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(pidfile, me.to_string())?;
+    Ok(())
+}
+
+fn read_pid(pidfile: &Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
+    plausible_pid(pid).then_some(pid)
+}
+
+/// A value that could be a process at all. Past `i32::MAX` it reaches `kill` as
+/// a negative number, and on Linux `kill -1 -0` means "every process you may
+/// signal" and succeeds, which would report a dead daemon as alive forever and
+/// lock the workspace with nothing to diagnose.
+fn plausible_pid(pid: u32) -> bool {
+    pid > 0 && pid <= i32::MAX as u32
+}
+
+/// `kill -0` is the portable way to ask whether a pid is alive without adding a
+/// libc dependency for one call at startup.
+///
+/// ponytail: this reads "permission denied" as dead. The only pid it is ever
+/// asked about is another ortak daemon of the same user, so that cannot happen
+/// here; if it ever can, this needs a real `kill(2)` and errno.
+fn process_alive(pid: u32) -> bool {
+    if !plausible_pid(pid) {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Cheap pre-filter before ignore rules: workspace-relative path, skipping
@@ -257,4 +330,68 @@ fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64)
 
 fn log(msg: &str) {
     println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pidfile(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ortak-{}-{}.pid", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn claims_a_workspace_nobody_holds() {
+        let f = pidfile("free");
+        claim(&f, |_| true).expect("no pidfile, nothing to conflict with");
+        assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn takes_over_from_a_dead_daemon() {
+        let f = pidfile("stale");
+        std::fs::write(&f, "424242").unwrap();
+        claim(&f, |_| false).expect("the pid it names is gone");
+        assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn refuses_while_another_daemon_lives() {
+        let f = pidfile("live");
+        std::fs::write(&f, "424242").unwrap();
+        assert!(claim(&f, |_| true).is_err());
+        assert_eq!(read_pid(&f), Some(424242), "the running daemon keeps it");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn an_unreadable_pidfile_holds_nothing() {
+        let f = pidfile("junk");
+        std::fs::write(&f, "not a pid").unwrap();
+        claim(&f, |_| true).expect("garbage cannot hold a workspace");
+        assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn a_pid_that_would_wrap_negative_holds_nothing() {
+        // `kill -0 4294967295` reaches Linux as kill(-1, 0), "every process you
+        // may signal", and succeeds. Such a pidfile must not lock the daemon out.
+        let f = pidfile("wrap");
+        std::fs::write(&f, u32::MAX.to_string()).unwrap();
+        assert_eq!(read_pid(&f), None);
+        claim(&f, |_| true).expect("an impossible pid holds nothing");
+        assert_eq!(read_pid(&f), Some(std::process::id()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn asking_the_system_about_a_pid_works_both_ways() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(u32::MAX));
+    }
 }
