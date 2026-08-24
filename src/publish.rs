@@ -27,6 +27,9 @@ pub struct PublishOpts<'a> {
     pub exclude: &'a [String],
     pub scope: Scope,
     pub push: bool,
+    /// Run the whole publish and stop before anything is recorded: no branch,
+    /// no publish row, no freed regions, no push.
+    pub dry_run: bool,
 }
 
 /// Assemble a session's net change into a real branch on the workspace's git
@@ -40,6 +43,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         exclude,
         scope,
         push,
+        dry_run,
     } = opts;
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
@@ -210,33 +214,46 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         ),
     };
     let amend = amending.is_some();
-    repo.branch(&branch_name, &repo.find_commit(commit_oid)?, amend)
-        .with_context(|| {
-            format!(
-                "could not create branch {} (does it already exist?)",
-                branch_name
-            )
-        })?;
-    // Only now: a failed publish must not move the session's high-water mark.
-    // An amend moves the branch's own mark instead of adding a second row for
-    // it, so the next new deliverable still starts after everything published.
-    if amend {
-        db.amend_publish(session.id, &branch_name, head_edit)?;
-    } else {
-        db.record_publish(session.id, &branch_name, head_edit)?;
-    }
-
-    // The work is out, so the lines are free. Until now only presence_minutes
-    // ever cooled a region, and a session that had published and moved on kept
-    // the gate pointed at code it was finished with.
+    // Everything above this line reads; everything below it records. A dry run
+    // is the same publish with the recording left out, which is the only way it
+    // can answer for the replay: a file that cannot be replayed, a base that
+    // has moved, a workspace behind it. A summary written beside the real path
+    // would drift from it by the next flag.
     let mut released = 0;
-    for (file, _) in &files {
-        released += db.release_regions(session.id, Some(file))?;
+    if !dry_run {
+        repo.branch(&branch_name, &repo.find_commit(commit_oid)?, amend)
+            .with_context(|| {
+                format!(
+                    "could not create branch {} (does it already exist?)",
+                    branch_name
+                )
+            })?;
+        // Only now: a failed publish must not move the session's high-water
+        // mark. An amend moves the branch's own mark instead of adding a second
+        // row for it, so the next new deliverable still starts after everything
+        // published.
+        if amend {
+            db.amend_publish(session.id, &branch_name, head_edit)?;
+        } else {
+            db.record_publish(session.id, &branch_name, head_edit)?;
+        }
+        // The work is out, so the lines are free. Until now only
+        // presence_minutes ever cooled a region, and a session that had
+        // published and moved on kept the gate pointed at code it was finished
+        // with.
+        for (file, _) in &files {
+            released += db.release_regions(session.id, Some(file))?;
+        }
     }
 
     println!(
-        "branch {}: {} ({} files, commit {})",
-        if amend { "rewritten" } else { "ready" },
+        "{}: {} ({} files, commit {})",
+        match (dry_run, amend) {
+            (true, true) => "dry run, would rewrite",
+            (true, false) => "dry run, would build",
+            (false, true) => "branch rewritten",
+            (false, false) => "branch ready",
+        },
         branch_name,
         files.len(),
         &commit_oid.to_string()[..8]
@@ -279,6 +296,27 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         println!("\nother sessions are working in files that use what this branch changed:");
         crate::impact::print_refs(&affected);
         println!("names are matched as text, so read these before believing them");
+    }
+
+    if dry_run {
+        // A branch name already taken is how a publish fails with everything
+        // else about it right, so the rehearsal tries the name too.
+        if !amend && repo.find_branch(&branch_name, BranchType::Local).is_ok() {
+            println!(
+                "\nbranch {branch_name} already exists, so publishing would stop there; pass --branch <name> or --amend"
+            );
+        }
+        println!(
+            "\nnothing was created: no branch, no publish record, and this session still holds its lines"
+        );
+        if push {
+            println!(
+                "--push would push {} to {}",
+                branch_name,
+                remote_for(&repo, cfg)
+            );
+        }
+        return Ok(());
     }
 
     if push {
@@ -1173,6 +1211,96 @@ mod tests {
         // has to say something true.
         let advice = push_advice(&repo, "kaan", "task/ortak-2-login");
         assert!(advice.contains("no remote by that name"), "{advice}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A rehearsal has to run the real thing: the same replay, the same
+    /// failures, and none of the recording. The three things publish leaves
+    /// behind are a branch, a publish row and freed lines, so a dry run is
+    /// exactly the run that leaves none of them.
+    #[test]
+    fn a_dry_run_builds_the_branch_and_records_none_of_it() {
+        let root = std::env::temp_dir().join(format!("ortak-dryrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("main");
+        let repo = Repository::init_opts(&root, &opts).unwrap();
+        std::fs::write(root.join("f.txt"), "one\ntwo\n").unwrap();
+        let sig = Signature::now("t", "t@t").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+
+        let ws = Workspace::at(&root);
+        let cfg = Config::default();
+        std::fs::create_dir_all(&ws.ortak_dir).unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow).unwrap();
+        let db = Db::open(&ws.db_path).unwrap();
+        let me = db
+            .upsert_session("ext", "claude-a", "llm", Some("rehearse a publish"))
+            .unwrap();
+
+        // One journaled edit, the way the daemon records one.
+        std::fs::write(root.join("f.txt"), "one\nTWO\n").unwrap();
+        let commit = crate::shadow::commit_edit(
+            &shadow,
+            "f.txt",
+            crate::shadow::Change::Modify,
+            "claude-a",
+            "ext",
+            None,
+        )
+        .unwrap();
+        let hunk = crate::regions::Hunk {
+            old_start: 2,
+            old_lines: 1,
+            new_start: 2,
+            new_lines: 1,
+        };
+        db.insert_edit(me, "f.txt", "modify", Some(&commit), &[hunk], None)
+            .unwrap();
+        db.apply_edit_regions(me, "f.txt", &[hunk]).unwrap();
+
+        let opts = |dry_run| PublishOpts {
+            branch: Some("task/rehearsal"),
+            base: None,
+            exclude: &[],
+            scope: Scope::New,
+            push: false,
+            dry_run,
+        };
+        let session = format!("ortak-{me}");
+        run(&ws, &cfg, &session, opts(true)).unwrap();
+        assert!(
+            repo.find_branch("task/rehearsal", BranchType::Local)
+                .is_err(),
+            "the dry run created the branch"
+        );
+        assert!(
+            db.publishes(me).unwrap().is_empty(),
+            "the dry run moved the session's high-water mark"
+        );
+        assert_eq!(
+            db.session_regions(me).unwrap().len(),
+            1,
+            "the dry run freed lines the session is still holding"
+        );
+
+        // The same command without it does all three, and the branch it builds
+        // is the one the rehearsal described.
+        run(&ws, &cfg, &session, opts(false)).unwrap();
+        let branch = repo
+            .find_branch("task/rehearsal", BranchType::Local)
+            .unwrap();
+        let published = branch.get().peel_to_tree().unwrap();
+        assert_eq!(named_file_in(&published, &repo, "f.txt"), "one\nTWO\n");
+        assert_eq!(db.publishes(me).unwrap().len(), 1);
+        assert!(db.session_regions(me).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 }
