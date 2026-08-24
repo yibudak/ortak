@@ -95,6 +95,41 @@ pub fn regions_from_hunks(hunks: &[Hunk]) -> Vec<Region> {
     merge(out)
 }
 
+/// `keep` with every line covered by `taken` removed, in order. A region comes
+/// back in two pieces when a later edit lands in the middle of it.
+///
+/// A session's regions on a file used to be one merged set, so nothing ever had
+/// to be taken out of anything. They now carry how the edit behind them was
+/// attributed, and the newest write is what a reader is asking about when they
+/// blame a line, so the lines it wrote leave the older claim rather than
+/// sitting underneath it.
+pub fn subtract(keep: Region, taken: &[Region]) -> Vec<Region> {
+    let mut out = vec![keep];
+    for t in taken {
+        let mut next = Vec::new();
+        for r in out {
+            if t.end < r.start || t.start > r.end {
+                next.push(r);
+                continue;
+            }
+            if r.start < t.start {
+                next.push(Region {
+                    start: r.start,
+                    end: t.start - 1,
+                });
+            }
+            if t.end < r.end {
+                next.push(Region {
+                    start: t.end + 1,
+                    end: r.end,
+                });
+            }
+        }
+        out = next;
+    }
+    out
+}
+
 /// Coalesce overlapping or directly adjacent regions.
 pub fn merge(mut v: Vec<Region>) -> Vec<Region> {
     v.sort_by_key(|r| r.start);
@@ -183,6 +218,17 @@ mod tests {
             regions_from_hunks(&hunks),
             vec![r(3, 4), r(12, 12), r(21, 21)]
         );
+    }
+
+    #[test]
+    fn subtract_takes_the_newer_edit_out_of_an_older_claim() {
+        // Straight through the middle, so the older claim comes back in two.
+        assert_eq!(subtract(r(5, 20), &[r(10, 12)]), vec![r(5, 9), r(13, 20)]);
+        // Overlapping an end clips it; a miss leaves it alone.
+        assert_eq!(subtract(r(5, 20), &[r(1, 7)]), vec![r(8, 20)]);
+        assert_eq!(subtract(r(5, 20), &[r(30, 40)]), vec![r(5, 20)]);
+        // Swallowed whole, and nothing is left to own.
+        assert!(subtract(r(5, 20), &[r(5, 20)]).is_empty());
     }
 
     #[test]

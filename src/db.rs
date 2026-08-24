@@ -1,6 +1,7 @@
 use crate::regions::{self, Hunk, Region};
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -262,7 +263,11 @@ CREATE TABLE IF NOT EXISTS regions (
   updated_at INTEGER NOT NULL,
   -- The work shipped and the lines are free, but the session still wrote them.
   -- The gate skips a cooled row; blame reads it.
-  cooled     INTEGER NOT NULL DEFAULT 0
+  cooled     INTEGER NOT NULL DEFAULT 0,
+  -- How the edit that wrote these lines was attributed, as `edits` stores it.
+  -- Kept here rather than read back off the session's newest edit on the file,
+  -- which marked every line of a file that had seen one contested write.
+  attributed_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_regions_file ON regions(file);
 CREATE TABLE IF NOT EXISTS errors (
@@ -340,6 +345,7 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE errors ADD COLUMN owner_told_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE regions ADD COLUMN attributed_by TEXT", []);
         Ok(Db { conn })
     }
 
@@ -871,27 +877,34 @@ impl Db {
 
     /// After journaling an edit: shift every existing region on the file
     /// through the edit's hunks, drop regions the edit overwrote, and record
-    /// the editor's own new regions (merged with what it already owned).
-    pub fn apply_edit_regions(&self, session_id: i64, file: &str, hunks: &[Hunk]) -> Result<()> {
+    /// the editor's own new regions with how this edit was attributed.
+    pub fn apply_edit_regions(
+        &self,
+        session_id: i64,
+        file: &str,
+        hunks: &[Hunk],
+        attributed_by: Option<Attribution>,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(i64, i64, i64, i64)> = {
+        let rows: Vec<(i64, i64, i64, i64, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, session_id, start_line, end_line FROM regions WHERE file = ?1",
+                "SELECT id, session_id, start_line, end_line, attributed_by FROM regions
+                 WHERE file = ?1",
             )?;
             let iter = stmt.query_map(params![file], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
             iter.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut mine: Vec<Region> = Vec::new();
-        for (id, sid, start, end) in rows {
+        let mut mine: Vec<(Region, Option<String>)> = Vec::new();
+        for (id, sid, start, end, how) in rows {
             let mapped = regions::map_region(hunks, Region { start, end });
             if sid == session_id {
                 // Own regions are rebuilt below, merged with the new hunks. A
                 // cooled one comes back hot, which is right: the session is
                 // editing this file again, so it is working here again.
                 if let Some(r) = mapped {
-                    mine.push(r);
+                    mine.push((r, how));
                 }
                 tx.execute("DELETE FROM regions WHERE id = ?1", params![id])?;
             } else {
@@ -908,13 +921,36 @@ impl Db {
                 }
             }
         }
-        mine.extend(regions::regions_from_hunks(hunks));
-        for r in regions::merge(mine) {
-            tx.execute(
-                "INSERT INTO regions (session_id, file, start_line, end_line, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, file, r.start, r.end, now_ts()],
-            )?;
+        // This edit's lines come out of whatever the session already claimed
+        // there: two rows over one line would let blame answer with the older
+        // of them, and the line was last written by this edit.
+        let fresh = regions::regions_from_hunks(hunks);
+        let how = attributed_by.map(|a| a.as_str().to_string());
+        let mut claims: Vec<(Region, Option<String>)> = mine
+            .into_iter()
+            .flat_map(|(r, was)| {
+                regions::subtract(r, &fresh)
+                    .into_iter()
+                    .map(move |r| (r, was.clone()))
+            })
+            .collect();
+        claims.extend(fresh.into_iter().map(|r| (r, how.clone())));
+        // Merged within one attribution and no further. Coalescing a contested
+        // range into the ordinary one beside it puts the marker back on lines
+        // nobody contested, which is what this column exists to stop.
+        let mut by_how: BTreeMap<Option<String>, Vec<Region>> = BTreeMap::new();
+        for (r, was) in claims {
+            by_how.entry(was).or_default().push(r);
+        }
+        for (was, ranges) in by_how {
+            for r in regions::merge(ranges) {
+                tx.execute(
+                    "INSERT INTO regions
+                       (session_id, file, start_line, end_line, updated_at, attributed_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![session_id, file, r.start, r.end, now_ts(), was],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -988,9 +1024,7 @@ impl Db {
             "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
                     COALESCE((SELECT MAX(e.ts) FROM edits e
                                WHERE e.session_id = r.session_id AND e.file = r.file), 0),
-                    (SELECT e.attributed_by FROM edits e
-                      WHERE e.session_id = r.session_id AND e.file = r.file
-                      ORDER BY e.ts DESC, e.id DESC LIMIT 1)
+                    r.attributed_by
              FROM regions r JOIN sessions s ON s.id = r.session_id
              WHERE r.file = ?1
              ORDER BY r.start_line, r.end_line",
@@ -1003,9 +1037,10 @@ impl Db {
                 start: r.get(3)?,
                 end: r.get(4)?,
                 last_ts: r.get(5)?,
-                // The same edit `last_ts` came from, so the marker and the age
-                // describe one row. `id` breaks the tie because two edits in
-                // the same second are common enough to have caused a bug once.
+                // From the region, so it speaks for these lines and no others.
+                // Read off the session's newest edit on the file, it marked
+                // every line the session owned there, including the ones a
+                // hook had named perfectly well.
                 attributed_by: r.get(6)?,
             })
         })?;
@@ -1855,7 +1890,8 @@ mod tests {
         }];
         db.insert_edit(session_id, file, "modify", None, &hunks, None)
             .unwrap();
-        db.apply_edit_regions(session_id, file, &hunks).unwrap();
+        db.apply_edit_regions(session_id, file, &hunks, None)
+            .unwrap();
     }
 
     #[test]
@@ -2066,7 +2102,8 @@ mod tests {
             }];
             db.insert_edit(who, "src/impact.rs", "modify", None, &hunks, how)
                 .unwrap();
-            db.apply_edit_regions(who, "src/impact.rs", &hunks).unwrap();
+            db.apply_edit_regions(who, "src/impact.rs", &hunks, how)
+                .unwrap();
         };
         wrote(agent, 1, Some(Attribution::Hook));
         wrote(human, 40, Some(Attribution::Contested));
@@ -2136,5 +2173,48 @@ mod tests {
         assert_eq!(db.resolve_errors(None).unwrap(), 3);
         assert!(db.take_owner_notice(culprit).unwrap().is_none());
         assert!(db.open_errors().unwrap().is_empty(), "#{} closed", unread);
+    }
+
+    /// One session, one file, two edits: an ordinary one and one the daemon
+    /// refused to attribute. The marker came from the session's newest edit on
+    /// the file, so both lines wore it, and a marker that fires on innocent
+    /// lines is one nobody reads by the third time they see it.
+    #[test]
+    fn only_the_contested_lines_carry_the_marker() {
+        let db = db();
+        let me = session(&db, "claude-a");
+        let wrote = |start: i64, lines: i64, how: Option<Attribution>| {
+            let hunks = [Hunk {
+                old_start: start,
+                old_lines: lines,
+                new_start: start,
+                new_lines: lines,
+            }];
+            db.insert_edit(me, "src/app.rs", "modify", None, &hunks, how)
+                .unwrap();
+            db.apply_edit_regions(me, "src/app.rs", &hunks, how)
+                .unwrap();
+        };
+        let marker_at = |line: i64| {
+            let owners = db.file_regions("src/app.rs").unwrap();
+            let o = owners
+                .iter()
+                .find(|o| o.start <= line && line <= o.end)
+                .expect("a line this session wrote");
+            attribution_note(o.attributed_by.as_deref())
+        };
+
+        wrote(1, 10, Some(Attribution::Hook));
+        wrote(40, 2, Some(Attribution::Contested));
+        assert_eq!(marker_at(5), "", "an ordinary line of the same file");
+        assert_eq!(marker_at(40), "two sessions had commands open");
+
+        // A contested write inside lines the session already owned takes them
+        // off the older claim. Left there, the one line that really was
+        // contested would be the one line reading as ordinary.
+        wrote(5, 1, Some(Attribution::Contested));
+        assert_eq!(marker_at(5), "two sessions had commands open");
+        assert_eq!(marker_at(4), "");
+        assert_eq!(marker_at(6), "");
     }
 }

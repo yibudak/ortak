@@ -205,7 +205,7 @@ mod tests {
             new_start: 1,
             new_lines: 1,
         };
-        db.apply_edit_regions(me, "config.rs", &[first_line])
+        db.apply_edit_regions(me, "config.rs", &[first_line], None)
             .unwrap();
         db.insert_edit(them, "hooks.rs", "modify", None, &[], None)
             .unwrap();

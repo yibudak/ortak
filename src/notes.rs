@@ -154,6 +154,7 @@ mod tests {
                 new_start: 10,
                 new_lines: 5,
             }],
+            None,
         )
         .unwrap();
 
@@ -193,6 +194,7 @@ mod tests {
                 new_start: 10,
                 new_lines: 5,
             }],
+            None,
         )
         .unwrap();
         let r = db.session_region(with, "src/db.rs").unwrap().unwrap();
