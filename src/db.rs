@@ -11,6 +11,23 @@ pub const HINT_TTL_SECS: i64 = 15;
 /// Reserved `hints.file` value for a session's open Bash claim. A
 /// workspace-relative path is never `*`, so it cannot collide with a real file.
 pub const BASH_CLAIM: &str = "*";
+/// How long a finished command's claim still speaks for what it wrote
+/// (seconds). `post-bash` runs the moment the command returns, but the daemon
+/// waits out its unattributed-quiet window before journaling, so a claim closed
+/// on the spot is gone by the time anyone asks whose write it was. Long enough
+/// to cover that wait, short enough not to catch the next thing typed, and
+/// whole seconds is as fine as a stored timestamp goes.
+pub const CLAIM_GRACE_SECS: i64 = 3;
+
+/// The sessions whose Bash claim speaks for a write right now: a command still
+/// running, or one that ended inside the grace. `?1` is `BASH_CLAIM` and `?2`
+/// the grace cutoff, so it reads the same alone and as a subquery. One copy,
+/// because two that drift hand a write to different sessions in different
+/// places.
+const LIVE_CLAIMANTS: &str =
+    "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
+      WHERE h.file = ?1 AND s.status = 'active'
+        AND (h.closed_at IS NULL OR h.closed_at >= ?2)";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
 /// How long an outage is still worth reporting in `status` (seconds). The
@@ -20,6 +37,11 @@ pub const OUTAGE_RECENT_SECS: i64 = 3600;
 
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// The oldest `closed_at` a Bash claim can carry and still be heard.
+fn claim_grace_cutoff() -> i64 {
+    now_ts() - CLAIM_GRACE_SECS
 }
 
 /// Render a stored timestamp on the machine's local clock.
@@ -252,7 +274,10 @@ CREATE TABLE IF NOT EXISTS hints (
   file       TEXT NOT NULL,
   session_id INTEGER NOT NULL REFERENCES sessions(id),
   ts         INTEGER NOT NULL,
-  blob       TEXT                      -- shadow object id of the content the hook meant to write
+  blob       TEXT,                     -- shadow object id of the content the hook meant to write
+  -- When a Bash claim's command ended. NULL while it is still running; a claim
+  -- closed within CLAIM_GRACE_SECS still speaks for the write its command made.
+  closed_at  INTEGER
 );
 CREATE TABLE IF NOT EXISTS regions (
   id         INTEGER PRIMARY KEY,
@@ -346,6 +371,7 @@ impl Db {
         );
         let _ = conn.execute("ALTER TABLE errors ADD COLUMN owner_told_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE regions ADD COLUMN attributed_by TEXT", []);
+        let _ = conn.execute("ALTER TABLE hints ADD COLUMN closed_at INTEGER", []);
         Ok(Db { conn })
     }
 
@@ -489,12 +515,18 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
-        // Opportunistic purge of stale hints on other files. Claims are exempt:
-        // a build or test run outlives the TTL, and `post-bash` closes them.
-        // Expired snapshots are deliberately purged here as well.
+        // Opportunistic purge of stale hints on other files. Claims are exempt
+        // from the TTL: a build or test run outlives it, and `post-bash` closes
+        // them. Expired snapshots are deliberately purged here as well.
         self.conn.execute(
             "DELETE FROM hints WHERE ts < ?1 AND file != ?2",
             params![cutoff, BASH_CLAIM],
+        )?;
+        // Closed claims go once their grace has run out, so one row per Bash
+        // call does not accumulate for the length of a session.
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND closed_at IS NOT NULL AND closed_at < ?2",
+            params![BASH_CLAIM, claim_grace_cutoff()],
         )?;
         if let Some(id) = hit {
             return Ok(Some((id, Attribution::Hook)));
@@ -512,12 +544,9 @@ impl Db {
         // two-agent workspace somebody has a command open nearly always. A file
         // no claimant has written is the genuinely ambiguous one, and it still
         // falls through to the human with a contested marker.
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
-             WHERE h.file = ?1 AND s.status = 'active' LIMIT 2",
-        )?;
+        let mut stmt = self.conn.prepare(&format!("{LIVE_CLAIMANTS} LIMIT 2"))?;
         let claimants: Vec<i64> = stmt
-            .query_map(params![BASH_CLAIM], |r| r.get(0))?
+            .query_map(params![BASH_CLAIM, claim_grace_cutoff()], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
             [] => None,
@@ -542,22 +571,25 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT e.session_id FROM edits e
-                  WHERE e.file = ?1 AND e.session_id IN (
-                        SELECT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
-                         WHERE h.file = ?2 AND s.status = 'active')
-                  ORDER BY e.id DESC LIMIT 1",
-                params![file, BASH_CLAIM],
+                &format!(
+                    "SELECT e.session_id FROM edits e
+                      WHERE e.session_id IN ({LIVE_CLAIMANTS}) AND e.file = ?3
+                      ORDER BY e.id DESC LIMIT 1"
+                ),
+                params![BASH_CLAIM, claim_grace_cutoff(), file],
                 |r| r.get(0),
             )
             .optional()?)
     }
 
-    /// Close a session's Bash claim once its command has finished.
+    /// Close a session's Bash claim now its command has finished. The row stays
+    /// until the grace runs out; `CLAIM_GRACE_SECS` says why deleting it here
+    /// loses the writes the command itself made.
     pub fn clear_bash_claim(&self, session_id: i64) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM hints WHERE file = ?1 AND session_id = ?2",
-            params![BASH_CLAIM, session_id],
+            "UPDATE hints SET closed_at = ?3
+             WHERE file = ?1 AND session_id = ?2 AND closed_at IS NULL",
+            params![BASH_CLAIM, session_id, now_ts()],
         )?;
         Ok(())
     }
@@ -1541,8 +1573,30 @@ mod tests {
             Some((human, Attribution::Hook))
         );
 
+        // The command ends. Its claim is not gone yet: the daemon has not looked
+        // at what the command wrote, and a write it made a moment ago is still
+        // its work.
         db.clear_bash_claim(agent).unwrap();
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim))
+        );
+
+        // Once the grace is out, the claim speaks for nothing.
+        grace_expired(&db, agent);
         assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+    }
+
+    /// Age a session's closed claim past its grace. Timestamps are whole
+    /// seconds, so the alternative is a test that sleeps for three of them.
+    fn grace_expired(db: &Db, session_id: i64) {
+        db.conn
+            .execute(
+                "UPDATE hints SET closed_at = ?2
+                 WHERE file = ?1 AND session_id = ?3 AND closed_at IS NOT NULL",
+                params![BASH_CLAIM, now_ts() - CLAIM_GRACE_SECS - 1, session_id],
+            )
+            .unwrap();
     }
 
     /// Two commands open and a file neither of them has ever written. Nobody
@@ -1581,11 +1635,59 @@ mod tests {
         );
         db.clear_hints("src/x.rs").unwrap();
 
-        // b's command finishes and a is an unambiguous guess again.
+        // b's command finishes, and for the length of the grace it still counts:
+        // the daemon may be about to journal something that command wrote.
         db.clear_bash_claim(b).unwrap();
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        // Grace out, and a is an unambiguous guess again.
+        grace_expired(&db, b);
         assert_eq!(
             db.peek_hint("src/x.rs").unwrap(),
             Some((a, Attribution::Claim))
+        );
+    }
+
+    /// The shape that cost both agents work in round 7. A session runs
+    /// `cargo fmt` on a file only it has ever touched; the command returns and
+    /// `post-bash` closes its claim; a second later the daemon gets round to
+    /// journaling the write and finds the only open claim belongs to the other
+    /// session, which was running something of its own the whole time.
+    #[test]
+    fn a_finished_command_still_answers_for_what_it_wrote() {
+        let db = temp_db("claim-grace");
+        let writer = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let other = db
+            .upsert_session("sess-b", "claude-b", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_edit(
+            writer,
+            "tests/end_to_end.rs",
+            "create",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+
+        db.insert_hint(BASH_CLAIM, writer, None).unwrap();
+        db.insert_hint(BASH_CLAIM, other, None).unwrap();
+        db.clear_bash_claim(writer).unwrap();
+        assert_eq!(
+            db.peek_hint("tests/end_to_end.rs").unwrap(),
+            Some((writer, Attribution::Claim)),
+            "the command that just ended is the one that wrote the file"
+        );
+
+        // Long enough after and nothing connects the write to that command any
+        // more, so the one open claim answers for it, as it did before any of
+        // this. The window is what the daemon waits, not a share of the file.
+        grace_expired(&db, writer);
+        assert_eq!(
+            db.peek_hint("tests/end_to_end.rs").unwrap(),
+            Some((other, Attribution::Claim))
         );
     }
 
