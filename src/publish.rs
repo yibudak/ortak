@@ -258,13 +258,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         db.record_publish(session.id, &branch_name, head_edit)?;
     }
 
-    // The work is out, so the lines are free. Cooled rather than dropped: the
-    // session did write these lines, and deleting the region took blame's only
-    // record of that with it while `ortak log` kept the edit.
-    let mut cooled = 0;
-    for (file, _) in &files {
-        cooled += db.cool_regions(session.id, file)?;
-    }
+    let (cooled, affected) = free_lines_and_scan(ws, cfg, &db, session.id, &files)?;
 
     println!(
         "branch {}: {} ({} files, commit {})",
@@ -311,12 +305,6 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         );
     }
 
-    // The gate compares line regions, so it never sees the break that costs
-    // real time: a signature this branch changed and the call site another
-    // session is in. Once per deliverable is what makes the scan affordable
-    // here and not on every prompt. Advisory: a scan that fails found nothing,
-    // because a branch already built must not fail over what might break.
-    let (_, affected) = crate::impact::scan(ws, cfg, &db, session.id).unwrap_or_default();
     if !affected.is_empty() {
         println!("\nother sessions are working in files that use what this branch changed:");
         crate::impact::print_refs(&affected);
@@ -384,6 +372,35 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
     }
     Ok(())
+}
+
+/// Hand back the lines this branch just shipped, and report what it may have
+/// broken elsewhere. Returns how many regions were freed and what the scan
+/// found; `run` prints both, further down, where a reader expects them.
+///
+/// The two are one function because they are ordered, and nothing else says so.
+/// Both read the same `regions` rows: the scan asks which lines this session
+/// owns so it can read the names they define, and the release hands those very
+/// lines back. Taken in the other order the scan sees a session that owns
+/// nothing and reports nothing, which is what it did from the round it shipped
+/// in until the row happened to survive a publish.
+///
+/// Once per deliverable is what makes the scan affordable here and not on every
+/// prompt; `impact` says what it is for. Advisory: a scan that fails found
+/// nothing, because a branch already built must not fail over what might break.
+fn free_lines_and_scan(
+    ws: &Workspace,
+    cfg: &Config,
+    db: &Db,
+    session_id: i64,
+    files: &[(String, String)],
+) -> Result<(usize, Vec<crate::impact::Ref>)> {
+    let (_, affected) = crate::impact::scan(ws, cfg, db, session_id).unwrap_or_default();
+    let mut cooled = 0;
+    for (file, _) in files {
+        cooled += db.cool_regions(session_id, file)?;
+    }
+    Ok((cooled, affected))
 }
 
 fn entry_for(path: &str, id: Oid, mode: u32, size: usize) -> IndexEntry {
@@ -1151,11 +1168,11 @@ mod tests {
         // Newest first, as `publishes` returns them.
         let h: Vec<PublishRow> = [("third", 30), ("second", 20), ("first", 10)]
             .into_iter()
-             .map(|(branch, last_edit_id)| PublishRow {
-                 branch: branch.to_string(),
-                 last_edit_id,
-                 ts: 0,
-             })
+            .map(|(branch, last_edit_id)| PublishRow {
+                branch: branch.to_string(),
+                last_edit_id,
+                ts: 0,
+            })
             .collect();
         assert_eq!(branch_carrying(&h, 5), Some("first"));
         assert_eq!(branch_carrying(&h, 10), Some("first"));
@@ -1594,5 +1611,50 @@ mod tests {
         assert!(on_remote(&ws, "up", "main"));
         assert!(!on_remote(&ws, "up", "feat/never-pushed"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// One session changes a function, another is working in the file that
+    /// calls it: the break the gate cannot see, and the only thing the scan is
+    /// for. Publishing the first session has to name the second.
+    ///
+    /// The scan and the release read the same rows, so this fails the moment
+    /// they run in the other order, which is how the scan spent two rounds
+    /// printing nothing while `ortak impact` answered the same question fine.
+    #[test]
+    fn a_published_branch_still_names_what_it_may_have_broken() {
+        let dir = std::env::temp_dir().join(format!("ortak-shipped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.py"), "def remote_for(cfg):\n    return cfg\n").unwrap();
+        std::fs::write(dir.join("caller.py"), "value = remote_for(config)\n").unwrap();
+
+        let ws = Workspace::at(&dir);
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let theirs = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        db.apply_edit_regions(
+            mine,
+            "lib.py",
+            &[crate::regions::Hunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+            }],
+        )
+        .unwrap();
+        db.insert_edit(theirs, "caller.py", "modify", None, &[], None)
+            .unwrap();
+
+        let files = vec![("lib.py".to_string(), "modify".to_string())];
+        let (freed, affected) =
+            free_lines_and_scan(&ws, &Config::default(), &db, mine, &files).unwrap();
+
+        assert_eq!(freed, 1, "the work is out, so the lines are free");
+        assert_eq!(affected.len(), 1, "and the caller is still named");
+        assert_eq!(affected[0].name, "remote_for");
+        assert_eq!(affected[0].file, "caller.py");
+        assert_eq!(affected[0].session, theirs);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
