@@ -77,18 +77,6 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         }
     }
 
-    // Before the work that can fail, not after the success that does not need
-    // it: the publish that dies on the earlier task's lines is the one that has
-    // to hear which branch to stack on.
-    if let Some(p) = previous
-        .as_ref()
-        .filter(|p| scope == Scope::New && p.branch != base)
-    {
-        eprintln!(
-            "ortak-{}'s earlier work is on {}; if this publish cannot separate the two, pass --base {} to stack this branch on it.",
-            session.id, p.branch, p.branch
-        );
-    }
     for pattern in drop_excluded(&mut files, exclude) {
         println!(
             "warning: --exclude {} matched none of ortak-{}'s files",
@@ -146,7 +134,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // behaviour when the lookup fails.
     let still_theirs = |file: &str| -> bool { db.shared_file(session.id, file).unwrap_or(true) };
     let (session_tree, unreplayable) =
-        session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs)?;
+        match session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs)? {
+            Replay::Tree(tree, unreplayable) => (tree, unreplayable),
+            // The advice a blocked replay owes the reader is which branch
+            // already holds those lines, and only here is the publish history
+            // in reach.
+            Replay::Blocked(paths) => bail!(blocked_message(&db, &history, session.id, &paths)?),
+        };
 
     // A file whose history cannot be replayed has no correct content to ship, so
     // it leaves the branch and the rest of the session's work still goes out.
@@ -261,12 +255,18 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     if !skipped.is_empty() {
         println!("\nleft out of this branch:");
         for f in &skipped {
-            println!(
-                "  {} - built on another session's work that is not on {} yet",
-                f, base
-            );
+            // The work it builds on is usually another session's, but a session
+            // that created a file on an earlier branch of its own lands here
+            // too, and then the branch to build on is one it already has.
+            match published_branch_for(&db, &history, session.id, f)? {
+                Some(b) => println!("  {} - built on {}, which is not on {} yet", f, b, base),
+                None => println!(
+                    "  {} - built on another session's work that is not on {} yet",
+                    f, base
+                ),
+            }
         }
-        println!("the branch is incomplete; publish and merge that session, then publish again");
+        println!("the branch is incomplete; publish and merge that work, then publish again");
     }
     for f in &stale {
         println!(
@@ -405,7 +405,7 @@ fn session_only_tree<'r>(
     base_tree: &Tree,
     commits: &[String],
     still_theirs: &dyn Fn(&str) -> bool,
-) -> Result<(Tree<'r>, Vec<String>)> {
+) -> Result<Replay<'r>> {
     let mut head = seed.clone();
     let mut unreplayable: Vec<String> = Vec::new();
     let sig = Signature::now("ortak", "publish@ortak.local")?;
@@ -465,21 +465,83 @@ fn session_only_tree<'r>(
                 // Whose edits are already at those lines is not something the
                 // merge reports, and the old message guessed "another session".
                 // Often it is the publishing session's own work from an earlier
-                // branch, and the guess sends the reader looking for a
-                // collaborator who is not there.
-                let flags = format!("--exclude {}", paths.join(" --exclude "));
-                bail!(
-                    "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
-                    paths.join(", "),
-                    flags
-                );
+                // branch, which `run` can name from the journal.
+                return Ok(Replay::Blocked(paths));
             }
         }
         let tree = shadow.find_tree(merged.write_tree_to(shadow)?)?;
         let next = shadow.commit(None, &sig, &sig, "replay", &tree, &[&head])?;
         head = shadow.find_commit(next)?;
     }
-    Ok((head.tree()?, unreplayable))
+    Ok(Replay::Tree(head.tree()?, unreplayable))
+}
+
+/// What one replay produced: the tree and the files left out of it, or the
+/// files whose change could not be separated from what is already at their
+/// lines. The second is not an error here because the message a reader can act
+/// on names one of the session's own branches, and reading those means reading
+/// the journal.
+enum Replay<'r> {
+    Tree(Tree<'r>, Vec<String>),
+    Blocked(Vec<String>),
+}
+
+/// The error a blocked replay ends the publish with, including which of the
+/// session's own branches already carries the file it choked on.
+///
+/// The hint used to name the session's most recent publish, whatever that was.
+/// A session with three branches whose `db.rs` work sits on the first was told
+/// to stack on the third, and following that advice fails the same way an
+/// hour later, which is worse than no advice at all.
+fn blocked_message(
+    db: &Db,
+    history: &[PublishRow],
+    session_id: i64,
+    paths: &[String],
+) -> Result<String> {
+    let flags = format!("--exclude {}", paths.join(" --exclude "));
+    let mut msg = format!(
+        "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
+        paths.join(", "),
+        flags
+    );
+    for file in paths {
+        let Some(branch) = published_branch_for(db, history, session_id, file)? else {
+            continue;
+        };
+        msg.push_str(&format!(
+            "\n\nortak-{session_id} already published {file} on {branch}; pass --base {branch} to build this branch on that one."
+        ));
+    }
+    Ok(msg)
+}
+
+/// The session's own branch carrying its newest published edit to a file, if
+/// any of them does.
+fn published_branch_for<'a>(
+    db: &Db,
+    history: &'a [PublishRow],
+    session_id: i64,
+    file: &str,
+) -> Result<Option<&'a str>> {
+    let Some(newest) = history.first() else {
+        return Ok(None);
+    };
+    let Some(edit) = db.last_edit_upto(session_id, file, newest.last_edit_id)? else {
+        return Ok(None);
+    };
+    Ok(branch_carrying(history, edit))
+}
+
+/// Which branch's slice an edit fell in. A publish carries everything between
+/// the mark before it and its own, so the branch that has an edit is the oldest
+/// one whose mark reaches it; `history` arrives newest first.
+fn branch_carrying(history: &[PublishRow], edit: i64) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|p| p.last_edit_id >= edit)
+        .map(|p| p.branch.as_str())
 }
 
 /// Whether the branch's content for a file differs from what the session last
@@ -671,6 +733,22 @@ mod tests {
         false
     }
 
+    /// The replay, for the tests that expect it to get through. It deliberately
+    /// shadows the real `session_only_tree` so those tests keep reading as the
+    /// two things they are about, the tree and what was left out of it, and
+    /// only the tests about a blocked replay have to mention `Replay`.
+    fn session_only_tree<'r>(
+        shadow: &'r Repository,
+        seed: &Commit<'r>,
+        base_tree: &Tree,
+        commits: &[String],
+    ) -> Result<(Tree<'r>, Vec<String>)> {
+        match super::session_only_tree(shadow, seed, base_tree, commits, &shared_none)? {
+            Replay::Tree(tree, skipped) => Ok((tree, skipped)),
+            Replay::Blocked(paths) => panic!("the replay was blocked on {}", paths.join(", ")),
+        }
+    }
+
     fn lines(edits: &[(usize, &str)]) -> String {
         let mut v: Vec<String> = (1..=40).map(|i| format!("line_{i}")).collect();
         for (n, text) in edits {
@@ -760,7 +838,7 @@ mod tests {
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
         let picks = vec![a1.to_string(), a2.to_string()];
-        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks, &shared_none).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
         assert!(skipped.is_empty());
         let out = file_in(&tree, &repo);
 
@@ -778,7 +856,7 @@ mod tests {
         let (dir, repo) = scratch("empty");
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
-        let (tree, _) = session_only_tree(&repo, &seed, &base, &[], &shared_none).unwrap();
+        let (tree, _) = session_only_tree(&repo, &seed, &base, &[]).unwrap();
         assert_eq!(file_in(&tree, &repo), lines(&[]));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -803,8 +881,7 @@ mod tests {
         // Session A's file has since been merged, so the base branch carries it.
         let base = tree_with(&repo, Some(&lines(&[(3, "AAA-created")])));
         let seed = parentless(&repo, &base);
-        let (tree, _) =
-            session_only_tree(&repo, &seed, &base, &[edited.to_string()], &shared_none).unwrap();
+        let (tree, _) = session_only_tree(&repo, &seed, &base, &[edited.to_string()]).unwrap();
         assert!(file_in(&tree, &repo).contains("BBB-edit"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -840,12 +917,17 @@ mod tests {
         let picks = vec![mine1.to_string(), mine2.to_string()];
 
         // Still theirs: the old answer, and the right one while it is true.
-        let (_, skipped) =
-            session_only_tree(&repo, &seed, &base, &picks, &|f: &str| f == "mine.py").unwrap();
+        let skipped =
+            match super::session_only_tree(&repo, &seed, &base, &picks, &|f: &str| f == "mine.py")
+                .unwrap()
+            {
+                Replay::Tree(_, skipped) => skipped,
+                Replay::Blocked(p) => panic!("blocked on {}", p.join(", ")),
+            };
         assert_eq!(skipped, vec!["mine.py".to_string()]);
 
         // Released: the file is the author's own history with a hole in it.
-        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks, &shared_none).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &picks).unwrap();
         assert!(skipped.is_empty(), "a released file is publishable again");
         assert!(named_file_in(&tree, &repo, "mine.py").contains("MINE-2"));
         std::fs::remove_dir_all(&dir).ok();
@@ -879,7 +961,10 @@ mod tests {
         let picks = vec![touched.to_string(), own.to_string()];
         let theirs_still = |f: &str| f == "dep.py";
         let (tree, skipped) =
-            session_only_tree(&repo, &seed, &base, &picks, &theirs_still).unwrap();
+            match super::session_only_tree(&repo, &seed, &base, &picks, &theirs_still).unwrap() {
+                Replay::Tree(tree, skipped) => (tree, skipped),
+                Replay::Blocked(p) => panic!("blocked on {}", p.join(", ")),
+            };
 
         assert_eq!(skipped, vec!["dep.py".to_string()]);
         assert!(named_file_in(&tree, &repo, "mine.py").contains("MINE-new"));
@@ -902,14 +987,68 @@ mod tests {
         // The base branch has its own line 3, so the pick has nowhere to land.
         let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
         let seed = parentless(&repo, &base);
-        let err = session_only_tree(&repo, &seed, &base, &[mine.to_string()], &shared_none)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("app.py"), "{err}");
-        assert!(err.contains("--exclude app.py"), "{err}");
-        assert!(!err.contains("another session's edits"), "{err}");
+        match super::session_only_tree(&repo, &seed, &base, &[mine.to_string()], &shared_none)
+            .unwrap()
+        {
+            Replay::Blocked(paths) => assert_eq!(paths, vec!["app.py".to_string()]),
+            Replay::Tree(..) => panic!("a clash on line 3 replayed as if it were clean"),
+        }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Three deliverables, and the file the replay chokes on belongs to the
+    /// second. The hint named the session's most recent publish instead, so
+    /// following it cost another publish to learn the advice was wrong.
+    #[test]
+    fn the_stack_hint_names_the_branch_that_carries_the_file() {
+        let (dir, _repo) = scratch("stack-hint");
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db
+            .upsert_session("claude-a", "claude-a", "llm", None)
+            .unwrap();
+        for (file, branch) in [
+            ("one.rs", "first"),
+            ("db.rs", "second"),
+            ("three.rs", "third"),
+        ] {
+            db.insert_edit(mine, file, "modify", None, &[], None)
+                .unwrap();
+            let mark = db.max_edit_id(mine).unwrap().unwrap();
+            db.record_publish(mine, branch, mark).unwrap();
+        }
+        // The publish that fails is a fourth edit, to the second branch's file,
+        // and it is the one edit no branch carries yet.
+        db.insert_edit(mine, "db.rs", "modify", None, &[], None)
+            .unwrap();
+        let history = db.publishes(mine).unwrap();
+
+        let msg = blocked_message(&db, &history, mine, &["db.rs".to_string()]).unwrap();
+        assert!(msg.contains("--exclude db.rs"), "{msg}");
+        assert!(msg.contains("--base second"), "{msg}");
+        assert!(!msg.contains("third"), "{msg}");
+
+        // A file this session has published nowhere gets the clash and no
+        // advice, which is better than advice that cannot work.
+        let theirs = blocked_message(&db, &history, mine, &["theirs.rs".to_string()]).unwrap();
+        assert!(!theirs.contains("--base"), "{theirs}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_edit_belongs_to_the_branch_whose_slice_reaches_it() {
+        // Newest first, as `publishes` returns them.
+        let h: Vec<PublishRow> = [("third", 30), ("second", 20), ("first", 10)]
+            .into_iter()
+            .map(|(branch, last_edit_id)| PublishRow {
+                branch: branch.to_string(),
+                last_edit_id,
+            })
+            .collect();
+        assert_eq!(branch_carrying(&h, 5), Some("first"));
+        assert_eq!(branch_carrying(&h, 10), Some("first"));
+        assert_eq!(branch_carrying(&h, 11), Some("second"));
+        assert_eq!(branch_carrying(&h, 30), Some("third"));
+        assert_eq!(branch_carrying(&h, 31), None);
     }
 
     /// A journal that lost a row in the middle replays into a file the session
@@ -1011,8 +1150,7 @@ mod tests {
 
         let base = tree_with(&repo, Some(&lines(&[])));
         let seed = parentless(&repo, &base);
-        let (tree, skipped) =
-            session_only_tree(&repo, &seed, &base, &commits, &shared_none).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &commits).unwrap();
         assert!(skipped.is_empty());
         assert!(file_in(&tree, &repo).contains("KEPT-edit"));
         assert!(tree.get_path(Path::new("drop.py")).is_err());

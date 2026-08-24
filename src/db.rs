@@ -609,6 +609,22 @@ impl Db {
         )?)
     }
 
+    /// The newest edit a session made to one file at or before a high-water
+    /// mark. Publish uses it with the marks in `publishes` to work out which
+    /// branch already carries a file.
+    pub fn last_edit_upto(&self, session_id: i64, file: &str, upto: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT MAX(id) FROM edits
+                 WHERE session_id = ?1 AND file = ?2 AND id <= ?3",
+                params![session_id, file, upto],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Every shadow micro-commit this session recorded with the file it touched,
     /// oldest first after edit `after`. Publishing replays these to rebuild the session's own
     /// content, so the full history matters here where `session_files` only
