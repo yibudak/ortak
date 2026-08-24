@@ -475,8 +475,9 @@ impl Db {
     /// Falls back to an open Bash claim: the harness hooks cover the edit tools
     /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
     /// the daemon unattributed and would otherwise land on the human session.
-    /// That fallback applies only while exactly one session has a command
-    /// running; see below for why a second claim cancels the guess.
+    /// One command running makes that unambiguous. Two overlapping commands are
+    /// settled by the journal instead, and only a file none of the claimants
+    /// has written falls through to the human; see below.
     pub fn peek_hint(&self, file: &str) -> Result<Option<(i64, Attribution)>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
@@ -502,15 +503,15 @@ impl Db {
         // session retires it, so a harness that dies mid-command cannot leave
         // one standing.
         //
-        // Only one, though. Two sessions running commands at the same time and
-        // the daemon has no way to tell whose command produced the write; it
-        // used to take the newest claim, which is how one agent's
-        // `cargo fmt --all` was credited to the other, taking the region and
-        // the publishable content with it. Nothing reported it. A wrong owner
-        // is worse than no owner, so an ambiguous write falls through to the
-        // human session, where it is at least honest. It says `contested` on
-        // the way through: falling to the human is the same outcome as an
-        // ordinary human edit, and only one of the two is a decision.
+        // Two of them and the claims alone cannot say whose command wrote the
+        // file; taking the newest is how one agent's `cargo fmt --all` was
+        // credited to the other, region and publishable content with it, and
+        // nothing reported it. The journal can say, though: a session that has
+        // already written this file has a stake one that never touched it does
+        // not. Giving up instead gives up on most writes, because in a
+        // two-agent workspace somebody has a command open nearly always. A file
+        // no claimant has written is the genuinely ambiguous one, and it still
+        // falls through to the human with a contested marker.
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
              WHERE h.file = ?1 AND s.status = 'active' LIMIT 2",
@@ -519,10 +520,37 @@ impl Db {
             .query_map(params![BASH_CLAIM], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
-            [only] => Some((*only, Attribution::Claim)),
             [] => None,
-            _ => Some((self.ensure_human()?, Attribution::Contested)),
+            [only] => Some((*only, Attribution::Claim)),
+            _ => match self.claimant_in_file(file)? {
+                Some(id) => Some((id, Attribution::Claim)),
+                None => Some((self.ensure_human()?, Attribution::Contested)),
+            },
         })
+    }
+
+    /// Of the sessions with a command open, the one that most recently wrote
+    /// this file. `None` when none of them has: a person editing in their own
+    /// editor while two agents run commands is a real case, and the honest
+    /// answer there is still the human.
+    ///
+    /// The journal rather than `regions`, because a region is made from an edit
+    /// and does not outlive it. Lines a session has already published are cool
+    /// and lines it overwrote are gone, and neither means the session stopped
+    /// working in the file.
+    fn claimant_in_file(&self, file: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT e.session_id FROM edits e
+                  WHERE e.file = ?1 AND e.session_id IN (
+                        SELECT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
+                         WHERE h.file = ?2 AND s.status = 'active')
+                  ORDER BY e.id DESC LIMIT 1",
+                params![file, BASH_CLAIM],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Close a session's Bash claim once its command has finished.
@@ -1514,6 +1542,8 @@ mod tests {
         assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
     }
 
+    /// Two commands open and a file neither of them has ever written. Nobody
+    /// can be named, so nobody is.
     #[test]
     fn two_commands_at_once_credit_nobody() {
         let db = temp_db("two-claims");
@@ -1553,6 +1583,57 @@ mod tests {
         assert_eq!(
             db.peek_hint("src/x.rs").unwrap(),
             Some((a, Attribution::Claim))
+        );
+    }
+
+    /// Two commands open at once is the resting state of a two-agent
+    /// workspace, so a rule that gives up on every write made during one gives
+    /// up on most of them. The file itself says who was working in it.
+    #[test]
+    fn two_commands_at_once_credit_the_session_already_in_the_file() {
+        let db = temp_db("two-claims-stake");
+        let a = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let b = db
+            .upsert_session("sess-b", "claude-b", "llm", Some("claude-code"))
+            .unwrap();
+        let quiet = db
+            .upsert_session("sess-c", "claude-c", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, a, None).unwrap();
+        db.insert_hint(BASH_CLAIM, b, None).unwrap();
+        let edited = |s: i64, f: &str| {
+            db.insert_edit(s, f, "modify", None, &[], Some(Attribution::Hook))
+                .unwrap()
+        };
+
+        // a has been editing publish.rs all morning and b has not, so a's
+        // heredoc, codegen step or `sed -i` there is a's work.
+        edited(a, "src/publish.rs");
+        assert_eq!(
+            db.peek_hint("src/publish.rs").unwrap(),
+            Some((a, Attribution::Claim))
+        );
+
+        // b edits it too and is now the session most recently in the file.
+        // Both are plausible; the newer write is the better guess, and either
+        // beats a session that has never opened it.
+        edited(b, "src/publish.rs");
+        assert_eq!(
+            db.peek_hint("src/publish.rs").unwrap(),
+            Some((b, Attribution::Claim))
+        );
+
+        // Written only by a session with no command open, so neither claimant
+        // has a stake in it and neither may be named: a person editing in their
+        // own editor while two agents run commands is a real case, and the
+        // honest answer there is the human, whatever the fall-through calls it.
+        edited(quiet, "src/notes.rs");
+        let ambiguous = db.peek_hint("src/notes.rs").unwrap();
+        assert!(
+            !matches!(ambiguous, Some((s, _)) if s == a || s == b),
+            "a claimant with no stake in the file was named anyway: {ambiguous:?}"
         );
     }
 
