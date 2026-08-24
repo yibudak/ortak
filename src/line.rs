@@ -49,6 +49,16 @@ pub fn report(
     command: Option<&str>,
     text: &str,
 ) -> Result<()> {
+    // Reporting nothing stopped every session in the workspace behind an error
+    // that read `""`, and the hunt for a culprit matches file names in the
+    // output, so an empty one has nothing to go on either.
+    if text.trim().is_empty() {
+        bail!(
+            "say what the error was: ortak report {} --command \"<command>\" \"<output>\". \
+             Stopping the line without it leaves every other session waiting on a blank error",
+            session_ref
+        );
+    }
     let db = Db::open(&ws.db_path)?;
     let reporter = db.resolve_session(session_ref)?;
     let excerpt: String = text.chars().take(4000).collect();
@@ -222,5 +232,19 @@ mod tests {
         assert_eq!(blame_score(excerpt, "src/api/views.py"), 0);
         // Basenames this short match too much to mean anything.
         assert_eq!(blame_score("cannot open db", "src/db"), 0);
+    }
+
+    /// Refused before anything is opened or written, so a report with no error
+    /// in it cannot stop the line. The workspace path below does not exist and
+    /// the call never gets far enough to care.
+    #[test]
+    fn an_empty_report_does_not_stop_the_line() {
+        let ws = Workspace::at(std::path::Path::new("/nonexistent-ortak-workspace"));
+        let cfg = Config::default();
+        let err = report(&ws, &cfg, "ortak-2", Some("cargo test"), "   ").unwrap_err();
+        assert!(
+            err.to_string().starts_with("say what the error was"),
+            "{err}"
+        );
     }
 }
