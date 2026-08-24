@@ -136,6 +136,9 @@ enum Command {
         /// Push the branch to the remote
         #[arg(long)]
         push: bool,
+        /// Say what the branch would carry and record nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Report an error unrelated to your changes and stop the line
     Report {
@@ -314,6 +317,7 @@ fn run(cli: Cli) -> Result<()> {
             all,
             amend,
             push,
+            dry_run,
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
@@ -335,6 +339,7 @@ fn run(cli: Cli) -> Result<()> {
                     scope,
                     push,
                     message: message.as_deref(),
+                    dry_run,
                 },
             )
         }

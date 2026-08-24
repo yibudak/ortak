@@ -2192,7 +2192,8 @@ mod tests {
             }];
             db.insert_edit(who, "src/impact.rs", "modify", None, &hunks, how)
                 .unwrap();
-            db.apply_edit_regions(who, "src/impact.rs", &hunks).unwrap();
+            db.apply_edit_regions(who, "src/impact.rs", &hunks, how)
+                .unwrap();
         };
         wrote(guessed, 1, Some(Attribution::Claim));
         wrote(reported, 40, Some(Attribution::Hook));
