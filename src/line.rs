@@ -27,12 +27,6 @@ struct Suspect {
     score: u32,
 }
 
-/// How recently another session must have written a file for a failure naming
-/// it to read as a file caught mid-edit rather than a breakage. Long enough to
-/// cover the pause between two edits of one refactor, short enough that running
-/// the command a second time clears it.
-const MID_WRITE_SECONDS: i64 = 90;
-
 /// The files an error excerpt names that another session was writing seconds
 /// ago. A build that catches a file half-written fails for a reason that fixes
 /// itself, and stopping the line over it halts everyone else until somebody
@@ -42,11 +36,15 @@ fn still_being_written(
     reporter: i64,
     recent: &[(i64, String, String, i64)],
     now: i64,
+    window: i64,
 ) -> Vec<(String, i64, String, i64)> {
+    if window <= 0 {
+        return Vec::new();
+    }
     let mut fresh: Vec<(String, i64, String, i64)> = recent
         .iter()
         .filter(|(sid, _, file, ts)| {
-            *sid != reporter && now - *ts <= MID_WRITE_SECONDS && blame_score(excerpt, file) > 0
+            *sid != reporter && now - *ts <= window && blame_score(excerpt, file) > 0
         })
         .map(|(sid, agent, file, ts)| (file.clone(), *sid, agent.clone(), (now - *ts).max(0)))
         .collect();
@@ -90,15 +88,22 @@ pub fn report(
     // was going to run the command again anyway, and because waiting is the
     // whole escape: nothing new to remember, no flag, and a file nobody has
     // touched for a minute and a half stops the line exactly as it always did.
-    let fresh = still_being_written(&excerpt, reporter.id, &recent, crate::db::now_ts());
+    let fresh = still_being_written(
+        &excerpt,
+        reporter.id,
+        &recent,
+        crate::db::now_ts(),
+        cfg.line.mid_write_seconds,
+    );
     if let Some((file, sid, agent, secs)) = fresh.first() {
         bail!(
             "not stopping the line: {file} was written {secs}s ago by ortak-{sid} {agent}, so this \
              command caught it mid-edit. A half-written file fails and then builds again on its \
-             own. Run the command again: after {MID_WRITE_SECONDS}s untouched the same report goes \
+             own. Run the command again: after {window}s untouched the same report goes \
              through. If it keeps failing while that session works, say so with \
              `ortak tell ortak-{sid} \"<what broke>\" --from ortak-{}`",
-            reporter.id
+            reporter.id,
+            window = cfg.line.mid_write_seconds
         );
     }
 
@@ -289,7 +294,7 @@ mod tests {
                 now - 5,
             ),
         ];
-        let held = still_being_written(excerpt, 3, &mid_edit, now);
+        let held = still_being_written(excerpt, 3, &mid_edit, now, 90);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].0, "src/db.rs");
         assert_eq!(held[0].3, 5);
@@ -302,10 +307,10 @@ mod tests {
             "src/db.rs".to_string(),
             now - 3600,
         )];
-        assert!(still_being_written(excerpt, 3, &finished, now).is_empty());
+        assert!(still_being_written(excerpt, 3, &finished, now, 90).is_empty());
 
         // The reporter's own half-written file is its own problem to fix.
         let mine = vec![(3, "claude-b".to_string(), "src/db.rs".to_string(), now - 5)];
-        assert!(still_being_written(excerpt, 3, &mine, now).is_empty());
+        assert!(still_being_written(excerpt, 3, &mine, now, 90).is_empty());
     }
 }
