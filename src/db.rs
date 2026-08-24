@@ -117,12 +117,13 @@ impl ErrorRow {
     }
 }
 
-/// What one recorded publish carries: the branch it created, and the newest
-/// edit of the session's that the branch includes.
+/// What one recorded publish carries: the branch it created, the newest edit of
+/// the session's that the branch includes, and when it went out.
 #[derive(Debug, Clone)]
 pub struct PublishRow {
     pub branch: String,
     pub last_edit_id: i64,
+    pub ts: i64,
 }
 
 /// One message waiting for, or already handed to, a session.
@@ -699,16 +700,47 @@ impl Db {
     /// before it says where that branch's work began.
     pub fn publishes(&self, session_id: i64) -> Result<Vec<PublishRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT branch, last_edit_id FROM publishes WHERE session_id = ?1
+            "SELECT branch, last_edit_id, ts FROM publishes WHERE session_id = ?1
              ORDER BY id DESC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(PublishRow {
                 branch: r.get(0)?,
                 last_edit_id: r.get(1)?,
+                ts: r.get(2)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// What a session has published, newest first, each with the number of its
+    /// edits still waiting behind it.
+    ///
+    /// Only the newest publish can have any: work done after an older one went
+    /// into the branches published since, so counting there would report
+    /// shipped work as though it were still sitting in the workspace. `status`
+    /// prints this and `--json` carries it, and a rule that has to hold in both
+    /// belongs in one place.
+    pub fn published_branches(&self, session_id: i64) -> Result<Vec<(PublishRow, i64)>> {
+        let rows = self.publishes(session_id)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, p) in rows.into_iter().enumerate() {
+            let behind = match i {
+                0 => self.edits_since(session_id, p.last_edit_id)?,
+                _ => 0,
+            };
+            out.push((p, behind));
+        }
+        Ok(out)
+    }
+
+    /// How many edits a session has recorded since edit `after`.
+    fn edits_since(&self, session_id: i64, after: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM edits WHERE session_id = ?1 AND id > ?2",
+            params![session_id, after],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn record_publish(&self, session_id: i64, branch: &str, last_edit_id: i64) -> Result<()> {
@@ -1470,6 +1502,52 @@ mod tests {
             db.session_files(s, previous.last_edit_id).unwrap(),
             vec![("shared.rs".to_string(), "modify".to_string())]
         );
+    }
+
+    /// What `status` puts under a session: the branches it has published, and
+    /// the work none of them carries. Only the newest publish can have any, so
+    /// counting from an older one reports work that shipped on a later branch
+    /// as though it were still sitting in the workspace.
+    #[test]
+    fn only_the_newest_branch_has_work_waiting_behind_it() {
+        let db = temp_db("branches");
+        let s = db
+            .upsert_session("sess-a", "claude-sess", "llm", Some("claude-code"))
+            .unwrap();
+        let head = || db.max_edit_id(s).unwrap().unwrap();
+
+        db.insert_edit(s, "one.rs", "create", None, &[], None)
+            .unwrap();
+        db.record_publish(s, "task/one", head()).unwrap();
+        db.insert_edit(s, "two.rs", "create", None, &[], None)
+            .unwrap();
+        db.record_publish(s, "task/two", head()).unwrap();
+
+        let waiting = || -> Vec<i64> {
+            db.published_branches(s)
+                .unwrap()
+                .iter()
+                .map(|(_, behind)| *behind)
+                .collect()
+        };
+        let published = db.published_branches(s).unwrap();
+        assert_eq!(
+            published.iter().map(|(p, _)| &p.branch).collect::<Vec<_>>(),
+            vec!["task/two", "task/one"],
+            "newest first, the way status reads them out"
+        );
+        assert!(published[0].0.ts > 0, "status has to say when it went out");
+        assert_eq!(
+            waiting(),
+            vec![0, 0],
+            "one.rs shipped on task/one and two.rs on task/two; nothing is waiting"
+        );
+
+        // A fix arrives after both, so the newest branch is behind by one and
+        // the older one is still not the place to look for it.
+        db.insert_edit(s, "two.rs", "modify", None, &[], None)
+            .unwrap();
+        assert_eq!(waiting(), vec![1, 0]);
     }
 
     fn agent(db: &Db, ext: &str) -> i64 {

@@ -661,6 +661,7 @@ fn sessions() -> Result<()> {
 }
 
 fn print_sessions(db: &Db) -> Result<()> {
+    let now = db::now_ts();
     for s in db.list_sessions()? {
         let edits = db.edit_count(s.id)?;
         println!(
@@ -671,6 +672,23 @@ fn print_sessions(db: &Db) -> Result<()> {
             edits,
             s.task_intent.as_deref().unwrap_or("(not reported)")
         );
+        // Nothing at all for a session that has published nothing, which is
+        // every session in a fresh workspace: a row of empty labels reads as
+        // information and is not any.
+        for (i, (p, behind)) in db.published_branches(s.id)?.iter().enumerate() {
+            let waiting = match (i, behind) {
+                (0, 0) => ", up to date".to_string(),
+                (0, n) => format!(", {n} edit{} since", if *n == 1 { "" } else { "s" }),
+                _ => String::new(),
+            };
+            println!(
+                "        {} {} (published {}{})",
+                if i == 0 { "branches:" } else { "         " },
+                p.branch,
+                ago(now - p.ts),
+                waiting
+            );
+        }
     }
     Ok(())
 }
