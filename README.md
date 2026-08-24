@@ -26,6 +26,8 @@ Update the binary, installed agent plugins, and their bundled skills with:
 ortak update
 ```
 
+The command checks the latest release and skips any binary or agent plugin already on that version.
+
 Restart active agent sessions after updating so they load the new hooks and skills.
 
 ## Quick start

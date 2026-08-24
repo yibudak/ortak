@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 const INSTALLER: &str = include_str!("../install.sh");
 const PLUGIN_ID: &str = "ortak@ortak";
 const MARKETPLACE: &str = "ortak";
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/yibudak/ortak/releases/latest";
 
 pub fn run() -> Result<()> {
     let executable =
@@ -16,33 +18,94 @@ pub fn run() -> Result<()> {
 }
 
 fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
+    let latest = latest_version(runtime)?;
     let mut failures = Vec::new();
+    let mut updated = false;
 
-    attempt("binary", &mut failures, || {
-        update_binary(runtime, executable)
+    attempt("binary", &mut failures, &mut updated, || {
+        update_binary(runtime, executable, &latest)
     });
-    attempt("Codex plugin", &mut failures, || update_codex(runtime));
-    attempt("Claude plugin", &mut failures, || update_claude(runtime));
+    attempt("Codex plugin", &mut failures, &mut updated, || {
+        update_codex(runtime, &latest)
+    });
+    attempt("Claude plugin", &mut failures, &mut updated, || {
+        update_claude(runtime, &latest)
+    });
 
     if !failures.is_empty() {
         anyhow::bail!("update incomplete:\n  - {}", failures.join("\n  - "));
     }
 
-    println!(
-        "\nortak is up to date. Restart active agent sessions to load updated hooks and skills."
-    );
+    if updated {
+        println!(
+            "\nortak is up to date. Restart active agent sessions to load updated hooks and skills."
+        );
+    } else {
+        println!("\nortak is already up to date.");
+    }
     Ok(())
 }
 
-fn attempt(label: &str, failures: &mut Vec<String>, update: impl FnOnce() -> Result<()>) {
-    if let Err(error) = update() {
-        failures.push(format!("{label}: {error:#}"));
+fn latest_version(runtime: &mut impl Runtime) -> Result<String> {
+    let output = runtime.output(
+        OsStr::new("curl"),
+        &[
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-fsSL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            LATEST_RELEASE_URL,
+        ],
+    )?;
+    if !output.success {
+        anyhow::bail!("could not check the latest release: {}", output.failure());
+    }
+    let value: Value =
+        serde_json::from_str(&output.stdout).context("GitHub returned invalid release JSON")?;
+    let tag = value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .context("GitHub's latest release has no tag_name")?;
+    let version = normalize_version(tag).context("GitHub returned an invalid release tag")?;
+    println!("Latest ortak release: {version}");
+    Ok(version.to_string())
+}
+
+fn normalize_version(version: &str) -> Option<&str> {
+    let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
+    (!version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')))
+    .then_some(version)
+}
+
+fn attempt(
+    label: &str,
+    failures: &mut Vec<String>,
+    updated: &mut bool,
+    update: impl FnOnce() -> Result<bool>,
+) {
+    match update() {
+        Ok(changed) => *updated |= changed,
+        Err(error) => failures.push(format!("{label}: {error:#}")),
     }
 }
 
-fn update_binary(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
+fn update_binary(runtime: &mut impl Runtime, executable: &Path, latest: &str) -> Result<bool> {
+    if CURRENT_VERSION == latest {
+        println!("Binary already up to date: ortak {CURRENT_VERSION}");
+        return Ok(false);
+    }
     let install_dir = install_dir_for(executable)?;
-    println!("Updating ortak binary at {}...", executable.display());
+    println!(
+        "Updating ortak binary from {CURRENT_VERSION} to {latest} at {}...",
+        executable.display()
+    );
     runtime.install_binary(install_dir)?;
 
     let output = runtime.output(executable.as_os_str(), &["--version"])?;
@@ -53,11 +116,12 @@ fn update_binary(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
         );
     }
     let version = output.stdout.trim();
-    if !version.starts_with("ortak ") {
-        anyhow::bail!("the installed binary returned an unexpected version: {version:?}");
+    let expected = format!("ortak {latest}");
+    if version != expected {
+        anyhow::bail!("the installed binary returned {version:?}; expected {expected:?}");
     }
     println!("Binary updated: {version}");
-    Ok(())
+    Ok(true)
 }
 
 fn install_dir_for(executable: &Path) -> Result<&Path> {
@@ -73,17 +137,24 @@ fn install_dir_for(executable: &Path) -> Result<&Path> {
         .context("the current ortak binary has no installation directory")
 }
 
-fn update_codex(runtime: &mut impl Runtime) -> Result<()> {
+fn update_codex(runtime: &mut impl Runtime, latest: &str) -> Result<bool> {
     if !runtime.available("codex") {
         println!("Codex not found; skipping its Ortak plugin.");
-        return Ok(());
+        return Ok(false);
     }
-    if !installed(runtime, "codex")? {
+    let Some(installed) = installed_plugin(runtime, "codex")? else {
         println!("Ortak is not installed in Codex; skipping it.");
-        return Ok(());
+        return Ok(false);
+    };
+    if installed.matches(latest) {
+        println!("Codex plugin and skill already up to date: {latest}");
+        return Ok(false);
     }
 
-    println!("Updating the Codex plugin and bundled skill...");
+    println!(
+        "Updating the Codex plugin and bundled skill from {} to {latest}...",
+        installed.display()
+    );
     // Codex has no separate plugin-update command. Refreshing a configured
     // marketplace also refreshes the installed plugin cache sourced from it.
     checked(
@@ -91,53 +162,97 @@ fn update_codex(runtime: &mut impl Runtime) -> Result<()> {
         "codex",
         &["plugin", "marketplace", "upgrade", MARKETPLACE],
     )?;
+    verify_plugin(runtime, "codex", latest)?;
     println!("Codex plugin and skill updated.");
-    Ok(())
+    Ok(true)
 }
 
-fn update_claude(runtime: &mut impl Runtime) -> Result<()> {
+fn update_claude(runtime: &mut impl Runtime, latest: &str) -> Result<bool> {
     if !runtime.available("claude") {
         println!("Claude Code not found; skipping its Ortak plugin.");
-        return Ok(());
+        return Ok(false);
     }
-    if !installed(runtime, "claude")? {
+    let Some(installed) = installed_plugin(runtime, "claude")? else {
         println!("Ortak is not installed in Claude Code; skipping it.");
-        return Ok(());
+        return Ok(false);
+    };
+    if installed.matches(latest) {
+        println!("Claude Code plugin and skill already up to date: {latest}");
+        return Ok(false);
     }
 
-    println!("Updating the Claude Code plugin and bundled skill...");
+    println!(
+        "Updating the Claude Code plugin and bundled skill from {} to {latest}...",
+        installed.display()
+    );
     checked(
         runtime,
         "claude",
         &["plugin", "marketplace", "update", MARKETPLACE],
     )?;
     checked(runtime, "claude", &["plugin", "update", "--yes", PLUGIN_ID])?;
+    verify_plugin(runtime, "claude", latest)?;
     println!("Claude Code plugin and skill updated.");
+    Ok(true)
+}
+
+fn verify_plugin(runtime: &mut impl Runtime, program: &str, expected: &str) -> Result<()> {
+    let installed = installed_plugin(runtime, program)?
+        .with_context(|| format!("{PLUGIN_ID} disappeared after the update"))?;
+    if !installed.matches(expected) {
+        anyhow::bail!(
+            "{program} reports plugin version {}; expected {expected}",
+            installed.display()
+        );
+    }
     Ok(())
 }
 
-fn installed(runtime: &mut impl Runtime, program: &str) -> Result<bool> {
+fn installed_plugin(runtime: &mut impl Runtime, program: &str) -> Result<Option<InstalledPlugin>> {
     let output = runtime.output(OsStr::new(program), &["plugin", "list", "--json"])?;
     if !output.success {
         anyhow::bail!("could not list installed plugins: {}", output.failure());
     }
     let value: Value = serde_json::from_str(&output.stdout)
         .with_context(|| format!("{program} returned invalid plugin JSON"))?;
-    Ok(contains_plugin(&value))
+    Ok(find_plugin(&value))
 }
 
-fn contains_plugin(value: &Value) -> bool {
+#[derive(Debug, PartialEq)]
+struct InstalledPlugin {
+    version: Option<String>,
+}
+
+impl InstalledPlugin {
+    fn matches(&self, expected: &str) -> bool {
+        self.version.as_deref().and_then(normalize_version) == Some(expected)
+    }
+
+    fn display(&self) -> &str {
+        self.version.as_deref().unwrap_or("unknown")
+    }
+}
+
+fn find_plugin(value: &Value) -> Option<InstalledPlugin> {
     match value {
-        Value::Array(items) => items.iter().any(contains_plugin),
+        Value::Array(items) => items.iter().find_map(find_plugin),
         Value::Object(object) => {
             let is_ortak = ["pluginId", "id"]
                 .iter()
                 .filter_map(|key| object.get(*key).and_then(Value::as_str))
                 .any(|id| id == PLUGIN_ID)
                 && object.get("installed").and_then(Value::as_bool) != Some(false);
-            is_ortak || object.values().any(contains_plugin)
+            if is_ortak {
+                return Some(InstalledPlugin {
+                    version: object
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+            object.values().find_map(find_plugin)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -251,44 +366,104 @@ mod tests {
     #[test]
     fn recognizes_both_plugin_list_shapes() {
         let codex = serde_json::json!({
-            "installed": [{"pluginId": "ortak@ortak"}]
+            "installed": [{"pluginId": "ortak@ortak", "version": "0.1.0"}]
         });
         let claude = serde_json::json!([
             {"id": "something@else"},
-            {"id": "ortak@ortak"}
+            {"id": "ortak@ortak", "version": "v0.2.0"}
         ]);
-        assert!(contains_plugin(&codex));
-        assert!(contains_plugin(&claude));
-        assert!(!contains_plugin(&serde_json::json!({"installed": []})));
-        assert!(!contains_plugin(&serde_json::json!({
-            "available": [{"pluginId": "ortak@ortak", "installed": false}]
-        })));
+        assert_eq!(
+            find_plugin(&codex),
+            Some(InstalledPlugin {
+                version: Some("0.1.0".to_string())
+            })
+        );
+        assert!(find_plugin(&claude).unwrap().matches("0.2.0"));
+        assert_eq!(find_plugin(&serde_json::json!({"installed": []})), None);
+        assert_eq!(
+            find_plugin(&serde_json::json!({
+                "available": [{"pluginId": "ortak@ortak", "installed": false}]
+            })),
+            None
+        );
+        assert_eq!(normalize_version(" v0.2.0 "), Some("0.2.0"));
+        assert_eq!(normalize_version("v bad"), None);
     }
 
     #[test]
     fn updates_the_current_binary_and_both_installed_plugins() {
         let mut runtime = Fake::with_programs(&["codex", "claude"]);
         runtime.responses = VecDeque::from([
-            ok("ortak 0.2.0\n"),
-            ok(r#"{"installed":[{"pluginId":"ortak@ortak"}]}"#),
+            release(NEWER_VERSION),
+            binary_version(NEWER_VERSION),
+            codex_plugin(CURRENT_VERSION),
             ok("codex updated\n"),
-            ok(r#"[{"id":"ortak@ortak"}]"#),
+            codex_plugin(NEWER_VERSION),
+            claude_plugin(CURRENT_VERSION),
             ok("marketplace updated\n"),
             ok("plugin updated\n"),
+            claude_plugin(NEWER_VERSION),
         ]);
 
         run_with(&mut runtime, Path::new("/opt/ortak/bin/ortak")).unwrap();
 
         assert_eq!(runtime.installed_in, Some(PathBuf::from("/opt/ortak/bin")));
         assert_eq!(
-            runtime.calls,
+            &runtime.calls[1..],
             [
                 "/opt/ortak/bin/ortak --version",
                 "codex plugin list --json",
                 "codex plugin marketplace upgrade ortak",
+                "codex plugin list --json",
                 "claude plugin list --json",
                 "claude plugin marketplace update ortak",
                 "claude plugin update --yes ortak@ortak",
+                "claude plugin list --json",
+            ]
+        );
+        assert_latest_call(&runtime.calls[0]);
+    }
+
+    #[test]
+    fn skips_every_component_that_already_has_the_latest_version() {
+        let mut runtime = Fake::with_programs(&["codex", "claude"]);
+        runtime.responses = VecDeque::from([
+            release(CURRENT_VERSION),
+            codex_plugin(CURRENT_VERSION),
+            claude_plugin(CURRENT_VERSION),
+        ]);
+
+        run_with(&mut runtime, Path::new("/opt/ortak/bin/ortak")).unwrap();
+
+        assert_eq!(runtime.installed_in, None);
+        assert_latest_call(&runtime.calls[0]);
+        assert_eq!(
+            &runtime.calls[1..],
+            ["codex plugin list --json", "claude plugin list --json"]
+        );
+    }
+
+    #[test]
+    fn a_current_binary_does_not_hide_an_outdated_plugin() {
+        let mut runtime = Fake::with_programs(&["codex", "claude"]);
+        runtime.responses = VecDeque::from([
+            release(CURRENT_VERSION),
+            codex_plugin("0.1.0"),
+            ok("codex updated\n"),
+            codex_plugin(CURRENT_VERSION),
+            claude_plugin(CURRENT_VERSION),
+        ]);
+
+        run_with(&mut runtime, Path::new("/opt/ortak/bin/ortak")).unwrap();
+
+        assert_eq!(runtime.installed_in, None);
+        assert_eq!(
+            &runtime.calls[1..],
+            [
+                "codex plugin list --json",
+                "codex plugin marketplace upgrade ortak",
+                "codex plugin list --json",
+                "claude plugin list --json",
             ]
         );
     }
@@ -298,11 +473,13 @@ mod tests {
         let mut runtime = Fake::with_programs(&["codex", "claude"]);
         runtime.install_error = true;
         runtime.responses = VecDeque::from([
-            ok(r#"{"installed":[{"pluginId":"ortak@ortak"}]}"#),
+            release(NEWER_VERSION),
+            codex_plugin(CURRENT_VERSION),
             failed("codex failed"),
-            ok(r#"[{"id":"ortak@ortak"}]"#),
+            claude_plugin(CURRENT_VERSION),
             ok("marketplace updated\n"),
             ok("plugin updated\n"),
+            claude_plugin(NEWER_VERSION),
         ]);
 
         let error = run_with(&mut runtime, Path::new("/opt/ortak/bin/ortak"))
@@ -322,6 +499,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not \"ortak\""));
+    }
+
+    fn assert_latest_call(call: &str) {
+        assert!(call.starts_with("curl --proto =https --tlsv1.2 -fsSL"));
+        assert!(call.ends_with(LATEST_RELEASE_URL));
+    }
+
+    const NEWER_VERSION: &str = "999.0.0";
+
+    fn release(version: &str) -> CommandOutput {
+        ok(&format!(r#"{{"tag_name":"v{version}"}}"#))
+    }
+
+    fn binary_version(version: &str) -> CommandOutput {
+        ok(&format!("ortak {version}\n"))
+    }
+
+    fn codex_plugin(version: &str) -> CommandOutput {
+        ok(&format!(
+            r#"{{"installed":[{{"pluginId":"ortak@ortak","version":"{version}"}}]}}"#
+        ))
+    }
+
+    fn claude_plugin(version: &str) -> CommandOutput {
+        ok(&format!(
+            r#"[{{"id":"ortak@ortak","version":"{version}"}}]"#
+        ))
     }
 
     fn ok(stdout: &str) -> CommandOutput {

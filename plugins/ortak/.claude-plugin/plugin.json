@@ -1,6 +1,6 @@
 {
   "name": "ortak",
   "description": "ortak adapter with session registration, edit journaling hooks, and a workflow skill. Runs in workspaces with the ortak daemon installed.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": { "name": "yibudak" }
 }

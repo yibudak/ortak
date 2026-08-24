@@ -1,6 +1,6 @@
 {
   "name": "ortak",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Coordinate concurrent coding agents in one live workspace with ortak.",
   "author": {
     "name": "yibudak",
