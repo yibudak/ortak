@@ -94,16 +94,7 @@ fn split_target(target: &str) -> (&str, Option<i64>) {
 /// typed from a subdirectory or as an absolute path has to be brought back to
 /// that. A path from outside the workspace passes through and matches nothing.
 fn relativize(ws: &Workspace, file: &str) -> String {
-    let path = std::path::Path::new(file);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(_) => return file.to_string(),
-        }
-    };
-    ws.relativize(&abs).unwrap_or_else(|| file.to_string())
+    ws.relativize_arg(file).unwrap_or_else(|| file.to_string())
 }
 
 /// Rough age for someone reading a list: whichever unit keeps it short.

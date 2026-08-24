@@ -796,16 +796,7 @@ fn split_target(target: &str) -> (&str, Option<i64>) {
 /// that. A path from outside the workspace is passed through and simply matches
 /// nothing.
 fn relativize_arg(ws: &Workspace, file: &str) -> String {
-    let path = std::path::Path::new(file);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(_) => return file.to_string(),
-        }
-    };
-    ws.relativize(&abs).unwrap_or_else(|| file.to_string())
+    ws.relativize_arg(file).unwrap_or_else(|| file.to_string())
 }
 
 /// Rough age for someone reading a list: whichever unit keeps it short.
@@ -980,16 +971,7 @@ fn release(session_ref: &str, file: Option<&str>, all: bool) -> Result<()> {
 /// A path argument as the journal stores it: relative to the workspace root,
 /// whatever directory the command was run from.
 fn workspace_path(ws: &Workspace, arg: &str) -> Result<String> {
-    let path = std::path::Path::new(arg);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    // `sub/../f.txt` is not the path the journal stores, and without this the
-    // release matches nothing and still reports that it worked.
-    let abs = abs.canonicalize().unwrap_or(abs);
-    ws.relativize(&abs)
+    ws.relativize_arg(arg)
         .ok_or_else(|| anyhow::anyhow!("{} is outside the workspace {}", arg, ws.root.display()))
 }
 

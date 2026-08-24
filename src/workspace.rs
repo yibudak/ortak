@@ -46,6 +46,27 @@ impl Workspace {
         Workspace::discover(&std::env::current_dir()?)
     }
 
+    /// A path as somebody typed it at the command line, in the form the journal
+    /// stores: relative to the workspace root, from whatever directory the
+    /// command was run in. `None` when it lands outside the workspace.
+    ///
+    /// `sub/../src/db.rs` and `./src/db.rs` are the same file as `src/db.rs`
+    /// and none of them is the key the journal holds, so a command that looks
+    /// the path up as typed answers that nobody has ever touched it.
+    pub fn relativize_arg(&self, arg: &str) -> Option<String> {
+        let path = Path::new(arg);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        // A file that is not on disk cannot be canonicalized, and a blamed or
+        // released file may well have been deleted. The joined path is then the
+        // best answer available, and it is the one these commands already gave.
+        let abs = abs.canonicalize().unwrap_or(abs);
+        self.relativize(&abs)
+    }
+
     /// Workspace-relative, forward-slash path for an absolute path inside the root.
     pub fn relativize(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
@@ -54,5 +75,36 @@ impl Workspace {
             return None;
         }
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `blame` and `why` looked the argument up as typed, so a path that walked
+    /// out of a directory and back in named a file the journal has never heard
+    /// of, and both answered that nobody had touched it.
+    #[test]
+    fn a_path_that_walks_through_a_directory_is_still_the_file_it_names() {
+        let root = std::env::temp_dir().join(format!("ortak-ws-arg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("src/db.rs"), "fn main() {}\n").unwrap();
+        // The temp directory is reached through a symlink on macOS, and the
+        // root a workspace records is the resolved one.
+        let root = root.canonicalize().unwrap();
+        let ws = Workspace::at(&root);
+        let arg = |p: &str| ws.relativize_arg(root.join(p).to_str().unwrap());
+
+        assert_eq!(arg("src/db.rs").as_deref(), Some("src/db.rs"));
+        assert_eq!(arg("sub/../src/db.rs").as_deref(), Some("src/db.rs"));
+        assert_eq!(arg("./src/db.rs").as_deref(), Some("src/db.rs"));
+        // A file the journal remembers and the disk no longer has still
+        // resolves, because a deleted file is a thing people blame.
+        assert_eq!(arg("src/gone.rs").as_deref(), Some("src/gone.rs"));
+        assert_eq!(ws.relativize_arg("/etc/hosts"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
