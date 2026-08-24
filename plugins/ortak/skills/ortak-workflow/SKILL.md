@@ -19,7 +19,7 @@ ortak uses this intent for the branch and PR title. Other sessions use it to und
 
 ## 2. Do not manage branches or commits with Git
 
-Do not run `git checkout`, `git branch`, `git commit`, or `git stash` while developing in this workspace. Those commands break the single live workspace. ortak handles versioning; edit files without changing Git state. You may run `git diff` and `git log` because they do not change state.
+Do not run `git checkout`, `git switch`, `git branch`, `git commit`, `git add`, or `git stash` while developing in this workspace. Those commands break the single live workspace. ortak handles versioning; edit files without changing Git state. You may run `git diff` and `git log` because they do not change state.
 
 ## 3. Respect gate denials
 
@@ -62,7 +62,7 @@ Run one of these commands when the task is complete or the user asks you to publ
 
 ```bash
 ortak publish ortak-N          # create the branch in the local repository
-ortak publish ortak-N --push   # push the branch; use the printed tea command to open a PR
+ortak publish ortak-N --push   # push the branch, then run the PR command it prints
 ```
 
 ## Tell the other sessions what changed under them
@@ -101,6 +101,8 @@ ortak log --session ortak-N
 ortak inbox ortak-N # messages other sessions sent you
 ortak impact ortak-N # who else is working on files that use what you changed
 ortak why <file>    # why sessions changed this file; add :<line> for one line
+ortak blame <file>  # who owns each line, and why the gate refused you
+ortak errors        # what is holding the line, and who owns the fix
 ```
 
 Check `ortak log` before changing unexpected content in a file. Another session may own that change.
