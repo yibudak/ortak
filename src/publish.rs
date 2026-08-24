@@ -541,6 +541,17 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
     repo.find_branch(base, BranchType::Local)
         .and_then(|b| b.get().peel_to_commit())
         .map_err(|_| {
+            // A repository with no commits has no branch to name either, so the
+            // advice below sends the reader to ortak.toml to try other names
+            // when nothing they could write there would work.
+            // `is_empty` is not the question: it answers false once HEAD names
+            // a branch other than libgit2's own default. An unborn HEAD is what
+            // "no commits" actually looks like.
+            if matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch) {
+                return anyhow!(
+                    "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
+                );
+            }
             let head = repo
                 .head()
                 .ok()
@@ -990,6 +1001,20 @@ mod tests {
         let err = base_commit_for(&repo, "main").unwrap_err().to_string();
         assert!(err.contains("'main' does not exist"), "{err}");
         assert!(err.contains("HEAD is on 'master'"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git init`, then `ortak init`, then a day's work: the first publish told
+    /// them to set base_branch to the branch these tasks merge into, and there
+    /// is no name they could have written there.
+    #[test]
+    fn a_repository_with_no_commits_says_so_instead_of_blaming_the_config() {
+        let dir = std::env::temp_dir().join(format!("ortak-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repository::init(&dir).unwrap();
+        let err = base_commit_for(&repo, "main").unwrap_err().to_string();
+        assert!(err.contains("no commits yet"), "{err}");
+        assert!(!err.contains("ortak.toml"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
