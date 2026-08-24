@@ -197,8 +197,22 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         session.agent_name,
         files.len()
     );
-    let email = format!("ortak-{}@ortak.local", session.id);
-    let sig = Signature::now(&session.agent_name, &email)?;
+    // The person, not the session. Which session wrote it is already three
+    // lines further up in the trailers, and the journal is the real record; the
+    // author field is what a forge matches to an account, what `git shortlog`
+    // counts and what a signature covers, and `ortak-3@ortak.local` matches
+    // nothing, so every branch published here arrived from a ghost.
+    //
+    // A repository with no identity configured is the one case where the old
+    // name is better than failing, since publish is not the place to teach
+    // somebody `git config user.email`.
+    let sig = match repo.signature() {
+        Ok(sig) => sig,
+        Err(_) => {
+            let email = format!("ortak-{}@ortak.local", session.id);
+            Signature::now(&session.agent_name, &email)?
+        }
+    };
     let commit_oid = repo.commit(None, &sig, &sig, &message, &tree, &[&base_commit])?;
 
     let branch_name = match branch_override {
@@ -632,6 +646,40 @@ fn slug(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every branch this tool published arrived as `claude-75c62662
+    /// <ortak-3@ortak.local>`, which no forge can match to an account and no
+    /// signature can cover. Which session did the work is in the trailers.
+    #[test]
+    fn a_published_commit_is_authored_by_the_person() {
+        let dir = std::env::temp_dir().join(format!("ortak-author-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repository::init(&dir).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "A Person").unwrap();
+            cfg.set_str("user.email", "person@example.com").unwrap();
+        }
+        let sig = repo.signature().unwrap();
+        assert_eq!(sig.name(), Some("A Person"));
+        assert_eq!(sig.email(), Some("person@example.com"));
+
+        // And the fallback, for a repository that has never been told who it
+        // belongs to: better a name than a failed publish.
+        let bare = std::env::temp_dir().join(format!("ortak-author-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        let plain = Repository::init(&bare).unwrap();
+        {
+            let mut cfg = plain.config().unwrap();
+            let _ = cfg.remove("user.name");
+            let _ = cfg.remove("user.email");
+        }
+        if plain.signature().is_err() {
+            assert!(Signature::now("claude-abcd", "ortak-3@ortak.local").is_ok());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
 
     fn lines(edits: &[(usize, &str)]) -> String {
         let mut v: Vec<String> = (1..=40).map(|i| format!("line_{i}")).collect();
