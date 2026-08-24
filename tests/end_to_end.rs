@@ -316,6 +316,8 @@ impl Live {
             "user.email=e2e@ortak.test",
             "-c",
             "user.name=ortak end to end",
+            "-c",
+            "commit.gpgSign=false",
             "commit",
             "-qm",
             "baseline",

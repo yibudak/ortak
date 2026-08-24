@@ -393,6 +393,7 @@ mod tests {
                 new_start: 1,
                 new_lines: 4,
             }],
+            None,
         )
         .unwrap();
 

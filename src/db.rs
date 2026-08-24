@@ -1817,7 +1817,10 @@ mod tests {
         // b's command finishes, and for the length of the grace it still counts:
         // the daemon may be about to journal something that command wrote.
         db.clear_bash_claim(b).unwrap();
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((db.ensure_human().unwrap(), Attribution::Contested))
+        );
 
         // Grace out, and a is an unambiguous guess again.
         grace_expired(&db, b);
@@ -2346,12 +2349,15 @@ mod tests {
         );
         assert!(db.session_files(bystander, 0).unwrap().is_empty());
         // And what a person reads: the file is the author's, and the journal
-        // says the repair happened rather than passing it off as a write.
+        // says which range was repaired rather than passing it off as a write.
         let owners = db.file_regions("tests/end_to_end.rs").unwrap();
-        assert!(owners.iter().all(|o| {
-            o.session_id == author
-                && attribution_note(o.attributed_by.as_deref()) == "claimed after the fact"
-        }));
+        assert!(owners.iter().all(|o| o.session_id == author));
+        assert!(owners
+            .iter()
+            .any(|o| { attribution_note(o.attributed_by.as_deref()) == "claimed after the fact" }));
+        assert!(owners
+            .iter()
+            .any(|o| { attribution_note(o.attributed_by.as_deref()).is_empty() }));
         assert!(db
             .recent_edits(Some(author), 20)
             .unwrap()
