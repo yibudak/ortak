@@ -151,6 +151,10 @@ pub struct Owner {
     pub start: i64,
     pub end: i64,
     pub last_ts: i64,
+    /// Whether the edit behind `last_ts` was credited by guesswork rather than
+    /// reported by a hook. Blame is read to settle who wrote a line, so the one
+    /// answer it must not give confidently is the one nobody reported.
+    pub inferred: bool,
 }
 
 /// Why one session made a change, kept against the range it owned at the time.
@@ -854,7 +858,10 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
                     COALESCE((SELECT MAX(e.ts) FROM edits e
-                               WHERE e.session_id = r.session_id AND e.file = r.file), 0)
+                               WHERE e.session_id = r.session_id AND e.file = r.file), 0),
+                    (SELECT e.attributed_by FROM edits e
+                      WHERE e.session_id = r.session_id AND e.file = r.file
+                      ORDER BY e.ts DESC, e.id DESC LIMIT 1)
              FROM regions r JOIN sessions s ON s.id = r.session_id
              WHERE r.file = ?1
              ORDER BY r.start_line, r.end_line",
@@ -867,6 +874,11 @@ impl Db {
                 start: r.get(3)?,
                 end: r.get(4)?,
                 last_ts: r.get(5)?,
+                // The same edit `last_ts` came from, so the marker and the age
+                // describe one row. `id` breaks the tie because two edits in
+                // the same second are common enough to have caused a bug once.
+                inferred: r.get::<_, Option<String>>(6)?.as_deref()
+                    == Some(Attribution::Claim.as_str()),
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1642,5 +1654,40 @@ mod tests {
         // Writing the file again is how a session takes it back.
         owns(&db, wrong, "src/impact.rs", 1, 195);
         assert_eq!(db.session_files(wrong, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn blame_says_which_owner_was_only_inferred() {
+        let db = db();
+        let guessed = session(&db, "claude-a");
+        let reported = session(&db, "claude-b");
+        let wrote = |who: i64, start: i64, how: Option<Attribution>| {
+            let hunks = [Hunk {
+                old_start: start,
+                old_lines: 5,
+                new_start: start,
+                new_lines: 5,
+            }];
+            db.insert_edit(who, "src/impact.rs", "modify", None, &hunks, how)
+                .unwrap();
+            db.apply_edit_regions(who, "src/impact.rs", &hunks).unwrap();
+        };
+        wrote(guessed, 1, Some(Attribution::Claim));
+        wrote(reported, 40, Some(Attribution::Hook));
+
+        let owner_of = |sid: i64| {
+            db.file_regions("src/impact.rs")
+                .unwrap()
+                .into_iter()
+                .find(|o| o.session_id == sid)
+                .expect("owner")
+        };
+        assert!(owner_of(guessed).inferred, "nobody reported this one");
+        assert!(!owner_of(reported).inferred);
+
+        // Editing it again with a hook behind the change settles the question,
+        // and the mark goes with the row the printed age belongs to.
+        wrote(guessed, 1, Some(Attribution::Hook));
+        assert!(!owner_of(guessed).inferred);
     }
 }
