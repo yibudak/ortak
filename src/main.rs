@@ -1022,6 +1022,15 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
+    // `ortak intent ortak-3` on its own used to record an empty one, quietly
+    // replacing whatever the session had told everybody it was doing. The
+    // intent is what the gate shows a session it is blocking.
+    if text.trim().is_empty() {
+        anyhow::bail!(
+            "say what the task is: ortak intent ortak-{} \"<one sentence>\"",
+            session.id
+        );
+    }
     db.set_intent(session.id, text)?;
     // Naming the agent as well as the number is the cheap half of catching an
     // intent recorded against the wrong session: `ortak intent ortak-3` from a
