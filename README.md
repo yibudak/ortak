@@ -20,6 +20,14 @@ Set `ORTAK_INSTALL_DIR` to choose another directory or `ORTAK_VERSION` to pin a 
 cargo install --git https://github.com/yibudak/ortak --locked
 ```
 
+Update the binary, installed agent plugins, and their bundled skills with:
+
+```bash
+ortak update
+```
+
+Restart active agent sessions after updating so they load the new hooks and skills.
+
 ## Quick start
 
 Run these commands at the root of your Git repository:
@@ -65,6 +73,7 @@ session. `ortak publish` replays one session's journal onto a clean branch.
 | --- | --- |
 | Show the current session | `ortak whoami` |
 | Check daemon and sessions | `ortak status` |
+| Update Ortak and agent plugins | `ortak update` |
 | Read one session's journal | `ortak log --session ortak-2` |
 | Find who owns a line | `ortak blame src/publish.rs:120` |
 | Message another session | `ortak tell ortak-3 "db.rs is changing" --from ortak-2` |

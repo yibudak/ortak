@@ -16,6 +16,7 @@ need curl
 need tar
 need awk
 need install
+need mv
 
 case "$(uname -s)" in
     Darwin) os="apple-darwin" ;;
@@ -53,8 +54,10 @@ fi
 target="$arch-$os"
 archive="ortak-$target.tar.gz"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ortak-install.XXXXXX")" || fail "could not create temporary directory"
+staged="$install_dir/.ortak.new.$$"
 cleanup() {
     rm -rf "$tmp_dir"
+    rm -f "$staged"
 }
 trap cleanup 0 HUP INT TERM
 
@@ -79,7 +82,8 @@ tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
 [ -f "$tmp_dir/ortak" ] || fail "release archive does not contain the ortak binary"
 
 mkdir -p "$install_dir"
-install -m 0755 "$tmp_dir/ortak" "$install_dir/ortak"
+install -m 0755 "$tmp_dir/ortak" "$staged"
+mv -f "$staged" "$install_dir/ortak"
 
 printf 'Installed ortak to %s/ortak\n' "$install_dir"
 case ":${PATH:-}:" in

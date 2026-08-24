@@ -96,6 +96,7 @@ EOF
 
 ```bash
 ortak status         # daemon and sessions
+ortak update         # binary, installed agent plugins, and bundled skills
 ortak log            # recent journal entries and their owners
 ortak log --session ortak-N
 ortak inbox ortak-N # messages other sessions sent you
