@@ -156,8 +156,13 @@ impl Config {
         toml::from_str(&raw).with_context(|| format!("could not parse {}", path.display()))
     }
 
-    pub fn default_toml() -> &'static str {
-        r#"# ortak configuration
+    /// The file `ortak init` writes. The base branch is passed in rather than
+    /// spelled here, because a repository that calls its trunk something other
+    /// than `main` used to get a config naming a branch it does not have, and
+    /// the first publish its owner ever ran failed on it.
+    pub fn default_toml(base_branch: &str) -> String {
+        format!(
+            r#"# ortak configuration
 
 [workspace]
 # Extra patterns to exclude from the journal (gitignore syntax).
@@ -166,7 +171,7 @@ ignore = []
 
 [publish]
 # Base branch for published branches
-base_branch = "main"
+base_branch = "{base_branch}"
 # Prefix for generated branch names
 branch_prefix = "task/"
 # Remote used for pushes. Leave it unset: the remote differs per clone, so set
@@ -197,5 +202,6 @@ command = "claude"
 model = "haiku"
 timeout_secs = 20
 "#
+        )
     }
 }

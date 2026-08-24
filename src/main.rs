@@ -187,7 +187,7 @@ enum HookEvent {
     PreBash,
     /// Claude Code PostToolUse (Bash): error-reporting reminder
     PostBash,
-    /// Claude Code UserPromptSubmit: hat durumu enjeksiyonu
+    /// Claude Code UserPromptSubmit: line status and waiting messages
     PromptContext,
     /// Claude Code SessionEnd
     SessionEnd,
@@ -386,8 +386,10 @@ fn init() -> Result<()> {
         return Ok(());
     }
     if !ws.config_path.exists() {
-        std::fs::write(&ws.config_path, Config::default_toml())?;
+        let base = trunk_branch(&root);
+        std::fs::write(&ws.config_path, Config::default_toml(&base))?;
         println!("wrote: {}", ws.config_path.display());
+        println!("publishing onto {base}; change [publish] base_branch if that is not your trunk");
     }
     let cfg = Config::load(&ws.config_path)?;
     let db = Db::open(&ws.db_path)?;
@@ -400,6 +402,30 @@ fn init() -> Result<()> {
     println!("\nworkspace ready: {}", ws.root.display());
     println!("next: run `ortak daemon` in another terminal or in the background");
     Ok(())
+}
+
+/// The branch a new workspace publishes onto. It used to be `main` whatever the
+/// repository called its trunk, so on a `master` repo the first publish its
+/// owner ever ran failed on a branch name nobody had chosen.
+///
+/// A trunk that exists beats the branch that happens to be checked out, because
+/// `ortak init` is usually run from the task branch somebody is already on.
+/// Where neither name exists, HEAD is the only thing that knows, and git sets it
+/// before the first commit.
+fn trunk_branch(root: &std::path::Path) -> String {
+    let Ok(repo) = git2::Repository::open(root) else {
+        return "main".to_string();
+    };
+    for name in ["main", "master"] {
+        if repo.find_branch(name, git2::BranchType::Local).is_ok() {
+            return name.to_string();
+        }
+    }
+    repo.find_reference("HEAD")
+        .ok()
+        .and_then(|head| head.symbolic_target().map(str::to_string))
+        .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
+        .unwrap_or_else(|| "main".to_string())
 }
 
 /// How deep to look for hidden repositories. A repo-of-repos keeps them one or
