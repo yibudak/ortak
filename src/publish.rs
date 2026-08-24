@@ -356,7 +356,11 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 .args(["push", "-u", &remote, stack])
                 .status()?;
             if !status.success() {
-                bail!("git push of the base branch {} failed", stack);
+                bail!(
+                    "git push of the base branch {} failed: {}",
+                    stack,
+                    push_advice(&repo, &remote, stack)
+                );
             }
             println!(
                 "pushed base branch {} first; it did not exist on {}",
@@ -380,7 +384,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             .args(&args)
             .status()?;
         if !status.success() {
-            bail!("git push failed");
+            bail!(
+                "git push failed: {}",
+                push_advice(&repo, &remote, &branch_name)
+            );
         }
         if !amend {
             // The command has to match the forge. This printed `tea` wherever it
@@ -728,12 +735,35 @@ fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<S
 /// One contributor pushes to a fork while another pushes to upstream, so this is
 /// a per-clone setting; git config is where per-clone settings already live, and
 /// it survives the `.ortak` wipes that resetting a workspace involves.
-fn remote_for(repo: &Repository, cfg: &Config) -> String {
+pub fn remote_for(repo: &Repository, cfg: &Config) -> String {
     repo.config()
         .and_then(|c| c.get_string("ortak.remote"))
         .ok()
         .or_else(|| cfg.publish.remote.clone())
         .unwrap_or_else(|| "origin".to_string())
+}
+
+/// What a failed push has to say: where it went, and that the branch is already
+/// built, so the way out is a push and not another publish.
+///
+/// A fork owner's first `--push` goes to the upstream they cannot write to,
+/// because `ortak.remote` is unset on a fresh clone and the fallback is origin.
+/// Git's answer is a permission error with nothing about ortak in it, and
+/// re-running the publish after fixing the remote hits "changed nothing since
+/// its last publish": the branch and its high-water mark are already recorded.
+fn push_advice(repo: &Repository, remote: &str, branch: &str) -> String {
+    let url = repo
+        .find_remote(remote)
+        .ok()
+        .and_then(|r| r.url().map(str::to_string))
+        .unwrap_or_else(|| "no remote by that name in this clone".to_string());
+    format!(
+        "it went to {remote} ({url}).\n\
+         The branch {branch} is built and still here, so point ortak at the remote you can\n\
+         write to and push it yourself:\n  \
+         git config ortak.remote <name>\n  \
+         git push <name> {branch}"
+    )
 }
 
 /// Generated branch name. A session that never ran `ortak intent` has no words
@@ -1871,5 +1901,37 @@ mod tests {
             "remote_for shipped on the first branch, not this one: {named:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a fork owner's first push has to come back with: the remote it went
+    /// to, the other one in the clone, and a way out that is not another
+    /// publish, since the publish is already recorded by the time git refuses.
+    #[test]
+    fn a_failed_push_names_the_remote_and_the_way_out() {
+        let root = std::env::temp_dir().join(format!("ortak-advice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = Repository::init(&root).unwrap();
+        repo.remote("origin", "https://example.com/upstream.git")
+            .unwrap();
+
+        let advice = push_advice(&repo, "origin", "task/ortak-2-login");
+        assert!(
+            advice.contains("origin (https://example.com/upstream.git)"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("git config ortak.remote <name>"),
+            "{advice}"
+        );
+        assert!(
+            advice.contains("git push <name> task/ortak-2-login"),
+            "{advice}"
+        );
+        // The other half of the same mistake: ortak.remote naming a remote the
+        // clone does not have. The push fails the same way and the advice still
+        // has to say something true.
+        let advice = push_advice(&repo, "kaan", "task/ortak-2-login");
+        assert!(advice.contains("no remote by that name"), "{advice}");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

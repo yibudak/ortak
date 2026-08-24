@@ -399,6 +399,7 @@ fn init() -> Result<()> {
     let oid = shadow::baseline(&repo)?;
     println!("done ({})", &oid.to_string()[..8]);
     warn_about_ignored_repos(&repo, &ws.root);
+    name_the_push_remote(&root, &cfg);
     println!("\nworkspace ready: {}", ws.root.display());
     println!("next: run `ortak daemon` in another terminal or in the background");
     Ok(())
@@ -426,6 +427,64 @@ fn trunk_branch(root: &std::path::Path) -> String {
         .and_then(|head| head.symbolic_target().map(str::to_string))
         .and_then(|target| target.strip_prefix("refs/heads/").map(str::to_string))
         .unwrap_or_else(|| "main".to_string())
+}
+
+/// Where `ortak publish --push` will push, said once while somebody is reading
+/// the output of `init`.
+///
+/// The remote is per clone and lives in git config, so on a fresh clone it is
+/// unset and the fallback is origin: a fork owner's first push goes to the
+/// upstream they cannot write to. Contributing to a public repository through a
+/// fork is the normal shape of this, not an exotic one, and what git returns is
+/// a permission error with nothing about ortak in it.
+///
+/// It looks rather than asks. A prompt hangs in a script, and nothing on disk
+/// says which remote you can write to anyway, so naming the target and the
+/// one-line change beats guessing at one.
+fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
+    let Ok(repo) = git2::Repository::open(root) else {
+        return;
+    };
+    let Ok(names) = repo.remotes() else {
+        return;
+    };
+    let remotes: Vec<String> = names.iter().flatten().map(str::to_string).collect();
+    if remotes.is_empty() {
+        println!("\nthis clone has no git remote, so `ortak publish --push` has nowhere to push");
+        return;
+    }
+    let chosen = publish::remote_for(&repo, cfg);
+    let url = repo
+        .find_remote(&chosen)
+        .ok()
+        .and_then(|r| r.url().map(str::to_string));
+    match &url {
+        Some(url) => println!("\n`ortak publish --push` pushes to {chosen} ({url})"),
+        None => println!(
+            "\n`ortak publish --push` pushes to {chosen}, and this clone has no remote by that name"
+        ),
+    }
+    // Somebody who has already answered this does not need to be asked again,
+    // unless what they answered names a remote that is not here.
+    let answered = repo
+        .config()
+        .and_then(|c| c.get_string("ortak.remote"))
+        .is_ok()
+        || cfg.publish.remote.is_some();
+    if answered && url.is_some() {
+        return;
+    }
+    let others: Vec<&str> = remotes
+        .iter()
+        .map(String::as_str)
+        .filter(|r| *r != chosen)
+        .collect();
+    if !others.is_empty() {
+        println!(
+            "  other remotes here: {}. Working through a fork? `git config ortak.remote <name>`",
+            others.join(", ")
+        );
+    }
 }
 
 /// How deep to look for hidden repositories. A repo-of-repos keeps them one or
