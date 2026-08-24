@@ -381,9 +381,6 @@ fn process(
     )?;
     db.apply_edit_regions(session_id, rel, &hunks)?;
     // Only now. Everything above can fail, and a hint consumed ahead of its
-    // commit is not there for the retry.
-    db.clear_hints(rel)?;
-    // Only now. Everything above can fail, and a hint consumed ahead of its
     // commit is not there for the retry: the change lands on the human and the
     // regions of every session working in this file stop being shifted.
     db.clear_hints(rel)?;
