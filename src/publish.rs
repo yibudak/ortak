@@ -389,7 +389,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
 ///
 /// The two are one function because they are ordered, and nothing else says so.
 /// Both read the same `regions` rows: the scan asks which lines this session
-/// owns so it can read the names they define, and the release hands those very
+/// owns so it can read the names they define, and the cooling hands those very
 /// lines back. Taken in the other order the scan sees a session that owns
 /// nothing and reports nothing, which is what it did from the round it shipped
 /// in until the row happened to survive a publish.
@@ -1664,6 +1664,57 @@ mod tests {
         assert_eq!(affected[0].name, "remote_for");
         assert_eq!(affected[0].file, "caller.py");
         assert_eq!(affected[0].session, theirs);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same session's second deliverable, on a file nobody else references.
+    /// The first branch's lines are cooled by then, and a scan that still reads
+    /// them reports the first branch's blast radius against the second.
+    ///
+    /// A session four deliverables in would get four deliverables' worth of
+    /// names that way, and a report wrong three times is not read a fourth.
+    #[test]
+    fn a_second_publish_scans_only_what_it_is_shipping() {
+        let dir = std::env::temp_dir().join(format!("ortak-second-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.py"), "def remote_for(cfg):\n    return cfg\n").unwrap();
+        // other.py has to define something, or the second scan finds nothing
+        // because there was nothing to find and the test passes for free.
+        std::fs::write(dir.join("other.py"), "def nobody_calls_this():\n    pass\n").unwrap();
+        std::fs::write(dir.join("caller.py"), "value = remote_for(config)\n").unwrap();
+
+        let ws = Workspace::at(&dir);
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let theirs = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        db.insert_edit(theirs, "caller.py", "modify", None, &[], None)
+            .unwrap();
+        let first_line = [crate::regions::Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+        }];
+        let publish = |file: &str| {
+            let files = vec![(file.to_string(), "modify".to_string())];
+            free_lines_and_scan(&ws, &Config::default(), &db, mine, &files).unwrap()
+        };
+
+        db.apply_edit_regions(mine, "lib.py", &first_line).unwrap();
+        let (cooled, affected) = publish("lib.py");
+        assert_eq!(cooled, 1);
+        assert_eq!(affected.len(), 1, "the first branch does touch remote_for");
+
+        db.apply_edit_regions(mine, "other.py", &first_line)
+            .unwrap();
+        let (cooled, affected) = publish("other.py");
+        assert_eq!(cooled, 1);
+        let named: Vec<&str> = affected.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            named.is_empty(),
+            "remote_for shipped on the first branch, not this one: {named:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
