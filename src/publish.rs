@@ -234,12 +234,12 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         db.record_publish(session.id, &branch_name, head_edit)?;
     }
 
-    // The work is out, so the lines are free. Until now only presence_minutes
-    // ever cooled a region, and a session that had published and moved on kept
-    // the gate pointed at code it was finished with.
-    let mut released = 0;
+    // The work is out, so the lines are free. Cooled rather than dropped: the
+    // session did write these lines, and deleting the region took blame's only
+    // record of that with it while `ortak log` kept the edit.
+    let mut cooled = 0;
     for (file, _) in &files {
-        released += db.release_regions(session.id, Some(file))?;
+        cooled += db.cool_regions(session.id, file)?;
     }
 
     println!(
@@ -256,10 +256,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     for (f, k) in &files {
         println!("  {} {}", k, f);
     }
-    if released > 0 {
+    if cooled > 0 {
         println!(
-            "released {} protected region(s) on those files; other sessions may edit them now",
-            released
+            "freed {} protected region(s) on those files; other sessions may edit them now, and `ortak blame` still names this session",
+            cooled
         );
     }
     // After the file list, never before it: someone skimming the output has to

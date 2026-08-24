@@ -250,7 +250,10 @@ CREATE TABLE IF NOT EXISTS regions (
   file       TEXT NOT NULL,
   start_line INTEGER NOT NULL,
   end_line   INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  -- The work shipped and the lines are free, but the session still wrote them.
+  -- The gate skips a cooled row; blame reads it.
+  cooled     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_regions_file ON regions(file);
 CREATE TABLE IF NOT EXISTS errors (
@@ -317,6 +320,10 @@ impl Db {
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN blob TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE edits ADD COLUMN disowned INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE regions ADD COLUMN cooled INTEGER NOT NULL DEFAULT 0",
             [],
         );
         Ok(Db { conn })
@@ -802,6 +809,22 @@ impl Db {
         Ok((regions, edits))
     }
 
+    /// Free a session's lines on a file it has just published, keeping the row
+    /// so blame can still answer for them. Returns how many were cooled.
+    ///
+    /// Publish used to delete these, which freed the lines and lost the only
+    /// record of who wrote them: `ortak log` still had the edit while `blame`
+    /// said the file was as the base branch left it. A release deletes because
+    /// it means "this was never mine"; a publish means "this shipped", and the
+    /// session did write it.
+    pub fn cool_regions(&self, session_id: i64, file: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE regions SET cooled = 1
+             WHERE session_id = ?1 AND file = ?2 AND cooled = 0",
+            params![session_id, file],
+        )?)
+    }
+
     /// After journaling an edit: shift every existing region on the file
     /// through the edit's hunks, drop regions the edit overwrote, and record
     /// the editor's own new regions (merged with what it already owned).
@@ -820,7 +843,9 @@ impl Db {
         for (id, sid, start, end) in rows {
             let mapped = regions::map_region(hunks, Region { start, end });
             if sid == session_id {
-                // Own regions are rebuilt below, merged with the new hunks.
+                // Own regions are rebuilt below, merged with the new hunks. A
+                // cooled one comes back hot, which is right: the session is
+                // editing this file again, so it is working here again.
                 if let Some(r) = mapped {
                     mine.push(r);
                 }
@@ -869,6 +894,7 @@ impl Db {
                       WHERE e.session_id = r.session_id AND e.file = r.file) AS last_ts
              FROM regions r JOIN sessions s ON s.id = r.session_id
              WHERE r.file = ?1 AND r.session_id != ?2 AND s.status = 'active'
+               AND r.cooled = 0
                AND r.start_line <= ?3 AND r.end_line >= ?4
                AND (SELECT MAX(e.ts) FROM edits e
                      WHERE e.session_id = r.session_id AND e.file = r.file) >= ?5",
@@ -909,9 +935,10 @@ impl Db {
     }
 
     /// Every region recorded on one file, ordered down the file. Unlike
-    /// `fresh_regions` this ignores presence and session status: the point of
-    /// blame is that a line still belongs to whoever wrote it long after that
-    /// session ended.
+    /// `fresh_regions` this ignores presence, session status and cooling: the
+    /// point of blame is that a line still belongs to whoever wrote it long
+    /// after that session ended, and publishing frees a line rather than
+    /// unwriting it.
     pub fn file_regions(&self, file: &str) -> Result<Vec<Owner>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
@@ -942,7 +969,9 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// A session's live regions: the ranges it currently owns, file by file.
+    /// The ranges a session wrote, file by file, cooled or not: `publish` scans
+    /// for impact after cooling its own lines, and a scan that skipped them
+    /// would report nothing on exactly the run that needs it.
     pub fn session_regions(&self, session_id: i64) -> Result<Vec<(String, i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT file, start_line, end_line FROM regions WHERE session_id = ?1
@@ -1022,7 +1051,7 @@ impl Db {
                     (SELECT MAX(e.ts) FROM edits e
                       WHERE e.session_id = r.session_id AND e.file = r.file) AS last_ts
              FROM regions r JOIN sessions s ON s.id = r.session_id
-             WHERE s.status = 'active'
+             WHERE s.status = 'active' AND r.cooled = 0
                AND (SELECT MAX(e.ts) FROM edits e
                      WHERE e.session_id = r.session_id AND e.file = r.file) >= ?1
              ORDER BY r.file, r.start_line",
@@ -1849,5 +1878,60 @@ mod tests {
         assert_eq!(o.secs(), 2);
         assert!(o.recent(o.end + 60), "this is the one being asked about");
         assert!(!o.recent(o.end + OUTAGE_RECENT_SECS + 1));
+    }
+
+    /// After a publish, the three answers must agree: the gate lets the lines
+    /// go, blame still names who wrote them, and the branch is not rebuilt from
+    /// them a second time.
+    #[test]
+    fn a_published_file_stays_answerable_after_its_lines_go_free() {
+        let db = db();
+        let author = session(&db, "claude-a");
+        let onlooker = session(&db, "claude-b");
+        owns(&db, author, "src/publish.rs", 10, 5);
+        let hot = || {
+            db.conflicts(
+                "src/publish.rs",
+                &[Region { start: 12, end: 12 }],
+                onlooker,
+                3,
+                1800,
+            )
+            .unwrap()
+        };
+        assert_eq!(hot().len(), 1);
+
+        let head = db.max_edit_id(author).unwrap().unwrap();
+        assert_eq!(db.cool_regions(author, "src/publish.rs").unwrap(), 1);
+
+        assert!(hot().is_empty(), "published lines are free");
+        assert!(
+            db.fresh_regions(1800).unwrap().is_empty(),
+            "and the gate stops advertising them"
+        );
+        let owners = db.file_regions("src/publish.rs").unwrap();
+        assert_eq!(owners.len(), 1, "blame still answers for them");
+        assert_eq!(owners[0].session_id, author);
+        assert_eq!(
+            db.session_files(author, 0).unwrap().len(),
+            1,
+            "and the edit is still the session's work"
+        );
+        assert!(
+            db.session_files(author, head).unwrap().is_empty(),
+            "the next publish does not ship it again"
+        );
+
+        // Cooling twice, as a second publish of the same file would, is not a
+        // second freeing.
+        assert_eq!(db.cool_regions(author, "src/publish.rs").unwrap(), 0);
+
+        // A release is the other case and stays the other case: the session
+        // says the lines were never its work, so blame goes quiet too.
+        assert_eq!(
+            db.release_regions(author, Some("src/publish.rs")).unwrap(),
+            1
+        );
+        assert!(db.file_regions("src/publish.rs").unwrap().is_empty());
     }
 }
