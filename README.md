@@ -81,6 +81,38 @@ registers, everything it writes lands on `human` in the journal, and
 `ortak publish` has no branch to build for it. Restart or resume it to pick the
 hooks up.
 
+## What ortak can see
+
+ortak records a change when two things are true: it happened inside the
+workspace the daemon watches, and a hook told the daemon who made it. An edit
+written with your agent's edit tools, in the workspace, satisfies both. Every
+gap below is one of the two failing.
+
+A git worktree is another directory, so the daemon never sees it. That is the
+usual reason `ortak log` is empty after a busy afternoon: the session registered
+in one directory and did its work in `/tmp/wt-fix`. `ortak publish` reads the
+same journal, so it has nothing to build either, and the other sessions reading
+`ortak status` see a session that has done nothing all day.
+
+A shell command that writes a file is a weaker signal than an edit tool. The
+edit hooks name the file before it is written; `sed -i`, a heredoc, a formatter
+or a code generator name nothing, so the daemon takes the owner from whichever
+session has a command open at the time and marks the row as inferred. `ortak
+log` and `ortak blame` print that mark, and those rows are the ones to check
+when attribution looks wrong. While two sessions have commands running the
+daemon declines to guess at all and the change lands on `human`, which keeps
+that edit out of your branch and beats crediting the other session for it.
+
+Answering review used to send work out of the workspace as well, since a pushed
+branch is a git operation and ortak had nothing for it.
+`ortak publish <session> --amend --branch <branch>` rebuilds a branch from the
+journal instead, including one this session never published: whatever is already
+committed on the branch stays, and the session's newer edits go on top of it.
+
+When a file is credited to a session that did not write it,
+`ortak release <session> <file>` gives the lines back and drops the gate's hold
+on them, rather than waiting out `presence_minutes`.
+
 ## Workspaces and repository layout
 
 One workspace belongs to one git repository. `ortak publish` builds its branch in the repository at the workspace root, so run `ortak init` at the root of the repository the work should land in.
