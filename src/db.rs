@@ -128,8 +128,22 @@ pub struct Message {
     pub id: i64,
     pub from_session: i64,
     pub from_name: String,
+    /// Who it was addressed to. Usually the session reading it, and worth
+    /// carrying for the case where it is not: a message handed to the next
+    /// session because the one it was sent to has stopped.
+    pub to_session: i64,
     pub text: String,
     pub ts: i64,
+}
+
+/// One session's undelivered mail, as `status` reports it.
+#[derive(Debug, Clone)]
+pub struct Waiting {
+    pub session_id: i64,
+    pub agent_name: String,
+    pub stopped: bool,
+    pub count: i64,
+    pub oldest: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -964,7 +978,7 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         let out = {
             let mut stmt = tx.prepare(
-                "SELECT m.id, m.from_session, s.agent_name, m.text, m.ts
+                "SELECT m.id, m.from_session, s.agent_name, m.to_session, m.text, m.ts
                  FROM messages m JOIN sessions s ON s.id = m.from_session
                  WHERE m.to_session = ?1 AND m.delivered_at IS NULL
                  ORDER BY m.id",
@@ -981,10 +995,67 @@ impl Db {
         Ok(out)
     }
 
+    /// Messages still waiting for sessions that have stopped, handed to
+    /// `reader` and stamped delivered.
+    ///
+    /// The last thing a session says is usually its handover, and it says it
+    /// when the other session is least likely to be listening. Delivery hangs
+    /// off the recipient doing something, so a recipient that has finished
+    /// never collects: round 6 ended with the handover sitting in the table.
+    /// The next session to start in this workspace is the closest thing that
+    /// message has to its reader.
+    ///
+    /// Only a clean `SessionEnd` marks a session done. One killed mid-turn
+    /// leaves its row active and its mail here, where `waiting_messages` still
+    /// reports it: guessing that a quiet session is gone would hand its mail to
+    /// somebody else while it was still working.
+    pub fn take_orphan_messages(&self, reader: i64) -> Result<Vec<Message>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let stopped = "delivered_at IS NULL AND to_session != ?1
+                       AND to_session IN (SELECT id FROM sessions WHERE status = 'done')";
+        let out = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT m.id, m.from_session, s.agent_name, m.to_session, m.text, m.ts
+                 FROM messages m JOIN sessions s ON s.id = m.from_session
+                 WHERE {stopped} ORDER BY m.id"
+            ))?;
+            let rows = stmt.query_map(params![reader], row_to_message)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            &format!("UPDATE messages SET delivered_at = ?2 WHERE {stopped}"),
+            params![reader, now_ts()],
+        )?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Who has undelivered mail, so a message nobody ever collects is visible
+    /// to the person rather than only to the table.
+    pub fn waiting_messages(&self) -> Result<Vec<Waiting>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.to_session, s.agent_name, s.status, COUNT(*), MIN(m.ts)
+             FROM messages m JOIN sessions s ON s.id = m.to_session
+             WHERE m.delivered_at IS NULL
+             GROUP BY m.to_session, s.agent_name, s.status
+             ORDER BY m.to_session",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Waiting {
+                session_id: r.get(0)?,
+                agent_name: r.get(1)?,
+                stopped: r.get::<_, String>(2)? == "done",
+                count: r.get(3)?,
+                oldest: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Everything a session has been sent, oldest first, for a person looking.
     pub fn inbox(&self, session_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.from_session, s.agent_name, m.text, m.ts
+            "SELECT m.id, m.from_session, s.agent_name, m.to_session, m.text, m.ts
              FROM messages m JOIN sessions s ON s.id = m.from_session
              WHERE m.to_session = ?1 ORDER BY m.id",
         )?;
@@ -1170,8 +1241,9 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         id: r.get(0)?,
         from_session: r.get(1)?,
         from_name: r.get(2)?,
-        text: r.get(3)?,
-        ts: r.get(4)?,
+        to_session: r.get(3)?,
+        text: r.get(4)?,
+        ts: r.get(5)?,
     })
 }
 
@@ -1397,6 +1469,59 @@ mod tests {
         assert!(texts(db.take_messages(b).unwrap()).is_empty());
         // The person looking still sees it afterwards.
         assert_eq!(db.inbox(b).unwrap().len(), 1);
+    }
+
+    /// How round 6 ended: nine messages delivered and the tenth, the handover,
+    /// addressed to a session that had finished.
+    #[test]
+    fn a_message_to_a_session_that_stopped_reaches_the_next_one() {
+        let db = temp_db("messages-orphan");
+        let a = agent(&db, "sess-a");
+        let gone = agent(&db, "sess-gone");
+        let live = agent(&db, "sess-live");
+        db.send_message(a, gone, "round done my end: 51 stale-branch warning")
+            .unwrap();
+        db.send_message(a, live, "publish.rs is mid-refactor")
+            .unwrap();
+        db.end_session("sess-gone").unwrap();
+
+        let next = agent(&db, "sess-next");
+        assert_eq!(
+            texts(db.take_orphan_messages(next).unwrap()),
+            vec!["round done my end: 51 stale-branch warning"]
+        );
+        // Once. The session after this one inherits nothing.
+        assert!(db.take_orphan_messages(next).unwrap().is_empty());
+        // And a live session's mail is nobody else's to read.
+        assert_eq!(
+            texts(db.take_messages(live).unwrap()),
+            vec!["publish.rs is mid-refactor"]
+        );
+    }
+
+    /// A session killed mid-turn never fires SessionEnd, so its row stays
+    /// active and its mail stays addressed to it. Handing that to somebody else
+    /// would take it from a session that is still working, so status reports it
+    /// instead.
+    #[test]
+    fn mail_for_a_session_that_never_stopped_is_reported_not_reassigned() {
+        let db = temp_db("messages-waiting");
+        let a = agent(&db, "sess-a");
+        let killed = agent(&db, "sess-killed");
+        db.send_message(a, killed, "the gate denied me on src/db.rs")
+            .unwrap();
+
+        let next = agent(&db, "sess-next");
+        assert!(db.take_orphan_messages(next).unwrap().is_empty());
+
+        let waiting = db.waiting_messages().unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].session_id, killed);
+        assert_eq!(waiting[0].count, 1);
+        assert!(!waiting[0].stopped);
+        // Delivered mail is not waiting mail.
+        db.take_messages(killed).unwrap();
+        assert!(db.waiting_messages().unwrap().is_empty());
     }
 
     #[test]

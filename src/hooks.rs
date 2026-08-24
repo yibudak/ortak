@@ -107,6 +107,10 @@ pub fn session_start() -> Result<()> {
         Some(w) => format!("{context}\n\n{w}"),
         None => context,
     };
+    let context = match inherited_messages(&db, id)? {
+        Some(block) => format!("{context}\n\n{block}"),
+        None => context,
+    };
     let out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -115,6 +119,31 @@ pub fn session_start() -> Result<()> {
     });
     println!("{}", out);
     Ok(())
+}
+
+/// Mail this session is inheriting: sent to a session that has since stopped,
+/// and never read.
+///
+/// The other doors need their recipient to do something. A session that has
+/// finished does nothing ever again, so its last message, which is usually the
+/// handover, waits in the table for a turn that is not coming. This is the one
+/// moment a workspace has a reader who is not busy.
+fn inherited_messages(db: &Db, me: i64) -> Result<Option<String>> {
+    let waiting = db.take_orphan_messages(me)?;
+    if waiting.is_empty() {
+        return Ok(None);
+    }
+    let mut block = String::from(
+        "ortak MESSAGES left for sessions that have stopped. They were not addressed to you: \
+         the session each went to ended before reading it, and you are the next session here.",
+    );
+    for m in &waiting {
+        block.push_str(&format!(
+            "\n- ortak-{} {}, sent to ortak-{}: {}",
+            m.from_session, m.from_name, m.to_session, m.text
+        ));
+    }
+    Ok(Some(block))
 }
 
 pub fn post_edit() -> Result<()> {
