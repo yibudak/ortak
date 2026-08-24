@@ -406,6 +406,12 @@ fn init() -> Result<()> {
 /// one-line change beats guessing at one.
 fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
     let Ok(repo) = git2::Repository::open(root) else {
+        // Not an error: the journal and the gate work fine without git. But
+        // "workspace ready" is the only thing init said, and publishing is the
+        // reason the workspace exists, so say the one thing that will not work.
+        println!(
+            "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
+        );
         return;
     };
     let Ok(names) = repo.remotes() else {
