@@ -642,6 +642,7 @@ fn status(as_json: bool) -> Result<()> {
     }
     println!();
     print_sessions(&db)?;
+    print_waiting_messages(&db)?;
     let hot = db.fresh_regions(cfg.gate.presence_minutes * 60)?;
     if !hot.is_empty() {
         println!("\nhot regions protected by the gate:");
@@ -821,6 +822,36 @@ fn sessions() -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
     print_sessions(&db)
+}
+
+/// Who is holding unread mail. Silent when there is none, which is the normal
+/// case: a message reaches a working session before its next tool call.
+///
+/// The queue nobody drains is the failure this reports. A message for a session
+/// that stopped cleanly goes to the next session that starts here, but one
+/// whose recipient was killed mid-turn is addressed to a session that still
+/// looks active and never will be, and nothing but this line would say so.
+fn print_waiting_messages(db: &Db) -> Result<()> {
+    let waiting = db.waiting_messages()?;
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let now = db::now_ts();
+    println!("\nmessages waiting:");
+    for w in &waiting {
+        println!(
+            "  ortak-{} {}{}: {}, oldest {}",
+            w.session_id,
+            w.agent_name,
+            if w.stopped { " [stopped]" } else { "" },
+            w.count,
+            ago(now - w.oldest)
+        );
+    }
+    if waiting.iter().any(|w| w.stopped) {
+        println!("  a stopped session's mail goes to the next session that starts here; `ortak inbox ortak-N` reads it now");
+    }
+    Ok(())
 }
 
 fn print_sessions(db: &Db) -> Result<()> {
@@ -1095,6 +1126,17 @@ fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()
     }
     let recipient = db.resolve_session(to)?;
     db.send_message(sender, recipient.id, &text)?;
+    // Saying where it went matters most when the answer is not "to them": a
+    // message to a session that has finished used to report success and then
+    // sit in the table for good.
+    if recipient.status == "done" {
+        println!(
+            "ortak-{} {} has stopped. This goes to the next session that starts in this \
+             workspace, and `ortak inbox ortak-{}` reads it before then.",
+            recipient.id, recipient.agent_name, recipient.id
+        );
+        return Ok(());
+    }
     println!(
         "sent to ortak-{} {}; it arrives before that session's next edit or command, or at its \
          next prompt, whichever comes first.",
