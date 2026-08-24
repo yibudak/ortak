@@ -846,7 +846,8 @@ fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()
     let recipient = db.resolve_session(to)?;
     db.send_message(sender, recipient.id, &text)?;
     println!(
-        "sent to ortak-{} {}; it arrives at the start of that session's next turn.",
+        "sent to ortak-{} {}; it arrives before that session's next edit or command, or at its \
+         next prompt, whichever comes first.",
         recipient.id, recipient.agent_name
     );
     Ok(())

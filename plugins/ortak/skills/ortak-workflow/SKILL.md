@@ -69,8 +69,9 @@ ortak publish ortak-N --push   # push the branch; use the printed tea command to
 
 When you change something another session depends on, such as a function
 signature, a schema, or a file you are rewriting, say so. The message reaches
-the other session at the start of its next turn, so it does not find out from a
-broken build:
+the other session before its next edit or command, so an agent that is halfway
+through an hour of work reads it there rather than finding out from a broken
+build:
 
 ```bash
 ortak tell ortak-3 "I renamed take_hint to peek_snapshots, your daemon call needs updating" --from ortak-N
