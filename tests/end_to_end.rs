@@ -321,6 +321,16 @@ impl Live {
             "baseline",
         ])?;
         run(&root, ORTAK, &["init"])?;
+        // #63 declines a report naming a file another session wrote in the last
+        // ninety seconds, which in a test that runs in four is every file, so
+        // the stop-the-line scenario would never reach the assignment it is
+        // about. Turning the window off keeps this test measuring one thing.
+        // A no-op until #63 lands, since the key is not in the file before it.
+        let cfg = root.join("ortak.toml");
+        let text = std::fs::read_to_string(&cfg)
+            .map_err(|e| e.to_string())?
+            .replace("mid_write_seconds = 90", "mid_write_seconds = 0");
+        std::fs::write(&cfg, text).map_err(|e| e.to_string())?;
 
         let daemon = Command::new(ORTAK)
             .arg("daemon")
