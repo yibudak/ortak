@@ -788,6 +788,37 @@ impl Db {
         )?)
     }
 
+    /// The first edit this session made after `after` to any of `files`.
+    ///
+    /// Publish stops its high-water mark just short of this, so a file held
+    /// back by `--exclude` or left out of the replay is picked up by the next
+    /// publish. The mark used to advance to the session's newest edit whatever
+    /// shipped, which put the held-back file behind it for good: no incremental
+    /// publish would look that far back again.
+    pub fn first_edit_on(
+        &self,
+        session_id: i64,
+        after: i64,
+        files: &[String],
+    ) -> Result<Option<i64>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, file FROM edits WHERE session_id = ?1 AND id > ?2 ORDER BY id")?;
+        let rows = stmt.query_map(params![session_id, after], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, file) = row?;
+            if files.iter().any(|f| f == &file) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether any other session has journaled an edit to this file.
     pub fn shared_file(&self, session_id: i64, file: &str) -> Result<bool> {
         Ok(self
