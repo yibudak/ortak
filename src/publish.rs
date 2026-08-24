@@ -147,7 +147,12 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // so a checkout that never caught up with the base fails it on every
         // file at once. That reads exactly like a collision with another
         // session, and the message below used to say so.
-        Err(e) => match commits_behind(&repo, &base_commit) {
+        // Only when the base is the one this workspace tracks. A publish that
+        // names another branch with --base is deliberately stacking on work the
+        // checkout does not have, so being behind it is the point rather than
+        // the fault, and saying "update the checkout" there sends the reader to
+        // fix the one thing that is not wrong.
+        Err(e) => match commits_behind(&repo, &base_commit).filter(|_| base_override.is_none()) {
             Some(n) => bail!(
                 "{e}\n\nthis workspace is {n} commit(s) behind {base}, which is enough on its own to fail the replay: publish rebuilds each file on {base}'s content, not on the older content you have been editing. Update the checkout and publish again; --exclude will not help while it is behind."
             ),
@@ -848,6 +853,34 @@ mod tests {
         assert!(err.contains("app.py"), "{err}");
         assert!(err.contains("--exclude app.py"), "{err}");
         assert!(!err.contains("another session's edits"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Stacking on another branch means the checkout is behind it by design, so
+    /// the count is real and the explanation is wrong: it sends the reader to
+    /// update a checkout that is exactly where it should be, and says nothing
+    /// about the clash that actually stopped the replay.
+    #[test]
+    fn a_deliberate_stack_is_not_a_stale_checkout() {
+        let (dir, repo) = scratch("stacked");
+        let here = commit(&repo, None, Some(&lines(&[])));
+        let here = repo.find_commit(here).unwrap();
+        let stack_onto = commit_file(&repo, Some(&here), "dep.py", &lines(&[(3, "THEIRS")]));
+        let stack_onto = repo.find_commit(stack_onto).unwrap();
+
+        // The count itself is honest either way.
+        assert_eq!(commits_behind(&repo, &stack_onto), Some(1));
+
+        // What changes is whether it is worth saying. `--base` present means no.
+        let explained = |override_: Option<&str>| {
+            commits_behind(&repo, &stack_onto).filter(|_| override_.is_none())
+        };
+        assert_eq!(explained(None), Some(1), "no --base: the checkout is stale");
+        assert_eq!(
+            explained(Some("feat/other")),
+            None,
+            "--base: behind is the point of stacking"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
