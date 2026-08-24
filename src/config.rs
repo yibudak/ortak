@@ -21,16 +21,26 @@ pub struct LineCfg {
     /// How far back edits are considered when hunting an error's culprit.
     #[serde(default = "default_lookback")]
     pub blame_lookback_minutes: i64,
+    /// How recently another session must have written a file for a failure
+    /// naming it to read as a file caught mid-edit rather than a breakage.
+    /// Zero turns the check off.
+    #[serde(default = "default_mid_write")]
+    pub mid_write_seconds: i64,
 }
 
 fn default_lookback() -> i64 {
     120
 }
 
+fn default_mid_write() -> i64 {
+    90
+}
+
 impl Default for LineCfg {
     fn default() -> Self {
         LineCfg {
             blame_lookback_minutes: default_lookback(),
+            mid_write_seconds: default_mid_write(),
         }
     }
 }
@@ -174,6 +184,10 @@ presence_minutes = 30
 [line]
 # Search this many minutes of edit history when assigning an error
 blame_lookback_minutes = 120
+# Decline to stop the line when the failure names a file another session wrote
+# this recently: a half-written file fails and then builds again on its own.
+# Set to 0 to report regardless.
+mid_write_seconds = 90
 
 [orchestrator]
 # LLM arbiter for conflicts and ambiguous error ownership. Disabled by default.
