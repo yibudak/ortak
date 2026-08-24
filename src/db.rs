@@ -1000,25 +1000,35 @@ impl Db {
         attributed_by: Option<Attribution>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(i64, i64, i64, i64, Option<String>)> = {
+        let rows: Vec<(i64, i64, i64, i64, Option<String>, i64)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, session_id, start_line, end_line, attributed_by FROM regions
+                "SELECT id, session_id, start_line, end_line, attributed_by, cooled FROM regions
                  WHERE file = ?1",
             )?;
             let iter = stmt.query_map(params![file], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?;
             iter.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut mine: Vec<(Region, Option<String>)> = Vec::new();
-        for (id, sid, start, end, how) in rows {
+        let mut mine: Vec<(Region, Option<String>, i64)> = Vec::new();
+        for (id, sid, start, end, how, cooled) in rows {
             let mapped = regions::map_region(hunks, Region { start, end });
             if sid == session_id {
-                // Own regions are rebuilt below, merged with the new hunks. A
-                // cooled one comes back hot, which is right: the session is
-                // editing this file again, so it is working here again.
+                // Own regions are rebuilt below, merged with the new hunks.
+                // Only the lines this edit touches come back hot: the session is
+                // working there again, and nowhere else. Re-hotting the whole
+                // file put every published line of it back on the gate, and made
+                // `cooled = 0` stop meaning "what this branch ships" for the
+                // scan that reads it.
                 if let Some(r) = mapped {
-                    mine.push((r, how));
+                    mine.push((r, how, cooled));
                 }
                 tx.execute("DELETE FROM regions WHERE id = ?1", params![id])?;
             } else {
@@ -1040,29 +1050,29 @@ impl Db {
         // of them, and the line was last written by this edit.
         let fresh = regions::regions_from_hunks(hunks);
         let how = attributed_by.map(|a| a.as_str().to_string());
-        let mut claims: Vec<(Region, Option<String>)> = mine
+        let mut claims: Vec<(Region, Option<String>, i64)> = mine
             .into_iter()
-            .flat_map(|(r, was)| {
+            .flat_map(|(r, was, cooled)| {
                 regions::subtract(r, &fresh)
                     .into_iter()
-                    .map(move |r| (r, was.clone()))
+                    .map(move |r| (r, was.clone(), cooled))
             })
             .collect();
-        claims.extend(fresh.into_iter().map(|r| (r, how.clone())));
+        claims.extend(fresh.into_iter().map(|r| (r, how.clone(), 0)));
         // Merged within one attribution and no further. Coalescing a contested
         // range into the ordinary one beside it puts the marker back on lines
         // nobody contested, which is what this column exists to stop.
-        let mut by_how: BTreeMap<Option<String>, Vec<Region>> = BTreeMap::new();
-        for (r, was) in claims {
-            by_how.entry(was).or_default().push(r);
+        let mut by_how: BTreeMap<(Option<String>, i64), Vec<Region>> = BTreeMap::new();
+        for (r, was, cooled) in claims {
+            by_how.entry((was, cooled)).or_default().push(r);
         }
-        for (was, ranges) in by_how {
+        for ((was, cooled), ranges) in by_how {
             for r in regions::merge(ranges) {
                 tx.execute(
                     "INSERT INTO regions
-                       (session_id, file, start_line, end_line, updated_at, attributed_by)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![session_id, file, r.start, r.end, now_ts(), was],
+                       (session_id, file, start_line, end_line, updated_at, attributed_by, cooled)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![session_id, file, r.start, r.end, now_ts(), was, cooled],
                 )?;
             }
         }
@@ -2538,6 +2548,72 @@ mod tests {
         assert_eq!(o.secs(), 2);
         assert!(o.recent(o.end + 60), "this is the one being asked about");
         assert!(!o.recent(o.end + OUTAGE_RECENT_SECS + 1));
+    }
+
+    /// B measured this in round 8 and A wrote it up: a published file that the
+    /// session comes back to had every one of its lines put back on the gate,
+    /// not just the ones edited, so the scan that reads `cooled = 0` to find out
+    /// what a branch is shipping was told the whole file.
+    #[test]
+    fn editing_a_published_file_re_hots_only_the_lines_edited() {
+        let db = db();
+        let me = session(&db, "claude-a");
+        // Two separate stretches of one file, both shipped.
+        owns(&db, me, "publish.rs", 10, 5);
+        owns(&db, me, "publish.rs", 80, 5);
+        assert_eq!(db.cool_regions(me, "publish.rs").unwrap(), 2);
+
+        // Back for one of them, in a different part of the file.
+        owns(&db, me, "publish.rs", 80, 5);
+
+        let state = |cooled: i64| -> Vec<(i64, i64)> {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT start_line, end_line FROM regions
+                      WHERE session_id = ?1 AND file = ?2 AND cooled = ?3
+                      ORDER BY start_line",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(params![me, "publish.rs", cooled], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            state(0),
+            vec![(80, 84)],
+            "only what was written again is hot"
+        );
+        assert_eq!(state(1), vec![(10, 14)], "the rest is still shipped");
+
+        // And the gate agrees: the cooled stretch is still free.
+        let onlooker = session(&db, "claude-b");
+        assert!(db
+            .conflicts(
+                "publish.rs",
+                &[Region { start: 12, end: 12 }],
+                onlooker,
+                3,
+                1800
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.conflicts(
+                "publish.rs",
+                &[Region { start: 82, end: 82 }],
+                onlooker,
+                3,
+                1800
+            )
+            .unwrap()
+            .len(),
+            1,
+            "and defends the lines the session came back to"
+        );
     }
 
     /// After a publish, the three answers must agree: the gate lets the lines
