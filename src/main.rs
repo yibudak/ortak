@@ -618,27 +618,46 @@ fn blame(target: &str) -> Result<()> {
     let now = db::now_ts();
 
     if let Some(line) = line {
-        let Some(o) = owners.iter().find(|o| o.start <= line && line <= o.end) else {
+        // Every owner, not the first one found. The gate lets two sessions hold
+        // ranges that overlap at a line, and blame is what a denied session
+        // reads to find out who is in its way: naming one of two, with nothing
+        // to say a second exists, sent people looking at the wrong session.
+        let mut at: Vec<&db::Owner> = owners
+            .iter()
+            .filter(|o| o.start <= line && line <= o.end)
+            .collect();
+        // `file_regions` reads in line order, which is right for a whole file
+        // and wrong for one line: the session that wrote it last is the one the
+        // reader is asking about.
+        at.sort_by_key(|o| std::cmp::Reverse(o.last_ts));
+        if at.is_empty() {
             println!(
                 "no session has touched line {} of {}; it is as the base branch left it",
                 line, rel
             );
             return Ok(());
-        };
-        println!(
-            "{}:{} - ortak-{} {}, {}{}",
-            rel,
-            line,
-            o.session_id,
-            o.agent_name,
-            ago(now - o.last_ts),
-            owner_note(o)
-        );
-        println!(
-            "  owns {}, intent: {}",
-            range(o),
-            o.intent.as_deref().unwrap_or("(not reported)")
-        );
+        }
+        println!("{}:{}", rel, line);
+        for o in &at {
+            println!(
+                "  ortak-{} {}, {}{}",
+                o.session_id,
+                o.agent_name,
+                ago(now - o.last_ts),
+                owner_note(o)
+            );
+            println!(
+                "    owns {}, intent: {}",
+                range(o),
+                o.intent.as_deref().unwrap_or("(not reported)")
+            );
+        }
+        if at.len() > 1 {
+            println!(
+                "  {} sessions hold this line; the newest write is listed first",
+                at.len()
+            );
+        }
         return Ok(());
     }
 
