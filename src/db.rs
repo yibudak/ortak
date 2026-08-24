@@ -49,10 +49,17 @@ pub struct Session {
 /// evidence; a Bash claim is an inference, and one the daemon is allowed to
 /// decline. Absent on a row means neither applied and the change fell to the
 /// human session.
+///
+/// `Claimed` is the odd one out: nobody watched that write at all. A session ran
+/// `ortak claim` afterwards and the journal was told. It is kept apart from
+/// `Claim`, which is the daemon guessing from a command that was running at the
+/// time, because a reader deciding whether to believe a row wants to know which
+/// of the two happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attribution {
     Hook,
     Claim,
+    Claimed,
 }
 
 impl Attribution {
@@ -60,6 +67,7 @@ impl Attribution {
         match self {
             Attribution::Hook => "hook",
             Attribution::Claim => "claim",
+            Attribution::Claimed => "claimed",
         }
     }
 }
@@ -84,6 +92,13 @@ impl EditRow {
     /// a marked row is the one worth a second look.
     pub fn inferred(&self) -> bool {
         self.attributed_by.as_deref() == Some(Attribution::Claim.as_str())
+    }
+
+    /// Whether this row was moved here by `ortak claim` rather than journaled
+    /// as it happened. A repair that reads like an ordinary edit is a lie the
+    /// journal is telling, so it says which rows it was told about.
+    pub fn claimed(&self) -> bool {
+        self.attributed_by.as_deref() == Some(Attribution::Claimed.as_str())
     }
 }
 
@@ -151,6 +166,12 @@ pub struct Owner {
     pub start: i64,
     pub end: i64,
     pub last_ts: i64,
+    /// Whether the newest journal row this session holds on the file is one it
+    /// claimed rather than wrote. Blame is where somebody goes to settle who
+    /// wrote a line, and a range that was handed over should not answer in the
+    /// same voice as one the daemon watched. File-level, because that is the
+    /// granularity a claim moves.
+    pub claimed: bool,
 }
 
 /// Why one session made a change, kept against the range it owned at the time.
@@ -789,6 +810,63 @@ impl Db {
         Ok(())
     }
 
+    /// The mirror of `disown`: one file's regions and journal rows become this
+    /// session's, whoever the daemon credited at the time. Returns (regions
+    /// moved, rows moved, the sessions they came from).
+    ///
+    /// Every moved row is marked `claimed`, so `blame` and `log` say the
+    /// journal was told rather than that it watched. Without that this is a way
+    /// to take another session's work and leave no trace, which is the opposite
+    /// of what the journal is for.
+    ///
+    /// Disowned rows come too, and lose the mark. A file released by the wrong
+    /// owner is the case this pairs with: those rows carry the shadow commits
+    /// the real author's branch needs, and while they sit disowned no session
+    /// can publish them.
+    pub fn claim_file(&self, session_id: i64, file: &str) -> Result<(usize, usize, Vec<i64>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let from: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id FROM edits WHERE file = ?1 AND session_id != ?2
+                 UNION
+                 SELECT session_id FROM regions WHERE file = ?1 AND session_id != ?2
+                 ORDER BY 1",
+            )?;
+            let rows = stmt.query_map(params![file, session_id], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let edits = tx.execute(
+            "UPDATE edits SET session_id = ?2, attributed_by = ?3, disowned = 0
+             WHERE file = ?1 AND (session_id != ?2 OR disowned = 1)",
+            params![file, session_id, Attribution::Claimed.as_str()],
+        )?;
+        let regions = tx.execute(
+            "UPDATE regions SET session_id = ?2, updated_at = ?3
+             WHERE file = ?1 AND session_id != ?2",
+            params![file, session_id, now_ts()],
+        )?;
+        if edits == 0 && regions == 0 {
+            let touched: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM edits WHERE file = ?1",
+                params![file],
+                |r| r.get(0),
+            )?;
+            if touched == 0 {
+                bail!("no session has touched {}; there is nothing to claim", file);
+            }
+            bail!(
+                "ortak-{} already holds every line and journal row on {}",
+                session_id,
+                file
+            );
+        }
+        // The ranges arrive as their old owners left them, un-coalesced: they
+        // are separate writes and blame naming the same session twice on two of
+        // them is the truth about how the file was written.
+        tx.commit()?;
+        Ok((regions, edits, from))
+    }
+
     /// Hot regions of *other* active sessions overlapping any target range
     /// (with the ±margin neighborhood). Freshness = the owner's last edit on
     /// this file within the presence window.
@@ -854,7 +932,10 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
                     COALESCE((SELECT MAX(e.ts) FROM edits e
-                               WHERE e.session_id = r.session_id AND e.file = r.file), 0)
+                               WHERE e.session_id = r.session_id AND e.file = r.file), 0),
+                    (SELECT e.attributed_by FROM edits e
+                      WHERE e.session_id = r.session_id AND e.file = r.file
+                      ORDER BY e.ts DESC, e.id DESC LIMIT 1)
              FROM regions r JOIN sessions s ON s.id = r.session_id
              WHERE r.file = ?1
              ORDER BY r.start_line, r.end_line",
@@ -867,6 +948,11 @@ impl Db {
                 start: r.get(3)?,
                 end: r.get(4)?,
                 last_ts: r.get(5)?,
+                // Reading the newest row rather than a flag on the region: an
+                // edit after the claim is the session working there for real,
+                // and the mark should go when that happens.
+                claimed: r.get::<_, Option<String>>(6)?.as_deref()
+                    == Some(Attribution::Claimed.as_str()),
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1565,6 +1651,96 @@ mod tests {
 
     /// Give a session a region on `file` by journaling an edit to it, the way
     /// the daemon does.
+    fn wrote(db: &Db, who: i64, file: &str, start: i64, how: Option<Attribution>) {
+        let hunks = [Hunk {
+            old_start: start,
+            old_lines: 6,
+            new_start: start,
+            new_lines: 6,
+        }];
+        db.insert_edit(who, file, "modify", None, &hunks, how)
+            .unwrap();
+        db.apply_edit_regions(who, file, &hunks).unwrap();
+    }
+
+    /// Round 6 from both ends: a session's own file took a write the daemon
+    /// credited to whichever other session had a command open, and the file
+    /// went with it.
+    #[test]
+    fn a_claim_takes_back_a_write_the_journal_gave_away() {
+        let db = db();
+        let author = session(&db, "claude-a");
+        let bystander = session(&db, "claude-b");
+        wrote(
+            &db,
+            author,
+            "tests/end_to_end.rs",
+            1,
+            Some(Attribution::Hook),
+        );
+        // `cargo fmt -- tests/end_to_end.rs`, on a file only the author had
+        // ever touched, landing on the session that was running something.
+        wrote(
+            &db,
+            bystander,
+            "tests/end_to_end.rs",
+            20,
+            Some(Attribution::Claim),
+        );
+
+        let moved = db.claim_file(author, "tests/end_to_end.rs").unwrap();
+        assert_eq!(moved, (1, 1, vec![bystander]));
+
+        // What publish reads, from both sides.
+        assert_eq!(
+            names(db.session_files(author, 0).unwrap()),
+            vec!["tests/end_to_end.rs"]
+        );
+        assert!(db.session_files(bystander, 0).unwrap().is_empty());
+        // And what a person reads: the file is the author's, and the journal
+        // says the repair happened rather than passing it off as a write.
+        let owners = db.file_regions("tests/end_to_end.rs").unwrap();
+        assert!(owners.iter().all(|o| o.session_id == author && o.claimed));
+        assert!(db
+            .recent_edits(Some(author), 20)
+            .unwrap()
+            .iter()
+            .any(|e| e.claimed()));
+    }
+
+    /// The other half of the round-6 repair, and the reason this stacks on
+    /// release meaning "never mine": a released row is invisible to every
+    /// session until something takes it back.
+    #[test]
+    fn a_file_the_wrong_owner_released_comes_back_whole() {
+        let db = db();
+        let author = session(&db, "claude-a");
+        let wrong = session(&db, "claude-b");
+        wrote(&db, wrong, "src/publish.rs", 40, Some(Attribution::Claim));
+        assert_eq!(db.disown(wrong, Some("src/publish.rs")).unwrap(), (1, 1));
+
+        db.claim_file(author, "src/publish.rs").unwrap();
+
+        assert_eq!(
+            names(db.session_files(author, 0).unwrap()),
+            vec!["src/publish.rs"]
+        );
+        assert_eq!(db.edit_count(author).unwrap(), 1);
+        assert_eq!(db.edit_count(wrong).unwrap(), 0);
+    }
+
+    #[test]
+    fn claiming_an_untouched_file_or_one_you_hold_is_refused() {
+        let db = db();
+        let author = session(&db, "claude-a");
+        assert!(db.claim_file(author, "src/db.rs").is_err());
+
+        wrote(&db, author, "src/db.rs", 1, Some(Attribution::Hook));
+        assert!(db.claim_file(author, "src/db.rs").is_err());
+        // Refused, not half-done: the row it already held is untouched.
+        assert!(!db.recent_edits(Some(author), 5).unwrap()[0].claimed());
+    }
+
     fn owns(db: &Db, session_id: i64, file: &str, start: i64, lines: i64) {
         let hunks = [Hunk {
             old_start: start,
