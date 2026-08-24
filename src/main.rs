@@ -462,8 +462,13 @@ fn status(as_json: bool) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let cfg = Config::load(&ws.config_path)?;
     let db = Db::open(&ws.db_path)?;
+    let behind_base = commits_behind_base(&ws, &cfg);
     if as_json {
-        return json::print(&json::status(&db, cfg.gate.presence_minutes * 60)?);
+        return json::print(&json::status(
+            &db,
+            cfg.gate.presence_minutes * 60,
+            behind_base,
+        )?);
     }
     match db.heartbeat_age()? {
         Some(age) if age <= HEARTBEAT_ALIVE_SECS => {
@@ -492,6 +497,20 @@ fn status(as_json: bool) -> Result<()> {
             recovered
         );
         println!("  changes in that window the scan did not pick up are not in the journal; touch those files again to record them");
+    }
+    // Silent while the checkout is current, which is the normal case. Behind is
+    // Silent while the checkout is current, which is the normal case. Behind is
+    // worth a line of its own: publish replays a session's edits onto the base
+    // branch, so in a stale checkout everyone is editing files that no longer
+    // look like what their work will land on, and nothing else says so.
+    if let Some((base, behind)) = behind_base.as_ref().filter(|(_, n)| *n > 0) {
+        println!(
+            "workspace: {} commit{} behind {}; publishes will replay onto content this \
+             checkout does not have",
+            behind,
+            if *behind == 1 { "" } else { "s" },
+             base
+        );
     }
     // Silent while the journal is healthy, which is nearly always, so the
     // section is a signal rather than another line to scroll past.
@@ -531,6 +550,22 @@ fn status(as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// How far this checkout has fallen behind the branch publishes build on:
+/// `git rev-list --count HEAD..base`, which is the count `publish` takes when a
+/// replay fails, so the standing report and the failure agree. `None` when the
+/// question has no answer here: no git repository, no such base branch in this
+/// checkout, or a repository with no commits yet.
+fn commits_behind_base(ws: &Workspace, cfg: &Config) -> Option<(String, i64)> {
+    let repo = git2::Repository::open(&ws.root).ok()?;
+    let base = repo
+        .find_branch(&cfg.publish.base_branch, git2::BranchType::Local)
+        .and_then(|b| b.get().peel_to_commit())
+        .ok()?;
+    let head = repo.head().ok()?.target()?;
+    let (_, behind) = repo.graph_ahead_behind(head, base.id()).ok()?;
+    Some((cfg.publish.base_branch.clone(), behind as i64))
 }
 
 /// Read line ownership back out of the journal. git history records the human

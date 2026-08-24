@@ -15,8 +15,20 @@ use serde::Serialize;
 pub struct Status {
     pub daemon: Daemon,
     pub journal: Journal,
+    /// Null when the count cannot be taken: no git repository at the workspace
+    /// root, or the configured base branch is not in this checkout.
+    pub workspace: Option<Checkout>,
     pub sessions: Vec<Session>,
     pub regions: Vec<Region>,
+}
+
+#[derive(Serialize)]
+pub struct Checkout {
+    pub base_branch: String,
+    /// Commits on the base branch this checkout does not have, and 0 when it is
+    /// current. A publish replays onto the base branch, so anything above 0 is
+    /// work the session cannot see in the files it is editing.
+    pub commits_behind: i64,
 }
 
 #[derive(Serialize)]
@@ -115,7 +127,7 @@ pub fn print<T: Serialize>(payload: &T) -> Result<()> {
     Ok(())
 }
 
-pub fn status(db: &Db, presence_secs: i64) -> Result<Status> {
+pub fn status(db: &Db, presence_secs: i64, behind_base: Option<(String, i64)>) -> Result<Status> {
     let age = db.heartbeat_age()?;
     let mut sessions = Vec::new();
     for s in db.list_sessions()? {
@@ -167,6 +179,10 @@ pub fn status(db: &Db, presence_secs: i64) -> Result<Status> {
                 ts: f.ts,
             }),
         },
+        workspace: behind_base.map(|(base_branch, commits_behind)| Checkout {
+            base_branch,
+            commits_behind,
+        }),
         sessions,
         regions,
     })
@@ -218,6 +234,10 @@ mod tests {
                     ts: 1_700_000_000,
                 }),
             },
+            workspace: Some(Checkout {
+                base_branch: "main".into(),
+                commits_behind: 83,
+            }),
             sessions: vec![Session {
                 session: "ortak-2".into(),
                 agent: "claude-be11".into(),
@@ -243,7 +263,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
-            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
+            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"workspace":{"base_branch":"main","commits_behind":83},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
         );
     }
 
