@@ -43,6 +43,9 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str) -> Result<()> {
         return Ok(());
     }
     print_refs(&refs);
+    println!(
+        "names are matched as text, so the short and the everyday ones are left out; read the rest before believing them"
+    );
     Ok(())
 }
 
@@ -60,6 +63,29 @@ pub struct Ref {
 /// What a scan found: the (name, defining file) pairs this session's live
 /// regions define, and the references other sessions make to them.
 pub type Scan = (Vec<(String, String)>, Vec<Ref>);
+
+/// Two rules keep the report readable, both of them about the same thing: a
+/// text match on an ordinary English word is not evidence of anything.
+///
+/// A test file this project shipped defines `run`, `it`, `edit`, `start` and
+/// `drop`, and the scan reported every session in every file that spells any of
+/// them: fifty-odd lines, one of which was real. A report wrong that often is
+/// not read a fourth time, which is worse than no report.
+///
+/// Shorter than four characters is never checked. It costs the odd real `run`,
+/// and it buys back the half of the workspace that says "run the daemon" in a
+/// comment.
+const SHORTEST_NAME: usize = 4;
+/// Matched in more than half the files searched, and never fewer than three, so
+/// a quiet workspace does not filter on a sample of two. Half rather than a
+/// fixed count on purpose: a real function called from five of twenty recent
+/// files is the case this scan exists for, and a flat cap would hide it.
+const FEWEST_FILES: usize = 3;
+
+/// How many different files a run of rows names.
+fn distinct<'a>(files: impl Iterator<Item = &'a str>) -> usize {
+    files.collect::<std::collections::HashSet<_>>().len()
+}
 
 /// The names this session's live regions define, and every reference the other
 /// sessions' recent files make to them. Two empty lists is the usual answer;
@@ -85,8 +111,21 @@ pub fn scan(ws: &Workspace, cfg: &Config, db: &Db, session_id: i64) -> Result<Sc
     // search those rather than walking the whole workspace for names nobody
     // else is working near.
     let recent = db.recent_session_files(cfg.line.blame_lookback_minutes * 60)?;
-    let mut refs = Vec::new();
+    let searched = distinct(
+        recent
+            .iter()
+            .filter(|(sid, _, _, _)| *sid != session_id)
+            .map(|(_, _, file, _)| file.as_str()),
+    );
+    let vocabulary = (searched / 2).max(FEWEST_FILES);
+    // Rarest name first: the fewer files a name turns up in, the more likely it
+    // is a symbol somebody actually calls, and the report is read from the top.
+    let mut by_name: Vec<(usize, Vec<Ref>)> = Vec::new();
     for (name, defined_in) in &defs {
+        if name.len() < SHORTEST_NAME {
+            continue;
+        }
+        let mut hits: Vec<Ref> = Vec::new();
         for (sid, agent, file, ts) in &recent {
             if *sid == session_id || file == defined_in {
                 continue;
@@ -97,7 +136,7 @@ pub fn scan(ws: &Workspace, cfg: &Config, db: &Db, session_id: i64) -> Result<Sc
             if !mentions(&text, name) {
                 continue;
             }
-            refs.push(Ref {
+            hits.push(Ref {
                 name: name.clone(),
                 file: file.clone(),
                 session: *sid,
@@ -110,7 +149,14 @@ pub fn scan(ws: &Workspace, cfg: &Config, db: &Db, session_id: i64) -> Result<Sc
                     .unwrap_or_else(|| "(not reported)".to_string()),
             });
         }
+        let files = distinct(hits.iter().map(|r| r.file.as_str()));
+        if files > vocabulary {
+            continue;
+        }
+        by_name.push((files, hits));
     }
+    by_name.sort_by_key(|(files, _)| *files);
+    let refs = by_name.into_iter().flat_map(|(_, hits)| hits).collect();
     Ok((defs, refs))
 }
 
@@ -137,15 +183,10 @@ fn defined_name(line: &str) -> Option<&str> {
     const KEYWORDS: [&str; 10] = [
         "fn", "struct", "enum", "trait", "const", "static", "type", "def", "class", "function",
     ];
-    let trimmed = line.trim_start();
-    // Comments and attributes define nothing, and both spell keywords freely.
-    if ["//", "#", "*", "/*"]
-        .iter()
-        .any(|p| trimmed.starts_with(p))
-    {
+    if is_comment(line) {
         return None;
     }
-    let mut tokens = trimmed.split_whitespace();
+    let mut tokens = line.split_whitespace();
     let name = loop {
         let token = tokens.next()?;
         if KEYWORDS.contains(&token) {
@@ -161,15 +202,34 @@ fn defined_name(line: &str) -> Option<&str> {
     Some(ident)
 }
 
-/// Does `text` use `name` as a whole word? A substring match would report every
-/// `run` in the workspace.
+/// Does `text` use `name` as a whole word, somewhere that is not a comment?
+///
+/// A substring match would report every `run` in the workspace. A match in
+/// prose is the same mistake one layer in: most of what this scan used to
+/// print came from doc comments spelling `drop` or `start` in a sentence, and
+/// a sentence calls nothing.
 fn mentions(text: &str, name: &str) -> bool {
+    text.lines()
+        .filter(|line| !is_comment(line))
+        .any(|line| whole_word(line, name))
+}
+
+fn whole_word(line: &str, name: &str) -> bool {
     let boundary = |c: char| !(c.is_alphanumeric() || c == '_');
-    text.match_indices(name).any(|(at, _)| {
-        let before = text[..at].chars().next_back().is_none_or(boundary);
-        let after = text[at + name.len()..].chars().next().is_none_or(boundary);
+    line.match_indices(name).any(|(at, _)| {
+        let before = line[..at].chars().next_back().is_none_or(boundary);
+        let after = line[at + name.len()..].chars().next().is_none_or(boundary);
         before && after
     })
+}
+
+/// Comments and attributes define nothing and call nothing, and both spell
+/// keywords and names freely.
+fn is_comment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["//", "#", "*", "/*"]
+        .iter()
+        .any(|p| trimmed.starts_with(p))
 }
 
 #[cfg(test)]
@@ -277,5 +337,80 @@ mod tests {
         assert!(mentions("let x = remote_for(&cfg);", "remote_for"));
         assert!(!mentions("let x = remote_format(&cfg);", "remote_for"));
         assert!(!mentions("let x = my_remote_for;", "remote_for"));
+    }
+
+    /// Prose is where a codebase spells its ordinary words, and prose calls
+    /// nothing. Most of what this scan used to print came from doc comments.
+    #[test]
+    fn a_name_in_a_comment_is_not_a_reference() {
+        assert!(!mentions("// drop the commit and keep replaying\n", "drop"));
+        assert!(!mentions("    /// start of the region\n", "start"));
+        assert!(!mentions("#[derive(Debug)] // start\n", "start"));
+        assert!(mentions("// start here\nlet r = start(&tag);\n", "start"));
+    }
+
+    /// Round 7 published a test file defining `run`, `it`, `edit` and `drop`,
+    /// and the scan answered with fifty lines naming every session in every
+    /// file that spells any of them. One line of the fifty was real, and a
+    /// report wrong that often stops being read.
+    #[test]
+    fn names_that_mean_nothing_stay_out_of_the_report() {
+        let dir = std::env::temp_dir().join(format!("ortak-noise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mine.rs"),
+            "fn it(what: &str) {}\nfn edit(file: &str) {}\nfn helper() {}\nfn remote_for() {}\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::at(&dir);
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let me = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let them = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        // Eight files the other session is in. Every one of them spells `edit`
+        // and `it`, the way a codebase spells its own vocabulary; three call
+        // `helper`, and one calls `remote_for`.
+        for n in 0..8 {
+            let file = format!("other{n}.rs");
+            let mut body = String::from("let it = edit(path);\n");
+            if n < 3 {
+                body.push_str("helper();\n");
+            }
+            if n == 0 {
+                body.push_str("remote_for();\n");
+            }
+            std::fs::write(dir.join(&file), body).unwrap();
+            db.insert_edit(them, &file, "modify", None, &[], None)
+                .unwrap();
+        }
+        db.apply_edit_regions(
+            me,
+            "mine.rs",
+            &[Hunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 4,
+            }],
+        )
+        .unwrap();
+
+        let (defs, refs) = scan(&ws, &Config::default(), &db, me).unwrap();
+        assert_eq!(defs.len(), 4, "the session still changed all four names");
+        let named: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !named.contains(&"it"),
+            "a two-letter name is not evidence: {named:?}"
+        );
+        assert!(
+            !named.contains(&"edit"),
+            "a name every file here spells is not evidence: {named:?}"
+        );
+        // Rarest first: the one file that calls remote_for leads, and helper's
+        // three come after it.
+        assert_eq!(named[0], "remote_for", "{named:?}");
+        assert_eq!(named.len(), 4, "{named:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
