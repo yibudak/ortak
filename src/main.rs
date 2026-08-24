@@ -509,7 +509,7 @@ fn status(as_json: bool) -> Result<()> {
              checkout does not have",
             behind,
             if *behind == 1 { "" } else { "s" },
-             base
+            base
         );
     }
     // Silent while the journal is healthy, which is nearly always, so the
@@ -595,7 +595,7 @@ fn blame(target: &str) -> Result<()> {
             o.session_id,
             o.agent_name,
             ago(now - o.last_ts),
-            inferred_note(o)
+            owner_note(o)
         );
         println!(
             "  owns {}, intent: {}",
@@ -620,7 +620,7 @@ fn blame(target: &str) -> Result<()> {
             o.session_id,
             o.agent_name,
             ago(now - o.last_ts),
-            inferred_note(o)
+            owner_note(o)
         );
         println!(
             "                intent: {}",
@@ -630,13 +630,13 @@ fn blame(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// A session, a time and an intent read as a complete account whether or not
-/// anybody reported the edit. `ortak log` marks these rows in the same words.
-fn inferred_note(o: &db::Owner) -> &'static str {
-    if o.inferred {
-        "   (inferred from a running command)"
-    } else {
-        ""
+/// A session, a time and an intent read as a complete account of a line whether
+/// or not anybody reported the edit behind it. `ortak log` marks the same rows
+/// in the same words.
+fn owner_note(o: &db::Owner) -> String {
+    match db::attribution_note(o.attributed_by.as_deref()) {
+        "" => String::new(),
+        note => format!("   ({})", note),
     }
 }
 
@@ -740,10 +740,9 @@ fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
     }
     for e in db.recent_edits(session_id, limit)? {
         let t = db::fmt_local(e.ts, "%m-%d %H:%M:%S");
-        let how = if e.inferred() {
-            ", inferred from a running command"
-        } else {
-            ""
+        let how = match db::attribution_note(e.attributed_by.as_deref()) {
+            "" => String::new(),
+            note => format!(", {}", note),
         };
         println!(
             "[{}] {:6} {} - {} (ortak-{}{})",
