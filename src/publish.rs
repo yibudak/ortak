@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::{Db, PublishRow};
+use crate::db::{Db, PublishRow, Session};
 use crate::workspace::Workspace;
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{BranchType, Commit, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
@@ -44,18 +44,27 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
+    let repo = Repository::open(&ws.root).with_context(|| {
+        format!(
+            "publishing requires {} to be a git repository with a configured remote",
+            ws.root.display()
+        )
+    })?;
     // One session runs several tasks, so shipping everything it ever touched
     // puts the finished work back into every later branch. Default to what came
     // after the last publish; --all rebuilds a branch holding all of it.
     let history = db.publishes(session.id)?;
     let previous = history.first().cloned();
-    // An amend goes back further, to where the branch it is rewriting began.
+    // An amend goes back further, to where the branch it is landing on began.
+    // The journal knows that only for branches this session published, so the
+    // repository is read here rather than after the file list: what a branch
+    // already carries is the other half of the answer.
     let amending = match scope {
-        Scope::Amend => Some(amend_target(&history, branch_override, session.id)?),
+        Scope::Amend => Some(amend_target(&repo, &history, branch_override, &session)?),
         _ => None,
     };
     let after = match amending {
-        Some((mark, _)) => mark,
+        Some(a) => a.after,
         None if scope == Scope::All => 0,
         None => previous.as_ref().map_or(0, |p| p.last_edit_id),
     };
@@ -102,26 +111,21 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         );
     }
 
-    let repo = Repository::open(&ws.root).with_context(|| {
-        format!(
-            "publishing requires {} to be a git repository with a configured remote",
-            ws.root.display()
-        )
-    })?;
-    // An amend rebuilds the branch where it already stands: its tip's parent is
-    // the commit it was published on, so leaving --base off does not quietly
-    // rebase a stacked branch onto the trunk and pull its base's work into the
-    // diff. An explicit --base still wins, which is how a branch moves.
+    // An amend rebuilds the branch where it already stands, so leaving --base
+    // off does not quietly rebase a stacked branch onto the trunk and pull its
+    // base's work into the diff. An explicit --base still wins while this
+    // session's own commit is the one being rewritten, which is how a branch
+    // moves. On a branch it did not publish, --base would point the branch
+    // somewhere else entirely and drop what it carries, and dropping somebody
+    // else's commit is the one thing an amend must never do.
     let base_commit = match (amending, base_override) {
-        (Some((_, branch)), None) => repo
-            .find_branch(branch, BranchType::Local)
-            .with_context(|| {
-                format!("ortak published {branch}, but this repository has no such branch now")
-            })?
-            .get()
-            .peel_to_commit()?
-            .parent(0)
-            .with_context(|| format!("{branch} has no parent commit to rebuild it on"))?,
+        (Some(a), Some(b)) if !a.rewrites => bail!(
+            "ortak-{} did not publish {}, so --amend puts this work on top of what that branch already carries; --base {} would move it off that. Publish this work as its own branch instead",
+            session.id,
+            a.branch,
+            b
+        ),
+        (Some(a), None) => repo.find_commit(a.base)?,
         _ => base_commit_for(&repo, base)?,
     };
     let base_tree = base_commit.tree()?;
@@ -210,6 +214,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         ),
     };
     let amend = amending.is_some();
+    let rewrites = amending.is_some_and(|a| a.rewrites);
     repo.branch(&branch_name, &repo.find_commit(commit_oid)?, amend)
         .with_context(|| {
             format!(
@@ -218,9 +223,12 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             )
         })?;
     // Only now: a failed publish must not move the session's high-water mark.
-    // An amend moves the branch's own mark instead of adding a second row for
-    // it, so the next new deliverable still starts after everything published.
-    if amend {
+    // Rewriting this session's own commit moves that branch's mark instead of
+    // adding a second row for it, so the next new deliverable still starts
+    // after everything published. A branch this session had not published has
+    // no row to move, so taking one over records it, and the amend after that
+    // rewrites this session's own commit like any other.
+    if rewrites {
         db.amend_publish(session.id, &branch_name, head_edit)?;
     } else {
         db.record_publish(session.id, &branch_name, head_edit)?;
@@ -236,7 +244,11 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
 
     println!(
         "branch {}: {} ({} files, commit {})",
-        if amend { "rewritten" } else { "ready" },
+        match amending {
+            Some(a) if a.rewrites => "rewritten",
+            Some(_) => "extended",
+            None => "ready",
+        },
         branch_name,
         files.len(),
         &commit_oid.to_string()[..8]
@@ -302,12 +314,15 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 stack, remote
             );
         }
-        // An amended branch is not a fast-forward, so the push has to say so.
+        // A rewritten branch is not a fast-forward, so the push has to say so.
         // --force-with-lease rather than --force: if the branch on the remote
         // has moved since this session last saw it, that is somebody else's
-        // commit and no amend was ever meant to drop it.
+        // commit and no amend was ever meant to drop it. A commit added on top
+        // of a branch this session did not publish is a fast-forward and needs
+        // no lease; forcing there would be a licence to drop exactly the work
+        // that path exists to keep.
         let mut args = vec!["push", "-u", remote.as_str(), branch_name.as_str()];
-        if amend {
+        if rewrites {
             args.insert(1, "--force-with-lease");
         }
         let status = std::process::Command::new("git")
@@ -327,10 +342,14 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         }
     } else if amend {
         let remote = remote_for(&repo, cfg);
-        println!(
-            "\n{} moved, so it is no longer a fast-forward. Push it with:\n  git push --force-with-lease {} {}",
-            branch_name, remote, branch_name
-        );
+        if rewrites {
+            println!(
+                "\n{} moved, so it is no longer a fast-forward. Push it with:\n  git push --force-with-lease {} {}",
+                branch_name, remote, branch_name
+            );
+        } else {
+            println!("\nnot pushed; run: git push {} {}", remote, branch_name);
+        }
     } else {
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
     }
@@ -569,40 +588,115 @@ fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Where an amend starts reading the journal, and the branch it rewrites.
+/// What one `--amend` resolved to: where it starts reading the journal, the
+/// branch it lands on, the commit it rebuilds that branch on, and whether it
+/// rewrites this session's own commit or puts one on top of a commit that is
+/// not this session's.
+#[derive(Clone, Copy, Debug)]
+struct Amend<'a> {
+    after: i64,
+    branch: &'a str,
+    base: Oid,
+    rewrites: bool,
+}
+
+/// Where an amend starts reading the journal, and what it may do to the branch.
 ///
-/// A branch carries the edits between the publish before it and its own, so
-/// rebuilding it means starting from the mark the publish before it left. That
-/// is only true while the branch is the session's newest publish: rewriting an
-/// older one would sweep every deliverable published since into it, which is
-/// the bug `--base` was added to avoid rather than one to introduce here.
+/// A branch this session published carries the edits between the publish before
+/// it and its own, so rebuilding it means starting from the mark the publish
+/// before it left. That is only true while the branch is the session's newest
+/// publish: rewriting an older one would sweep every deliverable published
+/// since into it, which is the bug `--base` was added to avoid rather than one
+/// to introduce here.
+///
+/// Most branches worth amending have no row in this journal at all: they were
+/// published by a session that has since ended, or from another workspace, or
+/// by hand. Refusing those is what sent every review fix into a worktree, where
+/// ortak sees none of the work. There the branch itself carries the floor:
+/// everything already committed on it stays, this session's edits since its own
+/// last publish go on top, and nothing that was there can be lost.
 fn amend_target<'a>(
+    repo: &Repository,
     history: &[PublishRow],
     branch: Option<&'a str>,
-    session_id: i64,
-) -> Result<(i64, &'a str)> {
+    session: &Session,
+) -> Result<Amend<'a>> {
     let Some(branch) = branch else {
         bail!("--amend rewrites one branch; name it with --branch <branch>");
     };
-    let Some(newest) = history.first() else {
-        bail!(
-            "ortak-{} has published nothing yet, so it has no branch to amend",
-            session_id
-        );
-    };
-    if newest.branch != branch {
-        if history.iter().any(|p| p.branch == branch) {
-            bail!(
-                "ortak-{} published {} after {}; amending {} now would sweep that later work into it. Publish the fix as its own branch instead",
-                session_id, newest.branch, branch, branch
-            );
+    let tip = branch_tip(repo, branch)?;
+    match history.iter().position(|p| p.branch == branch) {
+        Some(0) => {
+            // The journal says this session published the branch; git says what
+            // stands on it now. Anything that is not this session's own publish
+            // commit is somebody else's work, and rebuilding the branch from its
+            // tip's parent would drop it without a word.
+            if !published_by(&tip, &session.external_id) {
+                bail!(
+                    "{} has moved since ortak-{} published it: its tip {} is not a commit ortak-{} published, and rebuilding the branch would drop it. Publish this work as its own branch, or put {} back where ortak-{} left it",
+                    branch,
+                    session.id,
+                    &tip.id().to_string()[..8],
+                    session.id,
+                    branch,
+                    session.id
+                );
+            }
+            // Its tip's parent is the commit it was published on, so rebuilding
+            // it leaves a stacked branch stacked instead of quietly rebasing it
+            // onto the trunk and pulling its base's work into the diff.
+            let parent = tip
+                .parent(0)
+                .with_context(|| format!("{branch} has no parent commit to rebuild it on"))?;
+            Ok(Amend {
+                after: history.get(1).map_or(0, |p| p.last_edit_id),
+                branch,
+                base: parent.id(),
+                rewrites: true,
+            })
         }
-        bail!(
-            "ortak-{} did not publish {}; its last branch was {}, and --amend only rewrites a branch this session published",
-            session_id, branch, newest.branch
-        );
+        Some(_) => bail!(
+            "ortak-{} published {} after {}; amending {} now would sweep that later work into it. Publish the fix as its own branch instead",
+            session.id,
+            history[0].branch,
+            branch,
+            branch
+        ),
+        // Nothing on it is this session's to rewrite, so the tip itself is the
+        // floor and the new commit becomes its child.
+        None => Ok(Amend {
+            after: history.first().map_or(0, |p| p.last_edit_id),
+            branch,
+            base: tip.id(),
+            rewrites: false,
+        }),
     }
-    Ok((history.get(1).map_or(0, |p| p.last_edit_id), branch))
+}
+
+/// The commit a branch points at. `--amend` names a branch that is already
+/// there, so a missing one is a typo or a branch that was never published,
+/// rather than something to create quietly under a flag that says rebuild.
+fn branch_tip<'r>(repo: &'r Repository, branch: &str) -> Result<Commit<'r>> {
+    repo.find_branch(branch, BranchType::Local)
+        .and_then(|b| b.get().peel_to_commit())
+        .map_err(|_| {
+            anyhow!(
+                "--amend rebuilds a branch that already exists, and this repository has no branch {}. Publish without --amend to create it",
+                branch
+            )
+        })
+}
+
+/// Whether a commit is one this session published. Every publish stamps the
+/// session's external id into the commit message, so git carries the answer:
+/// the journal can be wiped and the workspace re-initialised, and the branch
+/// still says who left the commit on it.
+fn published_by(commit: &Commit, external_id: &str) -> bool {
+    commit.message().is_some_and(|m| {
+        m.lines()
+            .filter_map(|l| l.strip_prefix("Ortak-Session:"))
+            .any(|id| id.trim() == external_id)
+    })
 }
 
 /// The branch this publish builds on. `--base` is per invocation, so work that
@@ -993,20 +1087,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A commit on a branch, moving the branch to it. `msg` is what tells a
+    /// session's own publish from a commit somebody else left there.
+    fn commit_on<'r>(
+        repo: &'r Repository,
+        branch: &str,
+        parent: Option<&Commit>,
+        msg: &str,
+        content: &str,
+    ) -> Commit<'r> {
+        let mut tb = repo.treebuilder(None).unwrap();
+        let blob = repo.blob(content.as_bytes()).unwrap();
+        tb.insert("f.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = Signature::now("t", "t@t.t").unwrap();
+        let parents: Vec<&Commit> = parent.into_iter().collect();
+        let oid = repo.commit(None, &sig, &sig, msg, &tree, &parents).unwrap();
+        let commit = repo.find_commit(oid).unwrap();
+        repo.branch(branch, &commit, true).unwrap();
+        commit
+    }
+
     /// The arithmetic an amend rests on: rebuilding a branch reaches back to
     /// where its own work began, and the deliverable after it still starts from
     /// everything that has shipped. Getting the second half wrong re-publishes
     /// work that already went out, which is the bug incremental publish exists
     /// to fix.
+    ///
+    /// Then the two questions the journal cannot answer alone: a branch it has
+    /// no row for is not a branch to refuse, and a branch that has moved since
+    /// this session published it is not one to rebuild.
     #[test]
-    fn an_amend_rebuilds_one_branch_and_leaves_the_next_where_it_was() {
+    fn an_amend_rebuilds_its_own_branch_and_adopts_one_it_did_not_publish() {
         let dir = std::env::temp_dir().join(format!("ortak-amend-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("db.sqlite")).unwrap();
-        let s = db
-            .upsert_session("sess", "claude-sess", "llm", Some("claude-code"))
+        db.upsert_session("sess", "claude-sess", "llm", Some("claude-code"))
             .unwrap();
+        let session = db.resolve_session("sess").unwrap();
+        let s = session.id;
         let files = |after: i64| -> Vec<String> {
             db.session_files(s, after)
                 .unwrap()
@@ -1015,18 +1135,22 @@ mod tests {
                 .collect()
         };
         let head = || db.max_edit_id(s).unwrap().unwrap();
+        let repo = Repository::init(dir.join("repo")).unwrap();
+        let mine = "shipped\n\nOrtak-Session: sess\n";
+        let base = commit_on(&repo, "main", None, "base\n", "base\n");
 
         // The first deliverable ships.
         db.insert_edit(s, "one.rs", "create", None, &[], None)
             .unwrap();
+        commit_on(&repo, "task/one", Some(&base), mine, "one\n");
         db.record_publish(s, "task/one", head()).unwrap();
 
         // Review lands, so the fix goes into the same branch.
         db.insert_edit(s, "one.rs", "modify", None, &[], None)
             .unwrap();
-        let (after, branch) = amend_target(&db.publishes(s).unwrap(), Some("task/one"), s).unwrap();
-        assert_eq!((after, branch), (0, "task/one"));
-        assert_eq!(files(after), vec!["one.rs"]);
+        let a = amend_target(&repo, &db.publishes(s).unwrap(), Some("task/one"), &session).unwrap();
+        assert_eq!((a.after, a.branch, a.rewrites), (0, "task/one", true));
+        assert_eq!(files(a.after), vec!["one.rs"]);
         db.amend_publish(s, "task/one", head()).unwrap();
         assert_eq!(
             db.publishes(s).unwrap().len(),
@@ -1039,18 +1163,61 @@ mod tests {
             .unwrap();
         let history = db.publishes(s).unwrap();
         assert_eq!(files(history[0].last_edit_id), vec!["two.rs"]);
+        commit_on(&repo, "task/two", Some(&base), mine, "two\n");
         db.record_publish(s, "task/two", head()).unwrap();
 
         // task/one is behind the newest publish now, so it is out of reach, and
         // amending task/two reaches back only as far as task/one shipped.
         let history = db.publishes(s).unwrap();
-        assert!(amend_target(&history, Some("task/one"), s).is_err());
-        assert!(amend_target(&history, Some("never/published"), s).is_err());
-        assert!(amend_target(&history, None, s).is_err());
+        assert!(amend_target(&repo, &history, Some("task/one"), &session).is_err());
+        assert!(amend_target(&repo, &history, None, &session).is_err());
+        assert!(
+            amend_target(&repo, &history, Some("never/published"), &session).is_err(),
+            "a branch that is not in the repository is a typo, not one to create"
+        );
         assert_eq!(
-            files(amend_target(&history, Some("task/two"), s).unwrap().0),
+            files(
+                amend_target(&repo, &history, Some("task/two"), &session)
+                    .unwrap()
+                    .after
+            ),
             vec!["two.rs"]
         );
+
+        // A branch this session never published: nothing on it is this
+        // session's to rewrite, so the tip becomes the floor and the work since
+        // the last publish goes on top of it.
+        let theirs = commit_on(
+            &repo,
+            "feat/theirs",
+            Some(&base),
+            "their work\n",
+            "theirs\n",
+        );
+        db.insert_edit(s, "three.rs", "create", None, &[], None)
+            .unwrap();
+        let history = db.publishes(s).unwrap();
+        let adopted = amend_target(&repo, &history, Some("feat/theirs"), &session).unwrap();
+        assert!(
+            !adopted.rewrites,
+            "a commit this session did not publish must not be rewritten"
+        );
+        assert_eq!(adopted.after, history[0].last_edit_id);
+        assert_eq!(files(adopted.after), vec!["three.rs"]);
+
+        // And the branch it did publish, once somebody else has put a commit on
+        // top: rebuilding it from the tip's parent would drop that commit.
+        commit_on(
+            &repo,
+            "task/two",
+            Some(&theirs),
+            "a fix by hand\n",
+            "moved\n",
+        );
+        let err = amend_target(&repo, &db.publishes(s).unwrap(), Some("task/two"), &session)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would drop it"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
