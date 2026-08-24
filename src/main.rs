@@ -71,6 +71,11 @@ enum Command {
     },
     /// List sessions
     Sessions,
+    /// Which ortak-N this harness session is in this workspace
+    Whoami {
+        /// Harness session id (default: $CLAUDE_CODE_SESSION_ID)
+        session_id: Option<String>,
+    },
     /// Record a session's task intent
     Intent {
         /// Session reference (ortak-3)
@@ -287,6 +292,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Blame { target } => blame(&target),
         Command::Why { args } => notes::run(&args),
         Command::Sessions => sessions(),
+        Command::Whoami { session_id } => whoami(session_id.as_deref()),
         Command::Intent { session, text } => intent(&session, &text.join(" ")),
         Command::Tell {
             to,
@@ -728,6 +734,45 @@ fn print_sessions(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Answer "which session am I here?" from the one handle that survives.
+///
+/// `ortak-N` is a row id handed out in registration order, so it is per
+/// workspace and it moves: wipe `.ortak`, or start the two sessions in the
+/// other order, and the numbers swap. A session resumed from a compacted
+/// context, or one reading a findings file from last week, has no way to check
+/// which is which. The harness session id does not move, so ask with that.
+fn whoami(session_id: Option<&str>) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    // Claude Code exports its session id, which is the same string the hooks
+    // are handed on stdin and the same one `sessions.external_id` stores.
+    // Nothing else is assumed to, so every other harness passes it in.
+    let external_id = match session_id {
+        Some(id) => id.to_string(),
+        None => std::env::var("CLAUDE_CODE_SESSION_ID").map_err(|_| {
+            anyhow::anyhow!(
+                "no harness session id in the environment; pass it: ortak whoami <session-id>. \
+                 Claude Code exports it as CLAUDE_CODE_SESSION_ID"
+            )
+        })?,
+    };
+    let s = db.resolve_session(&external_id).map_err(|_| {
+        anyhow::anyhow!(
+            "no session in {} for harness id {}. This session has not registered here: it \
+             registers at SessionStart, and only in the workspace it starts in",
+            ws.root.display(),
+            external_id
+        )
+    })?;
+    println!("ortak-{} {} [{}]", s.id, s.agent_name, s.status);
+    println!("  harness id: {}", s.external_id);
+    println!(
+        "  intent: {}",
+        s.task_intent.as_deref().unwrap_or("(not reported)")
+    );
+    Ok(())
+}
+
 fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
@@ -800,7 +845,13 @@ fn intent(session_ref: &str, text: &str) -> Result<()> {
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
     db.set_intent(session.id, text)?;
-    println!("recorded intent for ortak-{}: {}", session.id, text);
+    // Naming the agent as well as the number is the cheap half of catching an
+    // intent recorded against the wrong session: `ortak intent ortak-3` from a
+    // session that is no longer ortak-3 silently overwrites the other one's.
+    println!(
+        "recorded intent for ortak-{} {}: {}",
+        session.id, session.agent_name, text
+    );
     Ok(())
 }
 
@@ -959,6 +1010,34 @@ mod blame_tests {
         );
         assert_eq!(owner_of(41).map(|o| o.session_id), Some(b));
         assert!(owner_of(20).is_none(), "the gap belongs to nobody");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What `whoami` rests on: `ortak-N` is registration order, so two sessions
+    /// starting in the other order swap numbers, and only the harness id still
+    /// points at the same session afterwards.
+    #[test]
+    fn the_numbers_move_but_the_harness_id_does_not() {
+        let path = std::env::temp_dir().join(format!("ortak-whoami-{}.sqlite", std::process::id()));
+        let register = |order: [&str; 2]| {
+            let _ = std::fs::remove_file(&path);
+            let db = Db::open(&path).unwrap();
+            for id in order {
+                db.upsert_session(id, &format!("claude-{id}"), "llm", Some("claude-code"))
+                    .unwrap();
+            }
+            (
+                db.resolve_session("sess-a").unwrap().id,
+                db.resolve_session("sess-b").unwrap().id,
+            )
+        };
+
+        assert_eq!(register(["sess-a", "sess-b"]), (1, 2));
+        assert_eq!(
+            register(["sess-b", "sess-a"]),
+            (2, 1),
+            "the number follows registration order, which is why nobody should trust it"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

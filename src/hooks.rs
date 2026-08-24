@@ -84,19 +84,22 @@ pub fn session_start() -> Result<()> {
         .unwrap_or("unknown")
         .to_string();
     let harness = harness_for(&input);
-    let id = db.upsert_session(
-        &external_id,
-        &agent_name_for(&external_id, harness),
-        "llm",
-        Some(harness),
-    )?;
-    // The no-git rule belongs here rather than only in the skill: a skill loads
-    // when the model judges it relevant, and this is the rule people get burned
-    // by. Advisory on purpose. Nothing blocks git, because the gate cannot tell
-    // a lone session's harmless commit from one that sweeps up another
-    // session's uncommitted work.
+    let agent = agent_name_for(&external_id, harness);
+    let id = db.upsert_session(&external_id, &agent, "llm", Some(harness))?;
+    // Two things are being said at once here. The no-git rule belongs in this
+    // hook rather than only in the skill: a skill loads when the model judges
+    // it relevant, and this is the rule people get burned by. Advisory on
+    // purpose. Nothing blocks git, because the gate cannot tell a lone
+    // session's harmless commit from one that sweeps up another session's
+    // uncommitted work. And the session is given both of its names, because the
+    // number is the one that moves: `ortak-{id}` is a row id in this
+    // workspace's database, reassigned when sessions register in a different
+    // order or `.ortak` is rebuilt, and a resumed session carries the old one
+    // in its context with no way to notice.
     let context = format!(
-        "ortak is active. The journal attributes this session's file changes to ortak-{id}. \
+        "ortak is active. The journal attributes this session's file changes to ortak-{id} \
+         ({agent}). If you are ever unsure which number is yours, `ortak whoami` answers from \
+         the harness session id, which does not move. \
          Before editing, record your task intent: `ortak intent ortak-{id} \"<one-sentence task>\"`. \
          Publish your changes as a branch and PR with: `ortak publish ortak-{id}`. \
          Do not run `git stash`, `checkout`, `switch`, `branch`, `commit` or `add` in this \
