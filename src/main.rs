@@ -111,6 +111,13 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Take a file's lines and journal rows back from whoever they were credited to
+    Claim {
+        /// Session reference (ortak-3)
+        session: String,
+        /// File to claim
+        file: String,
+    },
     /// Publish a session's net changes as a branch
     Publish {
         /// Session reference (ortak-3, human, or agent name)
@@ -308,6 +315,7 @@ fn run(cli: Cli) -> Result<()> {
         } => tell(&to, &text, from.as_deref(), stdin),
         Command::Inbox { session } => inbox(&session),
         Command::Release { session, file, all } => release(&session, file.as_deref(), all),
+        Command::Claim { session, file } => claim(&session, &file),
         Command::Publish {
             session,
             branch,
@@ -952,6 +960,49 @@ fn workspace_path(ws: &Workspace, arg: &str) -> Result<String> {
     let abs = abs.canonicalize().unwrap_or(abs);
     ws.relativize(&abs)
         .ok_or_else(|| anyhow::anyhow!("{} is outside the workspace {}", arg, ws.root.display()))
+}
+
+/// The other half of `release`. The journal could be told a write was not
+/// yours; nothing could tell it that one was, so repairing a misattribution
+/// needed the wrong owner to still be around to disown it first.
+///
+/// A whole file, and no `--all`. One journal row is one write with one shadow
+/// commit behind it, so there is no half of it to hand over line by line; and
+/// where `release --all` gives everything back, a `claim --all` would take the
+/// workspace off everybody at once. Repair is one file at a time.
+fn claim(session_ref: &str, file: &str) -> Result<()> {
+    let ws = Workspace::discover_from_cwd()?;
+    let db = Db::open(&ws.db_path)?;
+    let session = db.resolve_session(session_ref)?;
+    let rel = workspace_path(&ws, file)?;
+    let (regions, edits, from) = db.claim_file(session.id, &rel)?;
+    println!(
+        "claimed {} region(s) and {} journal row(s) on {} for ortak-{}",
+        regions, edits, rel, session.id
+    );
+    println!(
+        "`ortak blame {}` and `ortak log` mark them claimed, not written",
+        rel
+    );
+    // Work taken quietly is what this command could become, so the sessions it
+    // came from hear it from the journal rather than from a publish that has
+    // lost a file.
+    for other in &from {
+        db.send_message(
+            session.id,
+            *other,
+            &format!(
+                "ortak-{} claimed {}: what the journal credited to you there is theirs now. \
+                 If that is wrong, `ortak claim ortak-{} {}` takes it back.",
+                session.id, rel, other, rel
+            ),
+        )?;
+    }
+    if !from.is_empty() {
+        let names: Vec<String> = from.iter().map(|id| format!("ortak-{}", id)).collect();
+        println!("taken from {}, and they have been told", names.join(", "));
+    }
+    Ok(())
 }
 
 fn intent(session_ref: &str, text: &str) -> Result<()> {
