@@ -14,6 +14,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct Status {
     pub daemon: Daemon,
+    pub journal: Journal,
     pub sessions: Vec<Session>,
     pub regions: Vec<Region>,
 }
@@ -23,6 +24,26 @@ pub struct Daemon {
     pub running: bool,
     /// Seconds since the last heartbeat, null if the daemon never started.
     pub heartbeat_age_secs: Option<i64>,
+}
+
+/// Whether the daemon is managing to record what it sees. A healthy heartbeat
+/// and a failing journal look the same from `daemon` alone, so a session whose
+/// edits are not landing cannot tell from there.
+#[derive(Serialize)]
+pub struct Journal {
+    /// Files the daemon is failing on right now.
+    pub failing_files: usize,
+    /// The newest failure, null while the journal is healthy.
+    pub newest_failure: Option<Failure>,
+}
+
+#[derive(Serialize)]
+pub struct Failure {
+    pub file: String,
+    pub reason: String,
+    /// Consecutive failed attempts on this file.
+    pub streak: i64,
+    pub ts: i64,
 }
 
 #[derive(Serialize)]
@@ -56,6 +77,11 @@ pub struct Edit {
     pub file: String,
     pub change: String,
     pub ts: i64,
+    /// Where the owner came from: "hook" when the session reported the file
+    /// itself, "claim" when the daemon inferred it from a command that session
+    /// was running, null when nothing claimed it and the change fell to the
+    /// human session. A reader deciding whether to trust `session` needs this.
+    pub attribution: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -103,10 +129,20 @@ pub fn status(db: &Db, presence_secs: i64) -> Result<Status> {
             age_secs: (now - last_ts).max(0),
         })
         .collect();
+    let failing = db.journal_failures()?;
     Ok(Status {
         daemon: Daemon {
             running: age.is_some_and(|a| a <= crate::db::HEARTBEAT_ALIVE_SECS),
             heartbeat_age_secs: age,
+        },
+        journal: Journal {
+            failing_files: failing.len(),
+            newest_failure: failing.first().map(|f| Failure {
+                file: f.file.clone(),
+                reason: f.reason.clone(),
+                streak: f.streak,
+                ts: f.ts,
+            }),
         },
         sessions,
         regions,
@@ -121,6 +157,7 @@ pub fn edits(rows: Vec<EditRow>) -> Vec<Edit> {
             file: e.file,
             change: e.change_kind,
             ts: e.ts,
+            attribution: e.attributed_by,
         })
         .collect()
 }
@@ -149,6 +186,15 @@ mod tests {
                 running: true,
                 heartbeat_age_secs: Some(3),
             },
+            journal: Journal {
+                failing_files: 1,
+                newest_failure: Some(Failure {
+                    file: "src/db.rs".into(),
+                    reason: "the index is locked".into(),
+                    streak: 4,
+                    ts: 1_700_000_000,
+                }),
+            },
             sessions: vec![Session {
                 session: "ortak-2".into(),
                 agent: "claude-be11".into(),
@@ -169,7 +215,27 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
-            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
+            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
         );
+    }
+
+    #[test]
+    fn an_edit_payload_says_where_its_owner_came_from() {
+        let row = |attributed_by: Option<&str>| EditRow {
+            id: 1,
+            session_id: 2,
+            agent_name: "claude-be11".into(),
+            file: "src/db.rs".into(),
+            change_kind: "modify".into(),
+            shadow_commit: None,
+            ts: 1_700_000_000,
+            attributed_by: attributed_by.map(str::to_string),
+        };
+        let of = |a| edits(vec![row(a)]).remove(0).attribution;
+        assert_eq!(of(Some("claim")).as_deref(), Some("claim"));
+        assert_eq!(of(Some("hook")).as_deref(), Some("hook"));
+        // Nothing claimed the file and the change fell to the human session,
+        // which is a different fact from a session having reported it.
+        assert_eq!(of(None), None);
     }
 }
