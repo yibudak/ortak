@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::{Attribution, Db};
+use crate::db::{self, Attribution, Db};
 use crate::shadow::{self, Change};
 use crate::workspace::Workspace;
 use anyhow::{bail, Result};
@@ -58,8 +58,27 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
         "foreground"
     };
     log(&format!("daemon started ({}): {}", how, ws.root.display()));
+    // A heartbeat older than the alive threshold means nobody was watching, and
+    // both ends of the gap are known: that last beat, and now. Read it before
+    // this run's first heartbeat overwrites the only record of it.
+    let back = db::now_ts();
+    let stopped_at = db
+        .last_heartbeat()?
+        .filter(|t| back - t > db::HEARTBEAT_ALIVE_SECS);
     db.heartbeat()?;
-    startup_scan(&db, &repo, ws, human_id);
+    let journaled = startup_scan(&db, &repo, ws, human_id);
+    if let Some(start) = stopped_at {
+        let outage = db::Outage {
+            start,
+            end: back,
+            journaled,
+        };
+        log(&format!(
+            "the journal has a {}s gap; `ortak status` reports it for an hour",
+            outage.secs()
+        ));
+        db.record_outage(&outage)?;
+    }
 
     let mut pending: HashMap<String, Instant> = HashMap::new();
     let mut last_beat = Instant::now();
@@ -443,14 +462,14 @@ fn process_snapshots(db: &Db, repo: &git2::Repository, rel: &str) -> Result<bool
 
 /// Catch up on changes made while the daemon was down. Attribution hints are
 /// long stale by now, so everything found here lands on the human session.
-fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64) {
+fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64) -> u32 {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = match repo.statuses(Some(&mut opts)) {
         Ok(s) => s,
         Err(e) => {
             log(&format!("startup scan failed: {}", e));
-            return;
+            return 0;
         }
     };
     let mut journaled = 0u32;
@@ -466,6 +485,7 @@ fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64)
             journaled
         ));
     }
+    journaled
 }
 
 fn log(msg: &str) {

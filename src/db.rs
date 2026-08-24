@@ -12,6 +12,10 @@ pub const HINT_TTL_SECS: i64 = 15;
 pub const BASH_CLAIM: &str = "*";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
+/// How long an outage is still worth reporting in `status` (seconds). The
+/// question after one is always "what did I just miss", never "what happened
+/// last Tuesday".
+pub const OUTAGE_RECENT_SECS: i64 = 3600;
 
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
@@ -178,6 +182,28 @@ pub struct JournalFailure {
     pub ts: i64,
     /// Consecutive failed attempts on this file.
     pub streak: i64,
+}
+
+/// A stretch with no daemon, so nothing written in it reached the journal.
+/// Both ends are known: the last heartbeat before it stopped, and the moment
+/// one started again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Outage {
+    pub start: i64,
+    pub end: i64,
+    /// Files the startup scan caught up on afterwards, against the human
+    /// session. The difference between "you may have lost something" and
+    /// "these three were picked up".
+    pub journaled: u32,
+}
+
+impl Outage {
+    pub fn secs(&self) -> i64 {
+        (self.end - self.start).max(0)
+    }
+    pub fn recent(&self, now: i64) -> bool {
+        now - self.end <= OUTAGE_RECENT_SECS
+    }
 }
 
 pub struct Db {
@@ -1198,6 +1224,13 @@ impl Db {
 
     /// Seconds since the daemon's last heartbeat, if any.
     pub fn heartbeat_age(&self) -> Result<Option<i64>> {
+        Ok(self.last_heartbeat()?.map(|t| now_ts() - t))
+    }
+
+    /// When the daemon last said it was alive. A starting daemon reads this
+    /// before writing its own beat, which is the only moment the previous one
+    /// is still legible.
+    pub fn last_heartbeat(&self) -> Result<Option<i64>> {
         let v: Option<String> = self
             .conn
             .query_row(
@@ -1206,7 +1239,31 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(v.and_then(|s| s.parse::<i64>().ok()).map(|t| now_ts() - t))
+        Ok(v.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// Keep the newest outage, replacing any older one. A history would answer
+    /// a question nobody asks, and the one that gets asked is about the gap
+    /// that just happened.
+    pub fn record_outage(&self, outage: &Outage) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_outage', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![serde_json::to_string(outage)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_outage(&self) -> Result<Option<Outage>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_outage'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|s| serde_json::from_str(&s).ok()))
     }
 }
 
@@ -1689,5 +1746,30 @@ mod tests {
         // and the mark goes with the row the printed age belongs to.
         wrote(guessed, 1, Some(Attribution::Hook));
         assert!(!owner_of(guessed).inferred);
+    }
+
+    #[test]
+    fn only_the_newest_outage_is_kept() {
+        let db = db();
+        assert!(db.last_outage().unwrap().is_none(), "nothing has stopped");
+
+        db.record_outage(&Outage {
+            start: 100,
+            end: 190,
+            journaled: 3,
+        })
+        .unwrap();
+        db.record_outage(&Outage {
+            start: 400,
+            end: 402,
+            journaled: 0,
+        })
+        .unwrap();
+
+        let o = db.last_outage().unwrap().expect("an outage");
+        assert_eq!((o.start, o.end, o.journaled), (400, 402, 0));
+        assert_eq!(o.secs(), 2);
+        assert!(o.recent(o.end + 60), "this is the one being asked about");
+        assert!(!o.recent(o.end + OUTAGE_RECENT_SECS + 1));
     }
 }
