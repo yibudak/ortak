@@ -11,6 +11,8 @@ version.
 | `ortak daemon` | Run the watcher in the foreground. |
 | `ortak daemon --detach` | Start the watcher in the background. |
 | `ortak daemon --stop` | Stop the daemon named by `.ortak/daemon.pid`. |
+| `ortak doctor` | Check whether this workspace can publish, and say what to fix. Exits non-zero when a check fails. |
+| `ortak doctor --json` | Emit the same report for a script. |
 | `ortak update` | Update stale binary, Codex plugin, and Claude Code plugin components. |
 
 ## Observe the workspace
