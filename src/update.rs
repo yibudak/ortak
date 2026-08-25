@@ -31,6 +31,9 @@ fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
     attempt("Claude plugin", &mut failures, &mut updated, || {
         update_claude(runtime, &latest)
     });
+    attempt("OpenCode plugin", &mut failures, &mut updated, || {
+        update_opencode(runtime, executable, &latest)
+    });
 
     if !failures.is_empty() {
         anyhow::bail!("update incomplete:\n  - {}", failures.join("\n  - "));
@@ -196,6 +199,34 @@ fn update_claude(runtime: &mut impl Runtime, latest: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn update_opencode(runtime: &mut impl Runtime, executable: &Path, latest: &str) -> Result<bool> {
+    if !runtime.available("opencode") {
+        println!("OpenCode not found; skipping its Ortak plugin.");
+        return Ok(false);
+    }
+    let Some(installed) = runtime.opencode_plugin_version()? else {
+        println!("Ortak is not installed in OpenCode; skipping it.");
+        return Ok(false);
+    };
+    if normalize_version(&installed) == Some(latest) {
+        println!("OpenCode plugin and skill already up to date: {latest}");
+        return Ok(false);
+    }
+
+    println!("Updating the OpenCode plugin and skill from {installed} to {latest}...");
+    // The binary may have replaced itself earlier in this run. Invoke the path
+    // again so the newly installed binary writes its matching embedded adapter.
+    runtime.install_opencode_plugin(executable)?;
+    let version = runtime
+        .opencode_plugin_version()?
+        .context("OpenCode's Ortak plugin disappeared after the update")?;
+    if normalize_version(&version) != Some(latest) {
+        anyhow::bail!("OpenCode reports plugin version {version}; expected {latest}");
+    }
+    println!("OpenCode plugin and skill updated.");
+    Ok(true)
+}
+
 fn verify_plugin(runtime: &mut impl Runtime, program: &str, expected: &str) -> Result<()> {
     let installed = installed_plugin(runtime, program)?
         .with_context(|| format!("{PLUGIN_ID} disappeared after the update"))?;
@@ -294,6 +325,8 @@ impl CommandOutput {
 trait Runtime {
     fn available(&self, program: &str) -> bool;
     fn install_binary(&mut self, install_dir: &Path) -> Result<()>;
+    fn opencode_plugin_version(&mut self) -> Result<Option<String>>;
+    fn install_opencode_plugin(&mut self, executable: &Path) -> Result<()>;
     fn output(&mut self, program: &OsStr, args: &[&str]) -> Result<CommandOutput>;
 }
 
@@ -327,6 +360,24 @@ impl Runtime for System {
         write_result?;
         if !status.success() {
             anyhow::bail!("the embedded installer exited with {status}");
+        }
+        Ok(())
+    }
+
+    fn opencode_plugin_version(&mut self) -> Result<Option<String>> {
+        crate::opencode::installed_version()
+    }
+
+    fn install_opencode_plugin(&mut self, executable: &Path) -> Result<()> {
+        let output = self.output(executable.as_os_str(), &["opencode", "install"])?;
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+        }
+        if !output.success {
+            anyhow::bail!("`ortak opencode install` failed: {}", output.failure());
         }
         Ok(())
     }
@@ -469,6 +520,23 @@ mod tests {
     }
 
     #[test]
+    fn updates_an_installed_opencode_plugin_with_the_current_binary() {
+        let mut runtime = Fake::with_programs(&["opencode"]);
+        runtime.responses = VecDeque::from([release(CURRENT_VERSION)]);
+        runtime.opencode_version = Some("0.1.0".to_string());
+        runtime.opencode_after_install = Some(CURRENT_VERSION.to_string());
+
+        run_with(&mut runtime, Path::new("/opt/ortak/bin/ortak")).unwrap();
+
+        assert_latest_call(&runtime.calls[0]);
+        assert_eq!(
+            &runtime.calls[1..],
+            ["/opt/ortak/bin/ortak opencode install"]
+        );
+        assert_eq!(runtime.opencode_version.as_deref(), Some(CURRENT_VERSION));
+    }
+
+    #[test]
     fn one_failure_does_not_prevent_the_other_updates() {
         let mut runtime = Fake::with_programs(&["codex", "claude"]);
         runtime.install_error = true;
@@ -550,6 +618,8 @@ mod tests {
         calls: Vec<String>,
         installed_in: Option<PathBuf>,
         install_error: bool,
+        opencode_version: Option<String>,
+        opencode_after_install: Option<String>,
     }
 
     impl Fake {
@@ -563,6 +633,8 @@ mod tests {
                 calls: Vec::new(),
                 installed_in: None,
                 install_error: false,
+                opencode_version: None,
+                opencode_after_install: None,
             }
         }
     }
@@ -577,6 +649,17 @@ mod tests {
             if self.install_error {
                 anyhow::bail!("simulated installer failure");
             }
+            Ok(())
+        }
+
+        fn opencode_plugin_version(&mut self) -> Result<Option<String>> {
+            Ok(self.opencode_version.clone())
+        }
+
+        fn install_opencode_plugin(&mut self, executable: &Path) -> Result<()> {
+            self.calls
+                .push(format!("{} opencode install", executable.display()));
+            self.opencode_version = self.opencode_after_install.clone();
             Ok(())
         }
 

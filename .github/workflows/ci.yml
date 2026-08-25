@@ -28,6 +28,9 @@ jobs:
       - name: Check installer syntax
         run: sh -n install.sh
 
+      - name: Test OpenCode plugin
+        run: node --test tests/opencode_plugin.test.mjs
+
       - name: Check formatting
         run: cargo fmt --all --check
 

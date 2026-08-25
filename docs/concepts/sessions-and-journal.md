@@ -15,8 +15,9 @@ ortak whoami
 ortak whoami <session-id>
 ```
 
-The generated agent label, such as `claude-a1b2c3d4` or `codex-a1b2c3d4`, helps
-people distinguish sessions in status and gate messages.
+The generated agent label, such as `claude-a1b2c3d4`, `codex-a1b2c3d4`, or
+`opencode-a1b2c3d4`, helps people distinguish sessions in status and gate
+messages.
 
 ## Task intent
 

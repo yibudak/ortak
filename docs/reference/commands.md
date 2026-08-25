@@ -11,7 +11,10 @@ version.
 | `ortak daemon` | Run the watcher in the foreground. |
 | `ortak daemon --detach` | Start the watcher in the background. |
 | `ortak daemon --stop` | Stop the daemon named by `.ortak/daemon.pid`. |
-| `ortak update` | Update stale binary, Codex plugin, and Claude Code plugin components. |
+| `ortak doctor` | Check whether this workspace can publish, and say what to fix. Exits non-zero when a check fails. |
+| `ortak doctor --json` | Emit the same report for a script. |
+| `ortak update` | Update stale binary and installed Claude Code, Codex, and OpenCode integrations. |
+| `ortak opencode install` | Install the global OpenCode plugin and workflow skill. |
 
 ## Observe the workspace
 
@@ -49,7 +52,7 @@ version.
 | `ortak errors` | List recent error records and current owners. |
 | `ortak errors --json` | Emit machine-readable error rows. |
 | `ortak assign <error-id> ortak-3` | Reassign an open error. |
-| `ortak resolved ortak-3` | Resolve errors owned by one session. |
+| `ortak resolved ortak-3` | Resolve the errors one session owns or reported. |
 | `ortak resolved --all` | Resolve every open error. |
 
 ## Publish
@@ -73,8 +76,8 @@ The default mode includes edits after the session's latest publish.
 
 ## Hook commands
 
-`ortak hook ...` is the adapter surface for Claude Code and Codex. Plugins call
-these commands with event JSON on stdin:
+`ortak hook ...` is the adapter surface for Claude Code, Codex, and OpenCode.
+Plugins call these commands with event JSON on stdin:
 
 ```text
 session-start
