@@ -140,6 +140,9 @@ pub struct Error {
     pub reporter: String,
     /// Whoever must act: the assigned session, else the reporter.
     pub responsible: String,
+    /// Who closed it, null while it is open. Not always `responsible`: the
+    /// session that reported an error may close it whoever it landed on.
+    pub resolved_by: Option<String>,
     pub excerpt: String,
     pub opened_at: i64,
 }
@@ -245,6 +248,7 @@ pub fn errors(rows: &[ErrorRow]) -> Vec<Error> {
             status: e.status.clone(),
             reporter: format!("ortak-{}", e.reporter),
             responsible: format!("ortak-{}", e.responsible()),
+            resolved_by: e.resolved_by.map(|id| format!("ortak-{}", id)),
             excerpt: e.excerpt.clone(),
             opened_at: e.ts_opened,
         })

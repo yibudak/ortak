@@ -157,6 +157,9 @@ pub struct ErrorRow {
     pub culprit_name: Option<String>,
     pub fix_brief: Option<String>,
     pub ts_opened: i64,
+    /// The session that closed it, which is not always the one that owed the
+    /// fix. NULL while the error is open, and for anything `--all` swept up.
+    pub resolved_by: Option<i64>,
 }
 
 impl ErrorRow {
@@ -344,7 +347,11 @@ CREATE TABLE IF NOT EXISTS errors (
   -- When the responsible session was handed its assignment, the way messages
   -- carry delivered_at. Cleared on reassignment, because the new owner has not
   -- heard it.
-  owner_told_at    INTEGER
+  owner_told_at    INTEGER,
+  -- Who cleared it, which is not always the session that owed the fix: the
+  -- reporter may close what it reported. NULL for the errors `--all` swept up,
+  -- where nobody was named.
+  resolved_by      INTEGER REFERENCES sessions(id)
 );
 CREATE TABLE IF NOT EXISTS publishes (
   id           INTEGER PRIMARY KEY,
@@ -401,6 +408,7 @@ impl Db {
             "ALTER TABLE edits ADD COLUMN disowned INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("ALTER TABLE errors ADD COLUMN resolved_by INTEGER", []);
         let _ = conn.execute(
             "ALTER TABLE regions ADD COLUMN cooled INTEGER NOT NULL DEFAULT 0",
             [],
@@ -1484,7 +1492,8 @@ impl Db {
     fn error_rows(&self, only_open: bool, limit: u32) -> Result<Vec<ErrorRow>> {
         let sql = format!(
             "SELECT e.id, e.reporter_session, rs.agent_name, e.command, e.output_excerpt,
-                    e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened
+                    e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened,
+                    e.resolved_by
              FROM errors e
              JOIN sessions rs ON rs.id = e.reporter_session
              LEFT JOIN sessions cs ON cs.id = e.culprit_session
@@ -1516,7 +1525,8 @@ impl Db {
         let found = {
             let mut stmt = tx.prepare(
                 "SELECT e.id, e.reporter_session, rs.agent_name, e.command, e.output_excerpt,
-                        e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened
+                        e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened,
+                        e.resolved_by
                  FROM errors e
                  JOIN sessions rs ON rs.id = e.reporter_session
                  LEFT JOIN sessions cs ON cs.id = e.culprit_session
@@ -1541,16 +1551,32 @@ impl Db {
         self.error_rows(false, limit)
     }
 
-    /// Resolve open errors. With a session: those it is responsible for
-    /// (assigned culprit, or unassigned ones it reported). Without: all.
+    /// Resolve open errors. With a session: the ones it owns and the ones it
+    /// reported. Without: all.
+    ///
+    /// The reporter used to lose its own error the moment blame assigned a
+    /// culprit, which `report` does almost every time, and what was left was
+    /// typing the owner's name: the CLI carries no session identity, so that
+    /// works, and it reads as one session impersonating another in the one
+    /// record that exists to say who was responsible. The reporter is also the
+    /// session that can tell whether the thing is fixed, because it is the one
+    /// that ran the command.
+    ///
+    /// A third session still cannot: a stop-the-line anyone may lift is a
+    /// suggestion, and `--all` is already the loud way to do that.
+    ///
+    /// ponytail: nothing stops a session passing another session's name here.
+    /// That is #8's deferred item from round 1, and it wants an identity the
+    /// CLI does not have rather than another clause in this WHERE.
     pub fn resolve_errors(&self, responsible: Option<i64>) -> Result<usize> {
         let n = match responsible {
             Some(id) => self.conn.execute(
-                "UPDATE errors SET status = 'resolved', ts_resolved = ?2
+                "UPDATE errors SET status = 'resolved', ts_resolved = ?2, resolved_by = ?1
                  WHERE status = 'open'
-                   AND (culprit_session = ?1 OR (culprit_session IS NULL AND reporter_session = ?1))",
+                   AND (culprit_session = ?1 OR reporter_session = ?1)",
                 params![id, now_ts()],
             )?,
+            // Nobody was named, so nobody is recorded as having closed them.
             None => self.conn.execute(
                 "UPDATE errors SET status = 'resolved', ts_resolved = ?1 WHERE status = 'open'",
                 params![now_ts()],
@@ -1702,6 +1728,7 @@ fn row_to_error(r: &rusqlite::Row<'_>) -> rusqlite::Result<ErrorRow> {
         culprit_name: r.get(7)?,
         fix_brief: r.get(8)?,
         ts_opened: r.get(9)?,
+        resolved_by: r.get(10)?,
     })
 }
 
@@ -2816,6 +2843,49 @@ mod tests {
         assert_eq!(db.resolve_errors(None).unwrap(), 3);
         assert!(db.take_owner_notice(culprit).unwrap().is_none());
         assert!(db.open_errors().unwrap().is_empty(), "#{} closed", unread);
+    }
+
+    /// The round-7 incident: A reported a clippy failure in B's file, watched B
+    /// fix it, saw clippy go clean, and could not clear the line, because blame
+    /// had assigned the error to B by then. What was left was typing B's name,
+    /// which nothing here can tell from B typing it.
+    #[test]
+    fn the_session_that_reported_an_error_can_close_it() {
+        let db = temp_db("reporter-closes");
+        let reporter = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let owner = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        let bystander = db.upsert_session("c", "claude-c", "llm", None).unwrap();
+        let id = db
+            .insert_error(
+                reporter,
+                Some("cargo clippy"),
+                "unused import: `std::fmt` --> src/db.rs:4:5",
+                Some(owner),
+                None,
+            )
+            .unwrap();
+
+        // A line anyone may lift is a suggestion, so a session that neither
+        // reported this nor owns it clears nothing.
+        assert_eq!(db.resolve_errors(Some(bystander)).unwrap(), 0);
+        assert_eq!(db.open_errors().unwrap().len(), 1);
+
+        // Reassigned twice, and it is still the reporter's report.
+        db.assign_error(id, bystander).unwrap();
+        db.assign_error(id, owner).unwrap();
+        assert_eq!(db.resolve_errors(Some(reporter)).unwrap(), 1);
+        assert!(db.open_errors().unwrap().is_empty(), "line open");
+
+        // The record keeps both: who owed the fix, and who said it was done.
+        let closed = db.list_errors(10).unwrap().remove(0);
+        assert_eq!(closed.responsible(), owner);
+        assert_eq!(closed.resolved_by, Some(reporter));
+
+        // --all names nobody, so it records nobody.
+        db.insert_error(reporter, None, "linker crashed", Some(owner), None)
+            .unwrap();
+        assert_eq!(db.resolve_errors(None).unwrap(), 1);
+        assert_eq!(db.list_errors(10).unwrap().remove(0).resolved_by, None);
     }
 
     /// One session, one file, two edits: an ordinary one and one the daemon
