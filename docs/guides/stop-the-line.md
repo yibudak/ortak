@@ -58,6 +58,10 @@ line:
 ortak resolved ortak-3
 ```
 
+The session that reported the failure may close it too, whoever it was assigned
+to: it ran the command, so it is the one that can tell the failure is gone. A
+session that neither reported nor owns the error cannot.
+
 Use `--all` only when you intend to clear every open error:
 
 ```bash

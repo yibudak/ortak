@@ -18,6 +18,17 @@ pub const BASH_CLAIM: &str = "*";
 /// to cover that wait, short enough not to catch the next thing typed, and
 /// whole seconds is as fine as a stored timestamp goes.
 pub const CLAIM_GRACE_SECS: i64 = 3;
+/// How long a session's own write still speaks for the next change to the same
+/// file that nothing claims (seconds).
+///
+/// Something rewriting a file moments after the tool wrote it is ordinary:
+/// format-on-save, a `PostToolUse` formatter, a CRLF filter, a codegen step.
+/// No hook names that write and no command claims it, so it used to land on
+/// the human and take the session's lines with it. Wide enough to cover the
+/// daemon's unattributed-quiet window and a slow formatter behind it, narrow
+/// enough that a person typing in the file a few seconds later is still a
+/// person.
+pub const SETTLE_SECS: i64 = 5;
 
 /// The sessions whose Bash claim speaks for a write right now: a command still
 /// running, or one that ended inside the grace. `?1` is `BASH_CLAIM` and `?2`
@@ -28,6 +39,11 @@ const LIVE_CLAIMANTS: &str =
     "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
       WHERE h.file = ?1 AND s.status = 'active'
         AND (h.closed_at IS NULL OR h.closed_at >= ?2)";
+/// The session columns `row_to_session` reads, in the order it reads them. One
+/// copy, because a query that selects them in another order fills the fields
+/// with each other's values and nothing complains.
+const SESSION_COLS: &str =
+    "id, external_id, agent_name, kind, harness, task_intent, status, started_at, last_seen";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
 /// How long an outage is still worth reporting in `status` (seconds). The
@@ -70,6 +86,13 @@ pub struct Session {
     pub status: String,
     #[allow(dead_code)]
     pub started_at: i64,
+    /// When any hook last spoke for this session. Null on a row written before
+    /// the stamp existed.
+    ///
+    /// ponytail: evidence, not a verdict. A session thinking for twenty minutes
+    /// and one killed mid-turn look identical from here, so nothing in the tool
+    /// reads this to decide anything; a person looks at the number and decides.
+    pub last_seen: Option<i64>,
 }
 
 /// How the daemon worked out who owns an edit. An edit hook naming the file is
@@ -92,6 +115,11 @@ pub enum Attribution {
     /// same in the journal, and only one of them is worth a reader's attention.
     Contested,
     Claimed,
+    /// Nothing named this write and nothing claimed it, but the session that
+    /// wrote the same file seconds earlier is still the likeliest author: a
+    /// formatter, a codegen step or an editor rewriting what the tool had just
+    /// written. Weaker than `Claim`, which at least has a command open.
+    Settled,
 }
 
 impl Attribution {
@@ -101,6 +129,7 @@ impl Attribution {
             Attribution::Claim => "claim",
             Attribution::Contested => "contested",
             Attribution::Claimed => "claimed",
+            Attribution::Settled => "settled",
         }
     }
 }
@@ -114,6 +143,9 @@ pub fn attribution_note(attributed_by: Option<&str>) -> &'static str {
         Some(s) if s == Attribution::Claim.as_str() => "inferred from a running command",
         Some(s) if s == Attribution::Contested.as_str() => "two sessions had commands open",
         Some(s) if s == Attribution::Claimed.as_str() => "claimed after the fact",
+        Some(s) if s == Attribution::Settled.as_str() => {
+            "rewritten right after that session wrote it"
+        }
         _ => "",
     }
 }
@@ -145,6 +177,9 @@ pub struct ErrorRow {
     pub culprit_name: Option<String>,
     pub fix_brief: Option<String>,
     pub ts_opened: i64,
+    /// The session that closed it, which is not always the one that owed the
+    /// fix. NULL while the error is open, and for anything `--all` swept up.
+    pub resolved_by: Option<i64>,
 }
 
 impl ErrorRow {
@@ -276,7 +311,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   task_intent  TEXT,
   status       TEXT NOT NULL DEFAULT 'active', -- 'active' | 'done'
   started_at   INTEGER NOT NULL,
-  ended_at     INTEGER
+  ended_at     INTEGER,
+  last_seen    INTEGER                    -- newest hook from this session
 );
 CREATE TABLE IF NOT EXISTS edits (
   id            INTEGER PRIMARY KEY,
@@ -331,7 +367,11 @@ CREATE TABLE IF NOT EXISTS errors (
   -- When the responsible session was handed its assignment, the way messages
   -- carry delivered_at. Cleared on reassignment, because the new owner has not
   -- heard it.
-  owner_told_at    INTEGER
+  owner_told_at    INTEGER,
+  -- Who cleared it, which is not always the session that owed the fix: the
+  -- reporter may close what it reported. NULL for the errors `--all` swept up,
+  -- where nobody was named.
+  resolved_by      INTEGER REFERENCES sessions(id)
 );
 CREATE TABLE IF NOT EXISTS publishes (
   id           INTEGER PRIMARY KEY,
@@ -388,6 +428,7 @@ impl Db {
             "ALTER TABLE edits ADD COLUMN disowned INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("ALTER TABLE errors ADD COLUMN resolved_by INTEGER", []);
         let _ = conn.execute(
             "ALTER TABLE regions ADD COLUMN cooled INTEGER NOT NULL DEFAULT 0",
             [],
@@ -395,11 +436,17 @@ impl Db {
         let _ = conn.execute("ALTER TABLE errors ADD COLUMN owner_told_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE regions ADD COLUMN attributed_by TEXT", []);
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN closed_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen INTEGER", []);
         Ok(Db { conn })
     }
 
     // ---- sessions -------------------------------------------------------
 
+    /// Register a session, or mark an existing one active again.
+    ///
+    /// Every hook runs this before it does anything else, which is why the
+    /// `last_seen` stamp lives here rather than in the seven hook bodies: one
+    /// write, in the write that was already happening, and no hook to forget.
     pub fn upsert_session(
         &self,
         external_id: &str,
@@ -408,9 +455,11 @@ impl Db {
         harness: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (external_id, agent_name, kind, harness, status, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5)
-             ON CONFLICT(external_id) DO UPDATE SET status = 'active', ended_at = NULL",
+            "INSERT INTO sessions
+                 (external_id, agent_name, kind, harness, status, started_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+             ON CONFLICT(external_id) DO UPDATE
+                 SET status = 'active', ended_at = NULL, last_seen = ?5",
             params![external_id, agent_name, kind, harness, now_ts()],
         )?;
         let id: i64 = self.conn.query_row(
@@ -450,8 +499,7 @@ impl Db {
         let s = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE id = ?1",
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
                 params![id],
                 row_to_session,
             )
@@ -463,10 +511,9 @@ impl Db {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-             FROM sessions ORDER BY id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY id"))?;
         let rows = stmt.query_map([], row_to_session)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -482,8 +529,7 @@ impl Db {
         let by_ext = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE external_id = ?1",
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE external_id = ?1"),
                 params![reference],
                 row_to_session,
             )
@@ -494,8 +540,10 @@ impl Db {
         let by_agent = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE agent_name = ?1 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT {SESSION_COLS} FROM sessions
+                      WHERE agent_name = ?1 ORDER BY id DESC LIMIT 1"
+                ),
                 params![reference],
                 row_to_session,
             )
@@ -572,13 +620,35 @@ impl Db {
             .query_map(params![BASH_CLAIM, claim_grace_cutoff()], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
-            [] => None,
+            // Nothing named this write and nobody has a command open. Before it
+            // falls to the human, the journal gets asked: a file rewritten
+            // seconds after a session wrote it is that write settling.
+            [] => self
+                .settling_writer(file)?
+                .map(|id| (id, Attribution::Settled)),
             [only] => Some((*only, Attribution::Claim)),
             _ => match self.claimant_in_file(file)? {
                 Some(id) => Some((id, Attribution::Claim)),
                 None => Some((self.ensure_human()?, Attribution::Contested)),
             },
         })
+    }
+
+    /// The session that wrote this file within `SETTLE_SECS`, if it is still
+    /// working here. `None` once the window has passed, and for the human's own
+    /// rows: a person's write is not evidence about the next one.
+    fn settling_writer(&self, file: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT e.session_id FROM edits e JOIN sessions s ON s.id = e.session_id
+                  WHERE e.file = ?1 AND e.ts >= ?2 AND e.disowned = 0
+                    AND s.status = 'active' AND s.kind != 'human'
+                  ORDER BY e.id DESC LIMIT 1",
+                params![file, now_ts() - SETTLE_SECS],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Of the sessions with a command open, the one that most recently wrote
@@ -1464,7 +1534,8 @@ impl Db {
     fn error_rows(&self, only_open: bool, limit: u32) -> Result<Vec<ErrorRow>> {
         let sql = format!(
             "SELECT e.id, e.reporter_session, rs.agent_name, e.command, e.output_excerpt,
-                    e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened
+                    e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened,
+                    e.resolved_by
              FROM errors e
              JOIN sessions rs ON rs.id = e.reporter_session
              LEFT JOIN sessions cs ON cs.id = e.culprit_session
@@ -1496,7 +1567,8 @@ impl Db {
         let found = {
             let mut stmt = tx.prepare(
                 "SELECT e.id, e.reporter_session, rs.agent_name, e.command, e.output_excerpt,
-                        e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened
+                        e.status, e.culprit_session, cs.agent_name, e.fix_brief, e.ts_opened,
+                        e.resolved_by
                  FROM errors e
                  JOIN sessions rs ON rs.id = e.reporter_session
                  LEFT JOIN sessions cs ON cs.id = e.culprit_session
@@ -1521,16 +1593,32 @@ impl Db {
         self.error_rows(false, limit)
     }
 
-    /// Resolve open errors. With a session: those it is responsible for
-    /// (assigned culprit, or unassigned ones it reported). Without: all.
+    /// Resolve open errors. With a session: the ones it owns and the ones it
+    /// reported. Without: all.
+    ///
+    /// The reporter used to lose its own error the moment blame assigned a
+    /// culprit, which `report` does almost every time, and what was left was
+    /// typing the owner's name: the CLI carries no session identity, so that
+    /// works, and it reads as one session impersonating another in the one
+    /// record that exists to say who was responsible. The reporter is also the
+    /// session that can tell whether the thing is fixed, because it is the one
+    /// that ran the command.
+    ///
+    /// A third session still cannot: a stop-the-line anyone may lift is a
+    /// suggestion, and `--all` is already the loud way to do that.
+    ///
+    /// ponytail: nothing stops a session passing another session's name here.
+    /// That is #8's deferred item from round 1, and it wants an identity the
+    /// CLI does not have rather than another clause in this WHERE.
     pub fn resolve_errors(&self, responsible: Option<i64>) -> Result<usize> {
         let n = match responsible {
             Some(id) => self.conn.execute(
-                "UPDATE errors SET status = 'resolved', ts_resolved = ?2
+                "UPDATE errors SET status = 'resolved', ts_resolved = ?2, resolved_by = ?1
                  WHERE status = 'open'
-                   AND (culprit_session = ?1 OR (culprit_session IS NULL AND reporter_session = ?1))",
+                   AND (culprit_session = ?1 OR reporter_session = ?1)",
                 params![id, now_ts()],
             )?,
+            // Nobody was named, so nobody is recorded as having closed them.
             None => self.conn.execute(
                 "UPDATE errors SET status = 'resolved', ts_resolved = ?1 WHERE status = 'open'",
                 params![now_ts()],
@@ -1682,6 +1770,7 @@ fn row_to_error(r: &rusqlite::Row<'_>) -> rusqlite::Result<ErrorRow> {
         culprit_name: r.get(7)?,
         fix_brief: r.get(8)?,
         ts_opened: r.get(9)?,
+        resolved_by: r.get(10)?,
     })
 }
 
@@ -1706,6 +1795,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         task_intent: r.get(5)?,
         status: r.get(6)?,
         started_at: r.get(7)?,
+        last_seen: r.get(8)?,
     })
 }
 
@@ -1721,6 +1811,81 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         Db::open(&path).unwrap()
+    }
+
+    /// Every hook registers before it does anything, so the stamp has to move
+    /// on a session that is only reading, and it has to survive the session
+    /// ending: what a stopped session last said is the whole point of keeping
+    /// it.
+    #[test]
+    fn a_session_is_stamped_whenever_a_hook_speaks_for_it() {
+        let db = temp_db("last-seen");
+        let id = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let first = db.get_session(id).unwrap().last_seen.unwrap();
+
+        // Registration and the second hook land in the same second, so age the
+        // row rather than wait for the clock.
+        db.conn
+            .execute(
+                "UPDATE sessions SET last_seen = ?2 WHERE id = ?1",
+                params![id, first - 600],
+            )
+            .unwrap();
+        db.upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let refreshed = db.get_session(id).unwrap().last_seen.unwrap();
+        assert!(refreshed >= first);
+
+        db.end_session("sess-a").unwrap();
+        let ended = db.get_session(id).unwrap();
+        assert_eq!(ended.status, "done");
+        assert_eq!(ended.last_seen, Some(refreshed), "the last word is kept");
+    }
+
+    /// A formatter rewriting what the tool just wrote used to land on the human
+    /// and take the session's lines with it, which is every workspace with
+    /// format-on-save.
+    #[test]
+    fn a_rewrite_right_after_a_session_wrote_the_file_is_still_that_sessions() {
+        let db = temp_db("settle");
+        let human = db.ensure_human().unwrap();
+        let agent = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+
+        // Nobody has touched it: an unclaimed write is the human's own.
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        db.insert_edit(
+            agent,
+            "src/x.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Settled))
+        );
+        // Only the file that was written, and only while the window is open.
+        assert_eq!(db.peek_hint("src/y.rs").unwrap(), None);
+        db.conn
+            .execute(
+                "UPDATE edits SET ts = ?1 WHERE file = 'src/x.rs'",
+                params![now_ts() - SETTLE_SECS - 1],
+            )
+            .unwrap();
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        // The human's own write says nothing about the next one, or every
+        // change to a file a person is editing would echo the one before it.
+        db.insert_edit(human, "src/z.rs", "modify", None, &[], None)
+            .unwrap();
+        assert_eq!(db.peek_hint("src/z.rs").unwrap(), None);
     }
 
     #[test]
@@ -2764,6 +2929,49 @@ mod tests {
         assert_eq!(db.resolve_errors(None).unwrap(), 3);
         assert!(db.take_owner_notice(culprit).unwrap().is_none());
         assert!(db.open_errors().unwrap().is_empty(), "#{} closed", unread);
+    }
+
+    /// The round-7 incident: A reported a clippy failure in B's file, watched B
+    /// fix it, saw clippy go clean, and could not clear the line, because blame
+    /// had assigned the error to B by then. What was left was typing B's name,
+    /// which nothing here can tell from B typing it.
+    #[test]
+    fn the_session_that_reported_an_error_can_close_it() {
+        let db = temp_db("reporter-closes");
+        let reporter = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let owner = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        let bystander = db.upsert_session("c", "claude-c", "llm", None).unwrap();
+        let id = db
+            .insert_error(
+                reporter,
+                Some("cargo clippy"),
+                "unused import: `std::fmt` --> src/db.rs:4:5",
+                Some(owner),
+                None,
+            )
+            .unwrap();
+
+        // A line anyone may lift is a suggestion, so a session that neither
+        // reported this nor owns it clears nothing.
+        assert_eq!(db.resolve_errors(Some(bystander)).unwrap(), 0);
+        assert_eq!(db.open_errors().unwrap().len(), 1);
+
+        // Reassigned twice, and it is still the reporter's report.
+        db.assign_error(id, bystander).unwrap();
+        db.assign_error(id, owner).unwrap();
+        assert_eq!(db.resolve_errors(Some(reporter)).unwrap(), 1);
+        assert!(db.open_errors().unwrap().is_empty(), "line open");
+
+        // The record keeps both: who owed the fix, and who said it was done.
+        let closed = db.list_errors(10).unwrap().remove(0);
+        assert_eq!(closed.responsible(), owner);
+        assert_eq!(closed.resolved_by, Some(reporter));
+
+        // --all names nobody, so it records nobody.
+        db.insert_error(reporter, None, "linker crashed", Some(owner), None)
+            .unwrap();
+        assert_eq!(db.resolve_errors(None).unwrap(), 1);
+        assert_eq!(db.list_errors(10).unwrap().remove(0).resolved_by, None);
     }
 
     /// One session, one file, two edits: an ordinary one and one the daemon
