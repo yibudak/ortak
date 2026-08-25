@@ -196,8 +196,23 @@ pub fn commit_edit(
     blob: Option<Oid>,
 ) -> Result<String> {
     let mut index = repo.index()?;
+    // git cannot hold a file and a directory at one path, and a session that
+    // flattens src/thing/mod.rs into src/thing hands the index exactly that.
+    // While the directory's entries are still there `index.add` drops the blob
+    // without a word, so the micro-commit recorded nothing, the journal row
+    // pointed at it anyway, and the publish that came later died on a file its
+    // own history did not contain. Removing entries under `rel/` is safe
+    // whatever this change is: nothing else can live under a path that is
+    // about to be a file, and an index with no such directory is untouched.
+    let _ = index.remove_dir(Path::new(rel), 0);
     match (change, blob) {
-        (Change::Delete, _) => index.remove_path(Path::new(rel))?,
+        // Not found when the entry was the directory the line above just
+        // emptied: a watcher that reports the parent rather than each child
+        // brings `rm -rf src/thing` here as one path, and the removal has
+        // already happened.
+        (Change::Delete, _) => {
+            let _ = index.remove_path(Path::new(rel));
+        }
         (_, Some(id)) => {
             let size = repo.find_blob(id)?.content().len() as u32;
             // Keep whatever mode the file already has: recording a snapshot
@@ -273,6 +288,40 @@ mod tests {
         let repo = open(&ws).unwrap();
         assert!(repo.is_path_ignored("LATER.txt").unwrap());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A module flattened from thing/mod.rs into a file called thing. The index
+    /// still held the directory, so `add` dropped the blob without a word: the
+    /// micro-commit recorded nothing, the journal row pointed at it anyway, and
+    /// the publish that came later died on a file its own history did not have.
+    #[test]
+    fn a_file_that_replaces_a_directory_reaches_the_micro_commit() {
+        let dir = std::env::temp_dir().join(format!("ortak-dirfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("thing")).unwrap();
+        std::fs::write(dir.join("thing/mod.rs"), "pub fn go() {}\n").unwrap();
+        let ws = Workspace::at(&dir);
+        let repo = init(&ws, &Config::default()).unwrap();
+        baseline(&repo).unwrap();
+
+        std::fs::remove_dir_all(dir.join("thing")).unwrap();
+        std::fs::write(dir.join("thing"), "pub fn go() {}\n").unwrap();
+        let id = commit_edit(&repo, "thing", Change::Modify, "claude-a", "a", None).unwrap();
+
+        let tree = repo
+            .find_commit(Oid::from_str(&id).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(
+            tree.get_path(Path::new("thing")).is_ok(),
+            "the file the session wrote is not in its own micro-commit"
+        );
+        assert!(
+            tree.get_path(Path::new("thing/mod.rs")).is_err(),
+            "and the directory it replaced is still in there beside it"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
