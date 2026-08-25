@@ -507,8 +507,12 @@ fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64)
         }
     }
     if journaled > 0 {
+        // Not "(human)": journal() takes a live hint like any other pass, so a
+        // file written seconds before the daemon came back lands on the session
+        // that wrote it. The count is what the scan knows; `ortak log` is where
+        // the owners are.
         log(&format!(
-            "startup scan journaled {} changes made while the daemon was stopped (human)",
+            "startup scan journaled {} changes made while the daemon was stopped",
             journaled
         ));
     }

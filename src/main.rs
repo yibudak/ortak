@@ -630,10 +630,9 @@ fn status(as_json: bool) -> Result<()> {
     if let Some(o) = db.last_outage()?.filter(|o| o.recent(db::now_ts())) {
         let recovered = match o.journaled {
             0 => "the startup scan found nothing to recover".to_string(),
-            n => format!(
-                "the startup scan recovered {} file(s) into the human session",
-                n
-            ),
+            // Where they landed is not recorded: the scan journals through the
+            // same path as everything else and a live hint keeps its owner.
+            n => format!("the startup scan recovered {} file(s)", n),
         };
         println!(
             "last outage: {} to {} ({}s); {}",
