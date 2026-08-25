@@ -12,6 +12,7 @@ mod orchestrator;
 mod publish;
 mod regions;
 mod shadow;
+mod uninstall;
 mod update;
 mod workspace;
 
@@ -36,6 +37,8 @@ struct Cli {
 enum Command {
     /// Update the current binary and installed agent plugins
     Update,
+    /// Remove the binary, agent plugins, bundled skills, and marketplaces
+    Uninstall,
     /// Install integrations for OpenCode
     #[command(name = "opencode")]
     OpenCode {
@@ -309,6 +312,7 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Update => update::run(),
+        Command::Uninstall => uninstall::run(),
         Command::OpenCode {
             command: OpenCodeCommand::Install,
         } => opencode::install(),

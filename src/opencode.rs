@@ -25,6 +25,16 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+pub fn uninstall() -> Result<()> {
+    let paths = paths()?;
+    if uninstall_from(&paths)? {
+        println!("OpenCode plugin and skill removed.");
+    } else {
+        println!("Ortak is not installed in OpenCode; skipping it.");
+    }
+    Ok(())
+}
+
 pub fn installed_version() -> Result<Option<String>> {
     installed_version_at(&paths()?)
 }
@@ -66,6 +76,37 @@ fn install_to(paths: &Paths) -> Result<()> {
     atomic_write(&paths.plugin, plugin.as_bytes())?;
     atomic_write(&paths.skill, SKILL.as_bytes())?;
     Ok(())
+}
+
+fn uninstall_from(paths: &Paths) -> Result<bool> {
+    let managed = paths.marker.try_exists()?;
+    let occupied = paths.plugin.try_exists()? || paths.skill.try_exists()?;
+    if !managed {
+        if occupied {
+            anyhow::bail!(
+                "refusing to remove an unmanaged OpenCode plugin or skill at {} and {}",
+                paths.plugin.display(),
+                paths.skill.display()
+            );
+        }
+        return Ok(false);
+    }
+
+    // Keep the ownership marker until the managed files are gone. If a removal
+    // fails, the next uninstall can safely recognize and finish the partial
+    // cleanup instead of mistaking it for user-owned content.
+    for path in [&paths.plugin, &paths.skill] {
+        if path.try_exists()? {
+            fs::remove_file(path)
+                .with_context(|| format!("could not remove {}", path.display()))?;
+        }
+    }
+    fs::remove_file(&paths.marker)
+        .with_context(|| format!("could not remove {}", paths.marker.display()))?;
+    if let Some(skill_dir) = paths.marker.parent() {
+        fs::remove_dir(skill_dir).ok();
+    }
+    Ok(true)
 }
 
 fn installed_version_at(paths: &Paths) -> Result<Option<String>> {
@@ -185,6 +226,35 @@ mod tests {
         fs::write(&paths.plugin, "user plugin\n").unwrap();
 
         let error = install_to(&paths).unwrap_err().to_string();
+        assert!(error.contains("unmanaged"));
+        assert_eq!(fs::read_to_string(&paths.plugin).unwrap(), "user plugin\n");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn uninstalls_only_a_marker_owned_plugin_and_skill() {
+        let (root, paths) = test_paths("uninstall");
+        install_to(&paths).unwrap();
+        let sibling = root.join("skills/keep/SKILL.md");
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::write(&sibling, "keep\n").unwrap();
+
+        assert!(uninstall_from(&paths).unwrap());
+        assert!(!paths.plugin.exists());
+        assert!(!paths.skill.exists());
+        assert!(!paths.marker.exists());
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "keep\n");
+        assert!(!uninstall_from(&paths).unwrap());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn refuses_to_remove_an_unmanaged_opencode_file() {
+        let (root, paths) = test_paths("uninstall-unmanaged");
+        fs::create_dir_all(paths.plugin.parent().unwrap()).unwrap();
+        fs::write(&paths.plugin, "user plugin\n").unwrap();
+
+        let error = uninstall_from(&paths).unwrap_err().to_string();
         assert!(error.contains("unmanaged"));
         assert_eq!(fs::read_to_string(&paths.plugin).unwrap(), "user plugin\n");
         fs::remove_dir_all(root).ok();
