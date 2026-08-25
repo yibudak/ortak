@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod db;
+mod doctor;
 mod hooks;
 mod impact;
 mod json;
@@ -44,6 +45,13 @@ enum Command {
         /// Stop the daemon running on this workspace
         #[arg(long, conflicts_with = "detach")]
         stop: bool,
+    },
+    /// Check whether this workspace can publish, and say what to fix if not.
+    /// Exits non-zero when a check fails
+    Doctor {
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Show daemon and session status
     Status {
@@ -299,6 +307,16 @@ fn run(cli: Cli) -> Result<()> {
             }
             let cfg = Config::load(&ws.config_path)?;
             daemon::run(&ws, &cfg)
+        }
+        Command::Doctor { json } => {
+            let ws = Workspace::discover_from_cwd()?;
+            let cfg = Config::load(&ws.config_path)?;
+            // The report is the output; a failed check is not an error to print
+            // a second time, it is an exit code for whatever ran this.
+            if !doctor::run(&ws, &cfg, json)? {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Command::Status { json } => status(json),
         Command::Log {

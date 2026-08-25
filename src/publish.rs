@@ -829,17 +829,14 @@ fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
 /// tree happens to sit on, which may be another session's task branch. A repo
 /// whose trunk is `master` published every task off HEAD and still printed
 /// `--base main`.
-fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
+pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
     repo.find_branch(base, BranchType::Local)
         .and_then(|b| b.get().peel_to_commit())
         .map_err(|_| {
             // A repository with no commits has no branch to name either, so the
             // advice below sends the reader to ortak.toml to try other names
             // when nothing they could write there would work.
-            // `is_empty` is not the question: it answers false once HEAD names
-            // a branch other than libgit2's own default. An unborn HEAD is what
-            // "no commits" actually looks like.
-            if matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch) {
+            if unborn(repo) {
                 return anyhow!(
                     "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
                 );
@@ -856,6 +853,14 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
                 head
             )
         })
+}
+
+/// A repository with no commits: HEAD names a branch nothing has been written
+/// to yet. `is_empty` is not the question, because it answers false once HEAD
+/// names a branch other than libgit2's own default, and an unborn HEAD is what
+/// "no commits" actually looks like.
+pub(crate) fn unborn(repo: &Repository) -> bool {
+    matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch)
 }
 
 /// How many commits the workspace's own checkout is missing from the branch a
