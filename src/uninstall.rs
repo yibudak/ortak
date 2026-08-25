@@ -20,6 +20,7 @@ fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
     let mut failures = Vec::new();
     attempt("Codex", &mut failures, || uninstall_codex(runtime));
     attempt("Claude Code", &mut failures, || uninstall_claude(runtime));
+    attempt("OpenCode", &mut failures, || runtime.uninstall_opencode());
 
     if !failures.is_empty() {
         anyhow::bail!(
@@ -244,6 +245,7 @@ impl CommandOutput {
 trait Runtime {
     fn available(&self, program: &str) -> bool;
     fn output(&mut self, program: &OsStr, args: &[&str]) -> Result<CommandOutput>;
+    fn uninstall_opencode(&mut self) -> Result<()>;
     fn remove_binary(&mut self, path: &Path) -> Result<()>;
 }
 
@@ -267,6 +269,10 @@ impl Runtime for System {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn uninstall_opencode(&mut self) -> Result<()> {
+        crate::opencode::uninstall()
     }
 
     fn remove_binary(&mut self, path: &Path) -> Result<()> {
@@ -329,6 +335,7 @@ mod tests {
             runtime.removed_binary,
             Some(PathBuf::from("/opt/ortak/bin/ortak"))
         );
+        assert!(runtime.opencode_uninstalled);
     }
 
     #[test]
@@ -354,6 +361,7 @@ mod tests {
         run_with(&mut runtime, Path::new("/tmp/ortak")).unwrap();
 
         assert!(runtime.calls.is_empty());
+        assert!(runtime.opencode_uninstalled);
         assert_eq!(runtime.removed_binary, Some(PathBuf::from("/tmp/ortak")));
     }
 
@@ -378,6 +386,7 @@ mod tests {
         assert!(runtime
             .calls
             .contains(&"claude plugin marketplace remove ortak".to_string()));
+        assert!(runtime.opencode_uninstalled);
         assert_eq!(runtime.removed_binary, None);
     }
 
@@ -391,6 +400,7 @@ mod tests {
 
         assert!(error.contains("refusing to remove it"));
         assert!(runtime.calls.is_empty());
+        assert!(!runtime.opencode_uninstalled);
         assert_eq!(runtime.removed_binary, None);
     }
 
@@ -426,6 +436,7 @@ mod tests {
         programs: HashSet<String>,
         responses: VecDeque<CommandOutput>,
         calls: Vec<String>,
+        opencode_uninstalled: bool,
         removed_binary: Option<PathBuf>,
     }
 
@@ -438,6 +449,7 @@ mod tests {
                     .collect(),
                 responses: VecDeque::new(),
                 calls: Vec::new(),
+                opencode_uninstalled: false,
                 removed_binary: None,
             }
         }
@@ -454,6 +466,11 @@ mod tests {
             self.responses
                 .pop_front()
                 .context("test did not provide a command response")
+        }
+
+        fn uninstall_opencode(&mut self) -> Result<()> {
+            self.opencode_uninstalled = true;
+            Ok(())
         }
 
         fn remove_binary(&mut self, path: &Path) -> Result<()> {
