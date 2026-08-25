@@ -250,6 +250,15 @@ pub fn resolved(ws: &Workspace, session_ref: Option<&str>, all: bool) -> Result<
     let n = db.resolve_errors(responsible)?;
     let remaining = db.open_errors()?;
     println!("resolved {} errors.", n);
+    // Closing nothing while the line is down used to read as a tool that did
+    // not work, rather than as the refusal it is.
+    if let Some(id) = responsible.filter(|_| n == 0 && !remaining.is_empty()) {
+        println!(
+            "ortak-{} neither reported nor owns any of them; an error is closed by the session \
+             that owes the fix or by the one that reported it",
+            id
+        );
+    }
     if remaining.is_empty() {
         println!("line OPEN: all sessions may continue.");
     } else {
@@ -279,15 +288,23 @@ pub fn list(ws: &Workspace, as_json: bool) -> Result<()> {
     }
     for e in &rows {
         let t = crate::db::fmt_local(e.ts_opened, "%m-%d %H:%M");
+        // Who closed it, when that is on the record. The reporter may close an
+        // error the journal assigned to somebody else, so "resolved" on its own
+        // no longer says which of them decided it was done.
+        let closer = match e.resolved_by {
+            Some(id) => format!(", closed by ortak-{}", id),
+            None => String::new(),
+        };
         println!(
-            "#{} [{}] {} - reporter ortak-{} {}, owner ortak-{} {}",
+            "#{} [{}] {} - reporter ortak-{} {}, owner ortak-{} {}{}",
             e.id,
             e.status,
             t,
             e.reporter,
             e.reporter_name,
             e.responsible(),
-            e.responsible_name()
+            e.responsible_name(),
+            closer
         );
         println!("   {}", shorten(&e.excerpt, 120));
         if let Some(b) = &e.fix_brief {

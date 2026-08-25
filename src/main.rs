@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod db;
+mod doctor;
 mod hooks;
 mod impact;
 mod json;
@@ -44,6 +45,13 @@ enum Command {
         /// Stop the daemon running on this workspace
         #[arg(long, conflicts_with = "detach")]
         stop: bool,
+    },
+    /// Check whether this workspace can publish, and say what to fix if not.
+    /// Exits non-zero when a check fails
+    Doctor {
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Show daemon and session status
     Status {
@@ -300,6 +308,16 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = Config::load(&ws.config_path)?;
             daemon::run(&ws, &cfg)
         }
+        Command::Doctor { json } => {
+            let ws = Workspace::discover_from_cwd()?;
+            let cfg = Config::load(&ws.config_path)?;
+            // The report is the output; a failed check is not an error to print
+            // a second time, it is an exit code for whatever ran this.
+            if !doctor::run(&ws, &cfg, json)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Status { json } => status(json),
         Command::Log {
             session,
@@ -463,9 +481,18 @@ fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
         // Not an error: the journal and the gate work fine without git. But
         // "workspace ready" is the only thing init said, and publishing is the
         // reason the workspace exists, so say the one thing that will not work.
-        println!(
-            "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
-        );
+        // A directory inside a checkout is not a directory without one, and
+        // saying so sends somebody to `git init` in a repository they already
+        // have.
+        match publish::repository_above(root) {
+            Some(above) => println!(
+                "\nthis directory is inside the git repository at {}, rather than the root of one, so `ortak publish` has nowhere to build a branch; run `ortak init` there instead",
+                above.display()
+            ),
+            None => println!(
+                "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
+            ),
+        }
         return;
     };
     let Ok(names) = repo.remotes() else {
@@ -859,12 +886,20 @@ fn print_sessions(db: &Db) -> Result<()> {
     let now = db::now_ts();
     for s in db.list_sessions()? {
         let edits = db.edit_count(s.id)?;
+        // `[active]` is what the session last said about itself, and one killed
+        // mid-turn never said otherwise. The age beside it is the only thing
+        // here a person can weigh against how long the work should have taken.
+        let seen = s
+            .last_seen
+            .map(|ts| format!(" - last seen {}", ago(now - ts)))
+            .unwrap_or_default();
         println!(
-            "ortak-{} [{}] {} - {} edits - intent: {}",
+            "ortak-{} [{}] {} - {} edits{} - intent: {}",
             s.id,
             s.status,
             s.agent_name,
             edits,
+            seen,
             s.task_intent.as_deref().unwrap_or("(not reported)")
         );
         // Nothing at all for a session that has published nothing, which is

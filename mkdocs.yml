@@ -1,0 +1,88 @@
+site_name: ortak
+site_description: Coordination for people and coding agents sharing one live workspace.
+site_url: https://yibudak.github.io/ortak/
+repo_url: https://github.com/yibudak/ortak
+repo_name: yibudak/ortak
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: assets/ortak-logo.png
+  favicon: assets/ortak-logo.png
+  font: false
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.action.edit
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: ortak-light
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: ortak-dark
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Use light mode
+
+nav:
+  - Home: index.md
+  - Get started: getting-started.md
+  - Concepts:
+      - How ortak works: concepts/how-ortak-works.md
+      - Sessions and journal: concepts/sessions-and-journal.md
+  - Guides:
+      - Share a workspace: guides/concurrent-work.md
+      - Handle conflicts: guides/conflicts.md
+      - Stop the line: guides/stop-the-line.md
+      - Publish work: guides/publishing.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - CLI commands: reference/commands.md
+      - Agent integrations: reference/agent-integrations.md
+  - Troubleshooting: troubleshooting.md
+  - Architecture: architecture.md
+
+plugins:
+  - search:
+      lang: en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yibudak/ortak
+      name: ortak on GitHub
+
+copyright: Copyright &copy; 2026 ortak contributors
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn

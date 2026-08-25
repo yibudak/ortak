@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -148,12 +148,23 @@ impl Default for PublishCfg {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
-        if !path.exists() {
-            return Ok(Config::default());
+        let global = global_config_path();
+        Self::load_layers(global.as_deref(), path)
+    }
+
+    fn load_layers(global_path: Option<&Path>, workspace_path: &Path) -> Result<Config> {
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        if let Some(global_path) = global_path {
+            if let Some(global) = read_config(global_path)? {
+                merge_config(&mut merged, global);
+            }
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("could not read {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("could not parse {}", path.display()))
+        if let Some(workspace) = read_config(workspace_path)? {
+            merge_config(&mut merged, workspace);
+        }
+        merged
+            .try_into()
+            .context("could not combine global and workspace configuration")
     }
 
     /// The file `ortak init` writes. The base branch is passed in rather than
@@ -194,14 +205,171 @@ blame_lookback_minutes = 120
 # Set to 0 to report regardless.
 mid_write_seconds = 90
 
-[orchestrator]
-# LLM arbiter for conflicts and ambiguous error ownership. Disabled by default.
-# Deterministic rules apply while disabled.
-enabled = false
-command = "claude"
-model = "haiku"
-timeout_secs = 20
+# Optional workspace overrides for the LLM arbiter. Global defaults can live in
+# ~/.ortak/config.toml. Uncomment this block to override them in this workspace.
+# [orchestrator]
+# enabled = true
+# command = "claude"
+# model = "haiku"
+# timeout_secs = 20
 "#
         )
+    }
+}
+
+fn global_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".ortak").join("config.toml"))
+}
+
+fn read_config(path: &Path) -> Result<Option<toml::Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("could not parse {}", path.display()))?;
+    let _: Config = value
+        .clone()
+        .try_into()
+        .with_context(|| format!("could not parse {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn merge_config(base: &mut toml::Value, override_value: toml::Value) {
+    match (base, override_value) {
+        (toml::Value::Table(base), toml::Value::Table(overrides)) => {
+            for (key, value) in overrides {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_config(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, override_value) => *base = override_value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ortak-config-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn workspace_fields_override_global_fields() {
+        let dir = temp_dir("precedence");
+        let global = dir.join("global.toml");
+        let workspace = dir.join("workspace.toml");
+        std::fs::write(
+            &global,
+            r#"[orchestrator]
+enabled = true
+command = "claude"
+model = "sonnet"
+timeout_secs = 45
+
+[gate]
+margin_lines = 8
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &workspace,
+            r#"[orchestrator]
+model = "haiku"
+
+[gate]
+presence_minutes = 12
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_layers(Some(&global), &workspace).unwrap();
+
+        assert!(cfg.orchestrator.enabled);
+        assert_eq!(cfg.orchestrator.command, "claude");
+        assert_eq!(cfg.orchestrator.model, "haiku");
+        assert_eq!(cfg.orchestrator.timeout_secs, 45);
+        assert_eq!(cfg.gate.margin_lines, 8);
+        assert_eq!(cfg.gate.presence_minutes, 12);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_can_explicitly_disable_a_global_orchestrator() {
+        let dir = temp_dir("disable");
+        let global = dir.join("global.toml");
+        let workspace = dir.join("workspace.toml");
+        std::fs::write(&global, "[orchestrator]\nenabled = true\n").unwrap();
+        std::fs::write(&workspace, "[orchestrator]\nenabled = false\n").unwrap();
+
+        let cfg = Config::load_layers(Some(&global), &workspace).unwrap();
+
+        assert!(!cfg.orchestrator.enabled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn global_config_works_without_a_workspace_file() {
+        let dir = temp_dir("global-only");
+        let global = dir.join("global.toml");
+        let workspace = dir.join("missing.toml");
+        std::fs::write(
+            &global,
+            "[orchestrator]\nenabled = true\nmodel = \"sonnet\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_layers(Some(&global), &workspace).unwrap();
+
+        assert!(cfg.orchestrator.enabled);
+        assert_eq!(cfg.orchestrator.model, "sonnet");
+        assert!(cfg.gate.enabled);
+        assert_eq!(cfg.gate.margin_lines, 3);
+        assert_eq!(cfg.gate.presence_minutes, 30);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_global_values_are_not_hidden_by_workspace_overrides() {
+        let dir = temp_dir("invalid-global");
+        let global = dir.join("global.toml");
+        let workspace = dir.join("workspace.toml");
+        std::fs::write(&global, "[orchestrator]\ntimeout_secs = \"slow\"\n").unwrap();
+        std::fs::write(&workspace, "[orchestrator]\ntimeout_secs = 20\n").unwrap();
+
+        let error = Config::load_layers(Some(&global), &workspace)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&global.display().to_string()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn generated_workspace_config_inherits_global_orchestrator_settings() {
+        let generated = Config::default_toml("main");
+        let value: toml::Value = toml::from_str(&generated).unwrap();
+
+        assert!(value.get("orchestrator").is_none());
+        assert!(generated.contains("# ~/.ortak/config.toml"));
     }
 }

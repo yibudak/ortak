@@ -880,17 +880,14 @@ fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
 /// tree happens to sit on, which may be another session's task branch. A repo
 /// whose trunk is `master` published every task off HEAD and still printed
 /// `--base main`.
-fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
+pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
     repo.find_branch(base, BranchType::Local)
         .and_then(|b| b.get().peel_to_commit())
         .map_err(|_| {
             // A repository with no commits has no branch to name either, so the
             // advice below sends the reader to ortak.toml to try other names
             // when nothing they could write there would work.
-            // `is_empty` is not the question: it answers false once HEAD names
-            // a branch other than libgit2's own default. An unborn HEAD is what
-            // "no commits" actually looks like.
-            if matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch) {
+            if unborn(repo) {
                 return anyhow!(
                     "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
                 );
@@ -907,6 +904,27 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
                 head
             )
         })
+}
+
+/// The git repository this path sits inside, when the path is not its root.
+///
+/// `Repository::open` does not walk up, and both `init` and `doctor` read its
+/// failure as "not a git repository", which is what somebody working in a
+/// subdirectory of a checkout was told. The verdict is right, since publish
+/// builds from the workspace root and cannot work from there, but the reason
+/// given was false and the rest of the report reads as unreliable after it.
+pub(crate) fn repository_above(root: &Path) -> Option<std::path::PathBuf> {
+    let work = Repository::discover(root).ok()?.workdir()?.to_path_buf();
+    let same = work.canonicalize().ok()? == root.canonicalize().ok()?;
+    (!same).then_some(work)
+}
+
+/// A repository with no commits: HEAD names a branch nothing has been written
+/// to yet. `is_empty` is not the question, because it answers false once HEAD
+/// names a branch other than libgit2's own default, and an unborn HEAD is what
+/// "no commits" actually looks like.
+pub(crate) fn unborn(repo: &Repository) -> bool {
+    matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch)
 }
 
 /// How many commits the workspace's own checkout is missing from the branch a
@@ -1298,6 +1316,23 @@ mod tests {
             tree.get_path(Path::new("thing/mod.rs")).is_err(),
             "the branch still carries the directory the file replaced"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ortak init` in a subdirectory of a checkout, which both init and doctor
+    /// used to call a directory with no git repository at all. Publish still
+    /// cannot work from there; the reason given was the false part.
+    #[test]
+    fn a_workspace_inside_a_checkout_knows_where_the_repository_is() {
+        let (dir, _repo) = scratch("inside");
+        let sub = dir.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let found = repository_above(&sub).expect("the repository one directory up");
+        assert_eq!(found.canonicalize().unwrap(), dir.canonicalize().unwrap());
+        // The root of a repository is not inside another one, and a directory
+        // with no repository above it has nothing to name.
+        assert_eq!(repository_above(&dir), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

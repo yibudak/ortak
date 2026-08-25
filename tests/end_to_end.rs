@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -39,8 +40,8 @@ fn ortak_works_end_to_end() {
     // One after another, never at once: one daemon per workspace is the tool's
     // own rule, and cargo would otherwise run these on parallel threads. Each
     // scenario reports rather than panics, so one dead feature does not hide
-    // the other five.
-    let scenarios: [(&str, Scenario); 6] = [
+    // the other scenarios.
+    let scenarios: [(&str, Scenario); 8] = [
         (
             "an edit is credited to the session that made it",
             attribution,
@@ -48,6 +49,10 @@ fn ortak_works_end_to_end() {
         (
             "the gate denies an overlapping edit and allows a distant one",
             gate,
+        ),
+        (
+            "the global orchestrator can allow an overlapping edit",
+            global_orchestrator,
         ),
         (
             "a published branch carries this session's work and not the other's",
@@ -65,8 +70,13 @@ fn ortak_works_end_to_end() {
             "an error lands on the author, and the author hears about it",
             blame_reaches_the_author,
         ),
+        (
+            "doctor clears a workspace that can publish, and exits zero",
+            doctor_clears_a_healthy_workspace,
+        ),
     ];
 
+    let total = scenarios.len();
     let mut broken = Vec::new();
     for (what, scenario) in scenarios {
         match scenario() {
@@ -79,7 +89,7 @@ fn ortak_works_end_to_end() {
     }
     assert!(
         broken.is_empty(),
-        "{} of 6 end-to-end scenarios failed:\n  {}",
+        "{} of {total} end-to-end scenarios failed:\n  {}",
         broken.len(),
         broken.join("\n  ")
     );
@@ -134,6 +144,26 @@ fn gate() -> Result<(), String> {
         return Err(format!(
             "the gate denied {} a file nobody holds:\n{allowed}",
             b.label
+        ));
+    }
+    Ok(())
+}
+
+/// A global arbiter setting reaches the hook, and a workspace that does not
+/// mention the orchestrator inherits it.
+fn global_orchestrator() -> Result<(), String> {
+    let ws = Live::start_with_allowing_arbiter("global-orchestrator")?;
+    let a = ws.join("agent-a")?;
+    let b = ws.join("agent-b")?;
+    ws.edit(&a, "lib.rs", "cfg.remote.clone()", "cfg.remote.to_string()")?;
+
+    let allowed = ws.hook(
+        "pre-edit",
+        &ws.edit_call(&b, "lib.rs", "cfg.remote", "cfg.host"),
+    );
+    if allowed.contains("\"deny\"") {
+        return Err(format!(
+            "the global arbiter allowed the edit, but the hook denied it:\n{allowed}"
         ));
     }
     Ok(())
@@ -229,6 +259,37 @@ fn publish_names_the_caller() -> Result<(), String> {
     Ok(())
 }
 
+/// A workspace with a repository, a commit, the base branch, a remote and a
+/// running daemon is one that publishes, so `doctor` has to say so and exit
+/// zero. The broken workspaces are unit-tested against a temporary directory;
+/// what only the real binary can show is the command being wired up at all, and
+/// the exit code, which is the half a script reads.
+fn doctor_clears_a_healthy_workspace() -> Result<(), String> {
+    let ws = Live::start("doctor")?;
+    // Nothing pushes here. What the check reads is that ortak's remote is a
+    // remote this clone actually has.
+    run(
+        &ws.root,
+        "git",
+        &["remote", "add", "origin", &ws.root.display().to_string()],
+    )?;
+
+    let report = run(&ws.root, ORTAK, &["doctor"])
+        .map_err(|e| format!("doctor refused a workspace that publishes fine:\n{e}"))?;
+    if !report.contains("this workspace can publish") {
+        return Err(format!(
+            "doctor did not clear a healthy workspace:\n{report}"
+        ));
+    }
+    let json = run(&ws.root, ORTAK, &["doctor", "--json"])?;
+    if !json.contains("\"can_publish\": true") {
+        return Err(format!(
+            "--json disagrees with what a person is told:\n{json}"
+        ));
+    }
+    Ok(())
+}
+
 /// A build error names where a failure surfaced, which is the file of whoever
 /// ran the build. Blame has to reach past that to the session whose change
 /// caused it, and then that session has to hear about it without being asked.
@@ -296,17 +357,54 @@ struct Agent {
 /// deleted directory and the next run inherits it.
 struct Live {
     root: PathBuf,
+    home: PathBuf,
     daemon: Child,
 }
 
 impl Live {
     fn start(tag: &str) -> Result<Live, String> {
+        Self::start_inner(tag, false)
+    }
+
+    fn start_with_allowing_arbiter(tag: &str) -> Result<Live, String> {
+        Self::start_inner(tag, true)
+    }
+
+    fn start_inner(tag: &str, allowing_arbiter: bool) -> Result<Live, String> {
         let root = std::env::temp_dir().join(format!("ortak-e2e-{}-{tag}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("ortak-e2e-home-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&root).map_err(|e| format!("could not make {}: {e}", root.display()))?;
+        fs::create_dir_all(&home).map_err(|e| format!("could not make {}: {e}", home.display()))?;
         fs::write(root.join("lib.rs"), LIB).map_err(|e| format!("could not write lib.rs: {e}"))?;
         fs::write(root.join("caller.rs"), CALLER)
             .map_err(|e| format!("could not write caller.rs: {e}"))?;
+
+        if allowing_arbiter {
+            let arbiter = home.join("allow-arbiter");
+            fs::write(
+                &arbiter,
+                "#!/bin/sh\nprintf '%s\\n' '{\"decision\":\"allow\",\"message\":\"independent\"}'\n",
+            )
+            .map_err(|e| format!("could not write {}: {e}", arbiter.display()))?;
+            let mut permissions = fs::metadata(&arbiter)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&arbiter, permissions).map_err(|e| e.to_string())?;
+            let global_dir = home.join(".ortak");
+            fs::create_dir_all(&global_dir).map_err(|e| e.to_string())?;
+            fs::write(
+                global_dir.join("config.toml"),
+                format!(
+                    "[orchestrator]\nenabled = true\ncommand = \"{}\"\nmodel = \"test\"\ntimeout_secs = 5\n",
+                    arbiter.display()
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        }
 
         let git = |args: &[&str]| run(&root, "git", args);
         git(&["init", "-q", "-b", "main", "."])?;
@@ -322,7 +420,7 @@ impl Live {
             "-qm",
             "baseline",
         ])?;
-        run(&root, ORTAK, &["init"])?;
+        run_with_home(&root, &home, ORTAK, &["init"])?;
         // #63 declines a report naming a file another session wrote in the last
         // ninety seconds, which in a test that runs in four is every file, so
         // the stop-the-line scenario would never reach the assignment it is
@@ -337,11 +435,12 @@ impl Live {
         let daemon = Command::new(ORTAK)
             .arg("daemon")
             .current_dir(&root)
+            .env("HOME", &home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("could not start the daemon: {e}"))?;
-        let live = Live { root, daemon };
+        let live = Live { root, home, daemon };
         live.wait("the daemon to come up", || {
             live.ortak(&["status"]).contains("daemon: running")
         })?;
@@ -420,7 +519,7 @@ impl Live {
     /// One ortak command. Both streams, because a test that drops stderr
     /// reports the wrong thing the moment a command fails.
     fn ortak(&self, args: &[&str]) -> String {
-        match run(&self.root, ORTAK, args) {
+        match run_with_home(&self.root, &self.home, ORTAK, args) {
             Ok(text) | Err(text) => text,
         }
     }
@@ -430,6 +529,7 @@ impl Live {
         let mut child = Command::new(ORTAK)
             .args(["hook", event])
             .current_dir(&self.root)
+            .env("HOME", &self.home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -473,17 +573,34 @@ impl Drop for Live {
         let _ = Command::new(ORTAK)
             .args(["daemon", "--stop"])
             .current_dir(&self.root)
+            .env("HOME", &self.home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.home);
     }
 }
 
 fn run(dir: &Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
+    run_command(Command::new(program), dir, program, args)
+}
+
+fn run_with_home(dir: &Path, home: &Path, program: &str, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command.env("HOME", home);
+    run_command(command, dir, program, args)
+}
+
+fn run_command(
+    mut command: Command,
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let out = command
         .args(args)
         .current_dir(dir)
         .output()

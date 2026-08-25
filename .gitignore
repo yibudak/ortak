@@ -1,2 +1,4 @@
 /target
 .ortak/
+/site/
+.DS_Store
