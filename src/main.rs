@@ -1038,10 +1038,23 @@ fn claim(session_ref: &str, file: &str) -> Result<()> {
         "claimed {} region(s) and {} journal row(s) on {} for ortak-{}",
         regions, edits, rel, session.id
     );
-    println!(
-        "`ortak blame {}` and `ortak log` mark them claimed, not written",
-        rel
-    );
+    // Journal rows and held lines are separate things and a claim can take one
+    // without the other: `release` deletes the lines it frees, and a later
+    // claim finds rows with nothing to hold. Blame reads the lines, so it goes
+    // on saying nobody has touched the file, which reads as the claim having
+    // failed.
+    if regions == 0 {
+        println!(
+            "no lines were being held on {}, so `ortak log` marks the rows claimed and \
+             `ortak blame` still has nothing to show for them",
+            rel
+        );
+    } else {
+        println!(
+            "`ortak blame {}` and `ortak log` mark them claimed, not written",
+            rel
+        );
+    }
     // Work taken quietly is what this command could become, so the sessions it
     // came from hear it from the journal rather than from a publish that has
     // lost a file.
@@ -1170,6 +1183,18 @@ fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()
             "ortak-{} {} has stopped. This goes to the next session that starts in this \
              workspace, and `ortak inbox ortak-{}` reads it before then.",
             recipient.id, recipient.agent_name, recipient.id
+        );
+        return Ok(());
+    }
+    // Every door a message can arrive through is a hook, and the human session
+    // has none: it is the row unclaimed writes fall to, not a party that runs
+    // anything. Nothing is lost, but the wait is open-ended, so say that rather
+    // than promise a next prompt that will not come.
+    if recipient.kind == "human" {
+        println!(
+            "ortak-{} is the person at this terminal, and no hook delivers to them. It waits \
+             under `messages waiting` in `ortak status` until somebody reads `ortak inbox ortak-{}`.",
+            recipient.id, recipient.id
         );
         return Ok(());
     }
