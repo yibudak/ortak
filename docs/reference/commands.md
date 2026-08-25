@@ -49,7 +49,7 @@ version.
 | `ortak errors` | List recent error records and current owners. |
 | `ortak errors --json` | Emit machine-readable error rows. |
 | `ortak assign <error-id> ortak-3` | Reassign an open error. |
-| `ortak resolved ortak-3` | Resolve errors owned by one session. |
+| `ortak resolved ortak-3` | Resolve the errors one session owns or reported. |
 | `ortak resolved --all` | Resolve every open error. |
 
 ## Publish
