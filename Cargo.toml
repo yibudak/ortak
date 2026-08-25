@@ -1,6 +1,6 @@
 [package]
 name = "ortak"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Coordination-first version layer for concurrent coding agents and humans sharing one live workspace"
 license = "MIT"

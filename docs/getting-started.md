@@ -24,7 +24,7 @@ Choose another directory or pin a release when needed:
 
 ```bash
 ORTAK_INSTALL_DIR="$HOME/bin" curl -fsSL https://github.com/yibudak/ortak/raw/main/install.sh | sh
-ORTAK_VERSION=v0.2.1 curl -fsSL https://github.com/yibudak/ortak/raw/main/install.sh | sh
+ORTAK_VERSION=v0.3.0 curl -fsSL https://github.com/yibudak/ortak/raw/main/install.sh | sh
 ```
 
 Build from source instead:
