@@ -128,8 +128,10 @@ pub struct Edit {
     pub ts: i64,
     /// Where the owner came from: "hook" when the session reported the file
     /// itself, "claim" when the daemon inferred it from a command that session
-    /// was running, null when nothing claimed it and the change fell to the
-    /// human session. A reader deciding whether to trust `session` needs this.
+    /// was running, "settled" when nothing claimed it and the same session had
+    /// written the file seconds earlier, null when nothing claimed it and the
+    /// change fell to the human session. A reader deciding whether to trust
+    /// `session` needs this.
     pub attribution: Option<String>,
 }
 
