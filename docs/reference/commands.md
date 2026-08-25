@@ -11,7 +11,8 @@ version.
 | `ortak daemon` | Run the watcher in the foreground. |
 | `ortak daemon --detach` | Start the watcher in the background. |
 | `ortak daemon --stop` | Stop the daemon named by `.ortak/daemon.pid`. |
-| `ortak update` | Update stale binary, Codex plugin, and Claude Code plugin components. |
+| `ortak update` | Update stale binary and installed Claude Code, Codex, and OpenCode integrations. |
+| `ortak opencode install` | Install the global OpenCode plugin and workflow skill. |
 
 ## Observe the workspace
 
@@ -73,8 +74,8 @@ The default mode includes edits after the session's latest publish.
 
 ## Hook commands
 
-`ortak hook ...` is the adapter surface for Claude Code and Codex. Plugins call
-these commands with event JSON on stdin:
+`ortak hook ...` is the adapter surface for Claude Code, Codex, and OpenCode.
+Plugins call these commands with event JSON on stdin:
 
 ```text
 session-start

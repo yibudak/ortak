@@ -6,6 +6,7 @@ mod impact;
 mod json;
 mod line;
 mod notes;
+mod opencode;
 mod orchestrator;
 mod publish;
 mod regions;
@@ -34,6 +35,12 @@ struct Cli {
 enum Command {
     /// Update the current binary and installed agent plugins
     Update,
+    /// Install integrations for OpenCode
+    #[command(name = "opencode")]
+    OpenCode {
+        #[command(subcommand)]
+        command: OpenCodeCommand,
+    },
     /// Initialize this directory as an ortak workspace
     Init,
     /// Run the journal daemon (file watcher and shadow repository)
@@ -189,6 +196,12 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum OpenCodeCommand {
+    /// Install the global Ortak plugin and workflow skill
+    Install,
+}
+
+#[derive(Subcommand)]
 enum HookEvent {
     /// Claude Code SessionStart
     SessionStart,
@@ -288,6 +301,9 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Update => update::run(),
+        Command::OpenCode {
+            command: OpenCodeCommand::Install,
+        } => opencode::install(),
         Command::Init => init(),
         Command::Daemon { detach, stop } => {
             let ws = Workspace::discover_from_cwd()?;

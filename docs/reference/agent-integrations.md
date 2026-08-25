@@ -1,7 +1,7 @@
 # Agent integrations
 
-The Claude Code and Codex plugins connect harness lifecycle events to the same
-ortak workspace database and journal.
+The Claude Code, Codex, and OpenCode plugins connect harness lifecycle events
+to the same ortak workspace database and journal.
 
 ## Claude Code
 
@@ -33,6 +33,22 @@ Codex `apply_patch` events expose file paths but do not provide stable final lin
 coordinates. ortak protects the whole target file for those calls. Other
 supported edit payloads use the most precise ranges their input provides.
 
+## OpenCode
+
+```bash
+ortak opencode install
+```
+
+Start a new OpenCode session after installation. The command installs the
+global plugin and `ortak-workflow` skill under `~/.config/opencode/` or
+`$XDG_CONFIG_HOME/opencode/`.
+
+The plugin connects OpenCode's `edit`, `write`, `apply_patch`, and `bash` tools
+to the maintained Ortak hook adapter. It adds session and prompt context to the
+model, enforces the conflict gate before writes, and records attribution after
+each tool call. OpenCode can fuzzy-match an edit's source text, so Ortak uses
+whole-file protection when it cannot find the literal range.
+
 ## One checkout per collaboration group
 
 Start all collaborating agent sessions in the same initialized checkout. A
@@ -53,9 +69,10 @@ At session start, the plugin reports:
 ortak update
 ```
 
-The update command checks the installed binary and each available agent plugin
-against the latest release. It skips missing tools and components already on
-that version. Restart active sessions when hooks or skills change.
+The update command checks the installed binary and each available agent plugin,
+including an OpenCode integration installed by `ortak opencode install`, against
+the latest release. It skips missing tools and current components. Restart
+active sessions when hooks or skills change.
 
 ## Work without an agent plugin
 

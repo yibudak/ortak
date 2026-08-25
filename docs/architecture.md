@@ -6,12 +6,12 @@ keeps the original design record and may describe work that has not shipped.
 ## Components
 
 ```text
-┌──────────────────────── shared checkout ────────────────────────┐
-│ Claude Code hooks   Codex hooks   human editor                  │
-│        │                 │              │                       │
-└────────┼─────────────────┼──────────────┼───────────────────────┘
-         │ attribution     │              │ file events
-         ├─────────────────┴──────────────┤
+┌─────────────────────────── shared checkout ───────────────────────────┐
+│ Claude Code hooks   Codex hooks   OpenCode plugin   human editor      │
+│        │                 │               │                │           │
+└────────┼─────────────────┼───────────────┼────────────────┼───────────┘
+         │ attribution     │               │                │ file events
+         ├─────────────────┴───────────────┴────────────────┤
          ▼                                ▼
   .ortak/db.sqlite                 ortak daemon
   sessions, regions,              watcher + heartbeat
@@ -62,16 +62,19 @@ The shadow repository has its own excludes. It ignores internal state, the real
 
 ## Agent edit path
 
-1. A PreToolUse hook resolves the workspace and requesting session.
+1. A pre-tool hook resolves the workspace and requesting session.
 2. The gate reads open errors and active regions from SQLite.
 3. An allowed tool changes the live file.
-4. The PostToolUse hook reconstructs the intended content when its payload
+4. The post-tool hook reconstructs the intended content when its payload
    permits and records an attribution snapshot.
 5. The daemon writes the snapshot as a shadow Git commit and updates line
    ownership.
 
 Codex `apply_patch` supplies paths without stable final ranges, so the gate uses
 whole-file targets for those calls.
+
+OpenCode's edit tool can use fuzzy source matching. Ortak protects the whole
+file when the literal source range is absent.
 
 ## Human edit path
 
