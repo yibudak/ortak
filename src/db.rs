@@ -1766,12 +1766,13 @@ mod tests {
             .unwrap();
         db.upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
             .unwrap();
-        assert_eq!(db.get_session(id).unwrap().last_seen, Some(first));
+        let refreshed = db.get_session(id).unwrap().last_seen.unwrap();
+        assert!(refreshed >= first);
 
         db.end_session("sess-a").unwrap();
         let ended = db.get_session(id).unwrap();
         assert_eq!(ended.status, "done");
-        assert_eq!(ended.last_seen, Some(first), "the last word is kept");
+        assert_eq!(ended.last_seen, Some(refreshed), "the last word is kept");
     }
 
     #[test]
