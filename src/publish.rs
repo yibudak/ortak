@@ -126,6 +126,28 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     };
     let base_tree = base_commit.tree()?;
 
+    // Somebody who adds a file to .gitignore means it never leaves this
+    // machine. The daemon stops journaling it from that moment, but the rows it
+    // wrote before the rule existed are still here, and the branch shipped the
+    // file anyway, at whatever version it had when the rule landed. A secret,
+    // a build artifact or a model file goes out stale, which is the worst of
+    // both.
+    let ignored = ignored_now(&repo, &base_tree, &files);
+    for file in &ignored {
+        println!(
+            "warning: {file} is ignored by this project now, so it is not going into the branch; \
+             `ortak release ortak-{} {file}` drops it from the session for good",
+            session.id
+        );
+    }
+    files.retain(|(f, _)| !ignored.contains(f));
+    if files.is_empty() {
+        bail!(
+            "every file ortak-{} changed is ignored by this project; nothing left to publish",
+            session.id
+        );
+    }
+
     // The gate lets two sessions edit distant lines of one file, so the file on
     // disk can hold another session's work. Rebuild this session's own content
     // from its shadow history instead of reading the workspace.
@@ -812,6 +834,22 @@ fn blob_at(shadow: &Repository, commit: &str, file: &str) -> Option<Vec<u8>> {
     Some(shadow.find_blob(entry.id()).ok()?.content().to_vec())
 }
 
+/// The session's files this project's ignore rules now cover, which the branch
+/// must not carry whatever the journal remembers.
+///
+/// Only files the base branch does not already have: a tracked file is not
+/// ignored by git however well it matches a pattern, and dropping one would
+/// strip a real change out of a branch without anybody asking.
+fn ignored_now(repo: &Repository, base_tree: &Tree, files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .map(|(f, _)| f.clone())
+        .filter(|f| {
+            repo.is_path_ignored(f).unwrap_or(false) && base_tree.get_path(Path::new(f)).is_err()
+        })
+        .collect()
+}
+
 /// Drop the `--exclude` paths from the publish, returning the ones that matched
 /// nothing. A mistyped path is silent otherwise, and the file it was meant to
 /// keep out of the branch ships anyway.
@@ -1282,6 +1320,27 @@ mod tests {
             !out.contains("BBB"),
             "session B's edit leaked into A's branch:\n{out}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file journaled before .gitignore learned about it. The rows are real
+    /// and the branch is still the wrong place for it, and it went out at the
+    /// version it had when the rule landed, since nothing has journaled it
+    /// since.
+    #[test]
+    fn a_file_the_project_ignores_now_stays_out_of_the_branch() {
+        let (dir, repo) = scratch("ignored");
+        std::fs::write(dir.join(".gitignore"), "secret.env\napp.py\n").unwrap();
+        // app.py is on the base branch, so git does not ignore it whatever the
+        // pattern says, and neither may this.
+        let base = tree_with(&repo, Some("tracked\n"));
+        let files = vec![
+            ("secret.env".to_string(), "create".to_string()),
+            ("app.py".to_string(), "modify".to_string()),
+            ("src/main.rs".to_string(), "modify".to_string()),
+        ];
+
+        assert_eq!(ignored_now(&repo, &base, &files), vec!["secret.env"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
