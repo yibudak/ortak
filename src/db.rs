@@ -18,6 +18,17 @@ pub const BASH_CLAIM: &str = "*";
 /// to cover that wait, short enough not to catch the next thing typed, and
 /// whole seconds is as fine as a stored timestamp goes.
 pub const CLAIM_GRACE_SECS: i64 = 3;
+/// How long a session's own write still speaks for the next change to the same
+/// file that nothing claims (seconds).
+///
+/// Something rewriting a file moments after the tool wrote it is ordinary:
+/// format-on-save, a `PostToolUse` formatter, a CRLF filter, a codegen step.
+/// No hook names that write and no command claims it, so it used to land on
+/// the human and take the session's lines with it. Wide enough to cover the
+/// daemon's unattributed-quiet window and a slow formatter behind it, narrow
+/// enough that a person typing in the file a few seconds later is still a
+/// person.
+pub const SETTLE_SECS: i64 = 5;
 
 /// The sessions whose Bash claim speaks for a write right now: a command still
 /// running, or one that ended inside the grace. `?1` is `BASH_CLAIM` and `?2`
@@ -104,6 +115,11 @@ pub enum Attribution {
     /// same in the journal, and only one of them is worth a reader's attention.
     Contested,
     Claimed,
+    /// Nothing named this write and nothing claimed it, but the session that
+    /// wrote the same file seconds earlier is still the likeliest author: a
+    /// formatter, a codegen step or an editor rewriting what the tool had just
+    /// written. Weaker than `Claim`, which at least has a command open.
+    Settled,
 }
 
 impl Attribution {
@@ -113,6 +129,7 @@ impl Attribution {
             Attribution::Claim => "claim",
             Attribution::Contested => "contested",
             Attribution::Claimed => "claimed",
+            Attribution::Settled => "settled",
         }
     }
 }
@@ -126,6 +143,9 @@ pub fn attribution_note(attributed_by: Option<&str>) -> &'static str {
         Some(s) if s == Attribution::Claim.as_str() => "inferred from a running command",
         Some(s) if s == Attribution::Contested.as_str() => "two sessions had commands open",
         Some(s) if s == Attribution::Claimed.as_str() => "claimed after the fact",
+        Some(s) if s == Attribution::Settled.as_str() => {
+            "rewritten right after that session wrote it"
+        }
         _ => "",
     }
 }
@@ -592,13 +612,35 @@ impl Db {
             .query_map(params![BASH_CLAIM, claim_grace_cutoff()], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
-            [] => None,
+            // Nothing named this write and nobody has a command open. Before it
+            // falls to the human, the journal gets asked: a file rewritten
+            // seconds after a session wrote it is that write settling.
+            [] => self
+                .settling_writer(file)?
+                .map(|id| (id, Attribution::Settled)),
             [only] => Some((*only, Attribution::Claim)),
             _ => match self.claimant_in_file(file)? {
                 Some(id) => Some((id, Attribution::Claim)),
                 None => Some((self.ensure_human()?, Attribution::Contested)),
             },
         })
+    }
+
+    /// The session that wrote this file within `SETTLE_SECS`, if it is still
+    /// working here. `None` once the window has passed, and for the human's own
+    /// rows: a person's write is not evidence about the next one.
+    fn settling_writer(&self, file: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT e.session_id FROM edits e JOIN sessions s ON s.id = e.session_id
+                  WHERE e.file = ?1 AND e.ts >= ?2 AND e.disowned = 0
+                    AND s.status = 'active' AND s.kind != 'human'
+                  ORDER BY e.id DESC LIMIT 1",
+                params![file, now_ts() - SETTLE_SECS],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Of the sessions with a command open, the one that most recently wrote
@@ -1772,6 +1814,50 @@ mod tests {
         let ended = db.get_session(id).unwrap();
         assert_eq!(ended.status, "done");
         assert_eq!(ended.last_seen, Some(first), "the last word is kept");
+    }
+
+    /// A formatter rewriting what the tool just wrote used to land on the human
+    /// and take the session's lines with it, which is every workspace with
+    /// format-on-save.
+    #[test]
+    fn a_rewrite_right_after_a_session_wrote_the_file_is_still_that_sessions() {
+        let db = temp_db("settle");
+        let human = db.ensure_human().unwrap();
+        let agent = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+
+        // Nobody has touched it: an unclaimed write is the human's own.
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        db.insert_edit(
+            agent,
+            "src/x.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Settled))
+        );
+        // Only the file that was written, and only while the window is open.
+        assert_eq!(db.peek_hint("src/y.rs").unwrap(), None);
+        db.conn
+            .execute(
+                "UPDATE edits SET ts = ?1 WHERE file = 'src/x.rs'",
+                params![now_ts() - SETTLE_SECS - 1],
+            )
+            .unwrap();
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        // The human's own write says nothing about the next one, or every
+        // change to a file a person is editing would echo the one before it.
+        db.insert_edit(human, "src/z.rs", "modify", None, &[], None)
+            .unwrap();
+        assert_eq!(db.peek_hint("src/z.rs").unwrap(), None);
     }
 
     #[test]
