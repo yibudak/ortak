@@ -481,9 +481,18 @@ fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
         // Not an error: the journal and the gate work fine without git. But
         // "workspace ready" is the only thing init said, and publishing is the
         // reason the workspace exists, so say the one thing that will not work.
-        println!(
-            "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
-        );
+        // A directory inside a checkout is not a directory without one, and
+        // saying so sends somebody to `git init` in a repository they already
+        // have.
+        match publish::repository_above(root) {
+            Some(above) => println!(
+                "\nthis directory is inside the git repository at {}, rather than the root of one, so `ortak publish` has nowhere to build a branch; run `ortak init` there instead",
+                above.display()
+            ),
+            None => println!(
+                "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
+            ),
+        }
         return;
     };
     let Ok(names) = repo.remotes() else {

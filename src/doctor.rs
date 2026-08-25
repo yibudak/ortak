@@ -134,18 +134,32 @@ pub fn run(ws: &Workspace, cfg: &Config, as_json: bool) -> Result<bool> {
 fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
     let Ok(repo) = git2::Repository::open(&ws.root) else {
-        checks.push(failed(
-            "git_repository",
-            format!("{} is not a git repository", ws.root.display()),
-            "`git init` here, or run ortak in the checkout you meant to work in",
-        ));
+        // A workspace one directory inside a checkout is the common way to land
+        // here, and calling that "not a git repository" is false enough to cost
+        // the reader their trust in the four lines under it.
+        checks.push(match crate::publish::repository_above(&ws.root) {
+            Some(above) => failed(
+                "git_repository",
+                format!(
+                    "{} is inside the repository at {}, not the root of one, and publish builds from the workspace root",
+                    ws.root.display(),
+                    above.display()
+                ),
+                format!("run `ortak init` in {}, or make this directory a repository of its own with `git init`", above.display()),
+            ),
+            None => failed(
+                "git_repository",
+                format!("{} is not a git repository", ws.root.display()),
+                "`git init` here, or run ortak in the checkout you meant to work in",
+            ),
+        });
         // None of the three below can be asked at all without a repository, and
         // failing them would send somebody off to configure a base branch in a
         // directory git has never heard of.
         for check in ["commits", "base_branch", "push_remote"] {
             checks.push(skipped(
                 check,
-                "not checked: there is no git repository here",
+                "not checked: there is no git repository at the workspace root",
             ));
         }
         checks.push(daemon_check(ws));

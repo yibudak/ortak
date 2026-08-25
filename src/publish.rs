@@ -855,6 +855,19 @@ pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Co
         })
 }
 
+/// The git repository this path sits inside, when the path is not its root.
+///
+/// `Repository::open` does not walk up, and both `init` and `doctor` read its
+/// failure as "not a git repository", which is what somebody working in a
+/// subdirectory of a checkout was told. The verdict is right, since publish
+/// builds from the workspace root and cannot work from there, but the reason
+/// given was false and the rest of the report reads as unreliable after it.
+pub(crate) fn repository_above(root: &Path) -> Option<std::path::PathBuf> {
+    let work = Repository::discover(root).ok()?.workdir()?.to_path_buf();
+    let same = work.canonicalize().ok()? == root.canonicalize().ok()?;
+    (!same).then_some(work)
+}
+
 /// A repository with no commits: HEAD names a branch nothing has been written
 /// to yet. `is_empty` is not the question, because it answers false once HEAD
 /// names a branch other than libgit2's own default, and an unborn HEAD is what
@@ -1218,6 +1231,23 @@ mod tests {
             !out.contains("BBB"),
             "session B's edit leaked into A's branch:\n{out}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ortak init` in a subdirectory of a checkout, which both init and doctor
+    /// used to call a directory with no git repository at all. Publish still
+    /// cannot work from there; the reason given was the false part.
+    #[test]
+    fn a_workspace_inside_a_checkout_knows_where_the_repository_is() {
+        let (dir, _repo) = scratch("inside");
+        let sub = dir.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let found = repository_above(&sub).expect("the repository one directory up");
+        assert_eq!(found.canonicalize().unwrap(), dir.canonicalize().unwrap());
+        // The root of a repository is not inside another one, and a directory
+        // with no repository above it has nothing to name.
+        assert_eq!(repository_above(&dir), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
