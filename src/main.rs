@@ -886,12 +886,20 @@ fn print_sessions(db: &Db) -> Result<()> {
     let now = db::now_ts();
     for s in db.list_sessions()? {
         let edits = db.edit_count(s.id)?;
+        // `[active]` is what the session last said about itself, and one killed
+        // mid-turn never said otherwise. The age beside it is the only thing
+        // here a person can weigh against how long the work should have taken.
+        let seen = s
+            .last_seen
+            .map(|ts| format!(" - last seen {}", ago(now - ts)))
+            .unwrap_or_default();
         println!(
-            "ortak-{} [{}] {} - {} edits - intent: {}",
+            "ortak-{} [{}] {} - {} edits{} - intent: {}",
             s.id,
             s.status,
             s.agent_name,
             edits,
+            seen,
             s.task_intent.as_deref().unwrap_or("(not reported)")
         );
         // Nothing at all for a session that has published nothing, which is
