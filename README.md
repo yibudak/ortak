@@ -110,6 +110,28 @@ commit messages.
 
 `ortak init` writes `ortak.toml`, detects the trunk branch, and prints the remote used by `--push`.
 
+Ortak reads config files from lowest to highest priority. The later file wins:
+
+1. `~/.ortak/config.toml`: global defaults
+2. `ortak.toml`: overrides for the current workspace
+
+If `ortak.toml` omits a field, Ortak keeps its global value. Enable the optional
+LLM arbiter for all workspaces with:
+
+```toml
+# ~/.ortak/config.toml
+[orchestrator]
+enabled = true
+command = "claude"
+model = "haiku"
+timeout_secs = 20
+```
+
+To use different settings or disable the arbiter in one workspace, add only the
+fields that differ to that workspace's `ortak.toml`. Existing workspace files
+that contain the complete generated `[orchestrator]` block override the global
+block; remove or comment out those fields to inherit the global settings.
+
 Choose another push remote per clone with:
 
 ```bash
