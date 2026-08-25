@@ -19,6 +19,10 @@ pub struct Status {
     /// root, or the configured base branch is not in this checkout.
     pub workspace: Option<Checkout>,
     pub sessions: Vec<Session>,
+    /// Mail nobody has collected, in the same order the human output prints it.
+    /// Empty while every message has reached its reader, which is the normal
+    /// case.
+    pub waiting_messages: Vec<WaitingMail>,
     pub regions: Vec<Region>,
 }
 
@@ -66,6 +70,11 @@ pub struct Session {
     pub harness: Option<String>,
     pub intent: Option<String>,
     pub status: String,
+    /// When a hook last spoke for this session, unix seconds. `status` is what
+    /// the session last said about itself; this is when it last said anything,
+    /// and a session that was killed reads active here for good. Null on a row
+    /// written before the stamp existed.
+    pub last_seen: Option<i64>,
     pub edits: i64,
     /// What this session has published, newest first. Empty until it publishes.
     pub branches: Vec<Branch>,
@@ -80,6 +89,21 @@ pub struct Branch {
     /// the newest publish can have any: work after an older one went into the
     /// branches published since.
     pub edits_since: i64,
+}
+
+/// One session's undelivered mail. A queue nobody drains is the failure this
+/// reports.
+#[derive(Serialize)]
+pub struct WaitingMail {
+    pub session: String,
+    pub agent: String,
+    /// The recipient ended cleanly, so this mail goes to the next session that
+    /// starts here. False for a working session and for one that stopped
+    /// without saying so, whose mail is waiting for a reader who is not coming.
+    pub stopped: bool,
+    pub count: i64,
+    /// When the oldest undelivered message was sent, unix seconds.
+    pub oldest_ts: i64,
 }
 
 #[derive(Serialize)]
@@ -104,8 +128,10 @@ pub struct Edit {
     pub ts: i64,
     /// Where the owner came from: "hook" when the session reported the file
     /// itself, "claim" when the daemon inferred it from a command that session
-    /// was running, null when nothing claimed it and the change fell to the
-    /// human session. A reader deciding whether to trust `session` needs this.
+    /// was running, "settled" when nothing claimed it and the same session had
+    /// written the file seconds earlier, null when nothing claimed it and the
+    /// change fell to the human session. A reader deciding whether to trust
+    /// `session` needs this.
     pub attribution: Option<String>,
 }
 
@@ -116,6 +142,9 @@ pub struct Error {
     pub reporter: String,
     /// Whoever must act: the assigned session, else the reporter.
     pub responsible: String,
+    /// Who closed it, null while it is open. Not always `responsible`: the
+    /// session that reported an error may close it whoever it landed on.
+    pub resolved_by: Option<String>,
     pub excerpt: String,
     pub opened_at: i64,
 }
@@ -146,10 +175,22 @@ pub fn status(db: &Db, presence_secs: i64, behind_base: Option<(String, i64)>) -
             harness: s.harness,
             intent: s.task_intent,
             status: s.status,
+            last_seen: s.last_seen,
             edits: db.edit_count(s.id)?,
             branches,
         });
     }
+    let waiting_messages = db
+        .waiting_messages()?
+        .into_iter()
+        .map(|w| WaitingMail {
+            session: format!("ortak-{}", w.session_id),
+            agent: w.agent_name,
+            stopped: w.stopped,
+            count: w.count,
+            oldest_ts: w.oldest,
+        })
+        .collect();
     let now = crate::db::now_ts();
     let regions = db
         .fresh_regions(presence_secs)?
@@ -184,6 +225,7 @@ pub fn status(db: &Db, presence_secs: i64, behind_base: Option<(String, i64)>) -
             commits_behind,
         }),
         sessions,
+        waiting_messages,
         regions,
     })
 }
@@ -208,6 +250,7 @@ pub fn errors(rows: &[ErrorRow]) -> Vec<Error> {
             status: e.status.clone(),
             reporter: format!("ortak-{}", e.reporter),
             responsible: format!("ortak-{}", e.responsible()),
+            resolved_by: e.resolved_by.map(|id| format!("ortak-{}", id)),
             excerpt: e.excerpt.clone(),
             opened_at: e.ts_opened,
         })
@@ -244,12 +287,20 @@ mod tests {
                 harness: Some("claude-code".into()),
                 intent: Some("wire up the gate".into()),
                 status: "active".into(),
+                last_seen: Some(1_700_000_000),
                 edits: 7,
                 branches: vec![Branch {
                     branch: "feat/the-gate".into(),
                     published_at: 1_700_000_000,
                     edits_since: 2,
                 }],
+            }],
+            waiting_messages: vec![WaitingMail {
+                session: "ortak-3".into(),
+                agent: "claude-75c6".into(),
+                stopped: false,
+                count: 2,
+                oldest_ts: 1_700_000_000,
             }],
             regions: vec![Region {
                 file: "src/db.rs".into(),
@@ -263,8 +314,35 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
-            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"workspace":{"base_branch":"main","commits_behind":83},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
+            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"workspace":{"base_branch":"main","commits_behind":83},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","last_seen":1700000000,"edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"waiting_messages":[{"session":"ortak-3","agent":"claude-75c6","stopped":false,"count":2,"oldest_ts":1700000000}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
         );
+    }
+
+    /// The count comes off the same query the printed line uses, so the two
+    /// cannot drift. An empty list is the answer for a workspace where every
+    /// message arrived, and it is a different fact from the field being absent.
+    #[test]
+    fn status_carries_the_mail_the_printed_line_carries() {
+        let path =
+            std::env::temp_dir().join(format!("ortak-json-mail-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        assert!(status(&db, 600, None).unwrap().waiting_messages.is_empty());
+
+        let from = db.upsert_session("a", "claude-a", "llm", None).unwrap();
+        let to = db.upsert_session("b", "claude-b", "llm", None).unwrap();
+        db.send_message(from, to, "db.rs is mid-refactor").unwrap();
+        db.send_message(from, to, "and now it is not").unwrap();
+
+        let waiting = status(&db, 600, None).unwrap().waiting_messages;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].session, format!("ortak-{}", to));
+        assert_eq!(waiting[0].agent, "claude-b");
+        assert_eq!(waiting[0].count, 2);
+        assert!(!waiting[0].stopped);
+
+        db.take_messages(to).unwrap();
+        assert!(status(&db, 600, None).unwrap().waiting_messages.is_empty());
     }
 
     #[test]

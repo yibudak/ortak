@@ -41,7 +41,7 @@ fn ortak_works_end_to_end() {
     // own rule, and cargo would otherwise run these on parallel threads. Each
     // scenario reports rather than panics, so one dead feature does not hide
     // the other scenarios.
-    let scenarios: [(&str, Scenario); 7] = [
+    let scenarios: [(&str, Scenario); 8] = [
         (
             "an edit is credited to the session that made it",
             attribution,
@@ -69,6 +69,10 @@ fn ortak_works_end_to_end() {
         (
             "an error lands on the author, and the author hears about it",
             blame_reaches_the_author,
+        ),
+        (
+            "doctor clears a workspace that can publish, and exits zero",
+            doctor_clears_a_healthy_workspace,
         ),
     ];
 
@@ -250,6 +254,37 @@ fn publish_names_the_caller() -> Result<(), String> {
     if !published.contains(&b.label) {
         return Err(format!(
             "the publish named the file but not who is in it:\n{published}"
+        ));
+    }
+    Ok(())
+}
+
+/// A workspace with a repository, a commit, the base branch, a remote and a
+/// running daemon is one that publishes, so `doctor` has to say so and exit
+/// zero. The broken workspaces are unit-tested against a temporary directory;
+/// what only the real binary can show is the command being wired up at all, and
+/// the exit code, which is the half a script reads.
+fn doctor_clears_a_healthy_workspace() -> Result<(), String> {
+    let ws = Live::start("doctor")?;
+    // Nothing pushes here. What the check reads is that ortak's remote is a
+    // remote this clone actually has.
+    run(
+        &ws.root,
+        "git",
+        &["remote", "add", "origin", &ws.root.display().to_string()],
+    )?;
+
+    let report = run(&ws.root, ORTAK, &["doctor"])
+        .map_err(|e| format!("doctor refused a workspace that publishes fine:\n{e}"))?;
+    if !report.contains("this workspace can publish") {
+        return Err(format!(
+            "doctor did not clear a healthy workspace:\n{report}"
+        ));
+    }
+    let json = run(&ws.root, ORTAK, &["doctor", "--json"])?;
+    if !json.contains("\"can_publish\": true") {
+        return Err(format!(
+            "--json disagrees with what a person is told:\n{json}"
         ));
     }
     Ok(())

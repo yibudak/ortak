@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod db;
+mod doctor;
 mod hooks;
 mod impact;
 mod json;
@@ -51,6 +52,13 @@ enum Command {
         /// Stop the daemon running on this workspace
         #[arg(long, conflicts_with = "detach")]
         stop: bool,
+    },
+    /// Check whether this workspace can publish, and say what to fix if not.
+    /// Exits non-zero when a check fails
+    Doctor {
+        /// Emit JSON for another program to read
+        #[arg(long)]
+        json: bool,
     },
     /// Show daemon and session status
     Status {
@@ -316,6 +324,16 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = Config::load(&ws.config_path)?;
             daemon::run(&ws, &cfg)
         }
+        Command::Doctor { json } => {
+            let ws = Workspace::discover_from_cwd()?;
+            let cfg = Config::load(&ws.config_path)?;
+            // The report is the output; a failed check is not an error to print
+            // a second time, it is an exit code for whatever ran this.
+            if !doctor::run(&ws, &cfg, json)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Status { json } => status(json),
         Command::Log {
             session,
@@ -479,9 +497,18 @@ fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
         // Not an error: the journal and the gate work fine without git. But
         // "workspace ready" is the only thing init said, and publishing is the
         // reason the workspace exists, so say the one thing that will not work.
-        println!(
-            "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
-        );
+        // A directory inside a checkout is not a directory without one, and
+        // saying so sends somebody to `git init` in a repository they already
+        // have.
+        match publish::repository_above(root) {
+            Some(above) => println!(
+                "\nthis directory is inside the git repository at {}, rather than the root of one, so `ortak publish` has nowhere to build a branch; run `ortak init` there instead",
+                above.display()
+            ),
+            None => println!(
+                "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
+            ),
+        }
         return;
     };
     let Ok(names) = repo.remotes() else {
@@ -619,10 +646,9 @@ fn status(as_json: bool) -> Result<()> {
     if let Some(o) = db.last_outage()?.filter(|o| o.recent(db::now_ts())) {
         let recovered = match o.journaled {
             0 => "the startup scan found nothing to recover".to_string(),
-            n => format!(
-                "the startup scan recovered {} file(s) into the human session",
-                n
-            ),
+            // Where they landed is not recorded: the scan journals through the
+            // same path as everything else and a live hint keeps its owner.
+            n => format!("the startup scan recovered {} file(s)", n),
         };
         println!(
             "last outage: {} to {} ({}s); {}",
@@ -711,8 +737,11 @@ fn commits_behind_base(ws: &Workspace, cfg: &Config) -> Option<(String, i64)> {
 fn blame(target: &str) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
-    let (file, line) = split_target(target);
-    let rel = relativize_arg(&ws, file);
+    let (file, line) = split_target(target)?;
+    // A path outside the workspace has no answer here, and saying it is as the
+    // base branch left it claims knowledge of a file this repository has never
+    // seen. `claim` and `release` have refused it by name since #7.
+    let rel = workspace_path(&ws, file)?;
     let owners = db.file_regions(&rel)?;
     let now = db::now_ts();
 
@@ -807,22 +836,20 @@ fn range(o: &db::Owner) -> String {
 
 /// Split `src/db.rs:143` into its file and line. Anything after the last colon
 /// that is not a line number belongs to the filename.
-fn split_target(target: &str) -> (&str, Option<i64>) {
+fn split_target(target: &str) -> Result<(&str, Option<i64>)> {
     match target.rsplit_once(':') {
         Some((file, line)) => match line.parse::<i64>() {
-            Ok(n) if n > 0 => (file, Some(n)),
-            _ => (target, None),
+            Ok(n) if n > 0 => Ok((file, Some(n))),
+            // A suffix that is a number and not a line is a typo, not a file
+            // whose name ends in one. Falling through to the path made blame
+            // answer "no session has touched src/db.rs:0" about a file that
+            // cannot exist, in the command somebody runs right after the gate
+            // has refused them.
+            Ok(n) => anyhow::bail!("{} is not a line number; lines are counted from 1", n),
+            Err(_) => Ok((target, None)),
         },
-        None => (target, None),
+        None => Ok((target, None)),
     }
-}
-
-/// The journal keys files on their workspace-relative path, so an argument
-/// typed from a subdirectory or as an absolute path has to be brought back to
-/// that. A path from outside the workspace is passed through and simply matches
-/// nothing.
-fn relativize_arg(ws: &Workspace, file: &str) -> String {
-    ws.relativize_arg(file).unwrap_or_else(|| file.to_string())
 }
 
 /// Rough age for someone reading a list: whichever unit keeps it short.
@@ -875,12 +902,20 @@ fn print_sessions(db: &Db) -> Result<()> {
     let now = db::now_ts();
     for s in db.list_sessions()? {
         let edits = db.edit_count(s.id)?;
+        // `[active]` is what the session last said about itself, and one killed
+        // mid-turn never said otherwise. The age beside it is the only thing
+        // here a person can weigh against how long the work should have taken.
+        let seen = s
+            .last_seen
+            .map(|ts| format!(" - last seen {}", ago(now - ts)))
+            .unwrap_or_default();
         println!(
-            "ortak-{} [{}] {} - {} edits - intent: {}",
+            "ortak-{} [{}] {} - {} edits{} - intent: {}",
             s.id,
             s.status,
             s.agent_name,
             edits,
+            seen,
             s.task_intent.as_deref().unwrap_or("(not reported)")
         );
         // Nothing at all for a session that has published nothing, which is
@@ -1019,10 +1054,23 @@ fn claim(session_ref: &str, file: &str) -> Result<()> {
         "claimed {} region(s) and {} journal row(s) on {} for ortak-{}",
         regions, edits, rel, session.id
     );
-    println!(
-        "`ortak blame {}` and `ortak log` mark them claimed, not written",
-        rel
-    );
+    // Journal rows and held lines are separate things and a claim can take one
+    // without the other: `release` deletes the lines it frees, and a later
+    // claim finds rows with nothing to hold. Blame reads the lines, so it goes
+    // on saying nobody has touched the file, which reads as the claim having
+    // failed.
+    if regions == 0 {
+        println!(
+            "no lines were being held on {}, so `ortak log` marks the rows claimed and \
+             `ortak blame` still has nothing to show for them",
+            rel
+        );
+    } else {
+        println!(
+            "`ortak blame {}` and `ortak log` mark them claimed, not written",
+            rel
+        );
+    }
     // Work taken quietly is what this command could become, so the sessions it
     // came from hear it from the journal rather than from a publish that has
     // lost a file.
@@ -1154,6 +1202,18 @@ fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()
         );
         return Ok(());
     }
+    // Every door a message can arrive through is a hook, and the human session
+    // has none: it is the row unclaimed writes fall to, not a party that runs
+    // anything. Nothing is lost, but the wait is open-ended, so say that rather
+    // than promise a next prompt that will not come.
+    if recipient.kind == "human" {
+        println!(
+            "ortak-{} is the person at this terminal, and no hook delivers to them. It waits \
+             under `messages waiting` in `ortak status` until somebody reads `ortak inbox ortak-{}`.",
+            recipient.id, recipient.id
+        );
+        return Ok(());
+    }
     println!(
         "sent to ortak-{} {}; it arrives before that session's next edit or command, or at its \
          next prompt, whichever comes first.",
@@ -1267,8 +1327,17 @@ mod blame_tests {
 
     #[test]
     fn a_trailing_line_number_is_not_part_of_the_filename() {
-        assert_eq!(split_target("src/db.rs:143"), ("src/db.rs", Some(143)));
-        assert_eq!(split_target("src/db.rs"), ("src/db.rs", None));
-        assert_eq!(split_target("odd:name.rs"), ("odd:name.rs", None));
+        assert_eq!(
+            split_target("src/db.rs:143").unwrap(),
+            ("src/db.rs", Some(143))
+        );
+        assert_eq!(split_target("src/db.rs").unwrap(), ("src/db.rs", None));
+        // A filename may hold a colon, and those still resolve as paths.
+        assert_eq!(split_target("odd:name.rs").unwrap(), ("odd:name.rs", None));
+        // A number that is not a line is a typo and says so, rather than
+        // becoming a filename nobody has ever had.
+        for typo in ["src/db.rs:0", "src/db.rs:-5"] {
+            assert!(split_target(typo).is_err(), "{typo} answered as a path");
+        }
     }
 }

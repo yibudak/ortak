@@ -126,6 +126,28 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     };
     let base_tree = base_commit.tree()?;
 
+    // Somebody who adds a file to .gitignore means it never leaves this
+    // machine. The daemon stops journaling it from that moment, but the rows it
+    // wrote before the rule existed are still here, and the branch shipped the
+    // file anyway, at whatever version it had when the rule landed. A secret,
+    // a build artifact or a model file goes out stale, which is the worst of
+    // both.
+    let ignored = ignored_now(&repo, &base_tree, &files);
+    for file in &ignored {
+        println!(
+            "warning: {file} is ignored by this project now, so it is not going into the branch; \
+             `ortak release ortak-{} {file}` drops it from the session for good",
+            session.id
+        );
+    }
+    files.retain(|(f, _)| !ignored.contains(f));
+    if files.is_empty() {
+        bail!(
+            "every file ortak-{} changed is ignored by this project; nothing left to publish",
+            session.id
+        );
+    }
+
     // The gate lets two sessions edit distant lines of one file, so the file on
     // disk can hold another session's work. Rebuild this session's own content
     // from its shadow history instead of reading the workspace.
@@ -233,6 +255,12 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             stale.push(file.clone());
         }
         let mode = tracked.filemode() as u32;
+        // The base branch may still hold a directory where this session now has
+        // a file. `index.add` drops the entry silently while those paths are
+        // there, so the branch shipped the old directory and none of the change
+        // that replaced it. Nothing can live under a path that is about to be a
+        // file, so this only ever removes what the file replaces.
+        let _ = index.remove_dir(Path::new(file), 0);
         // The blob lives in the shadow object database; copy it into the project repo.
         let blob_id = repo.blob(&data)?;
         index.add(&entry_for(file, blob_id, mode, data.len()))?;
@@ -531,7 +559,23 @@ fn base_seed<'r>(
         let Ok(entry) = base_tree.get_path(Path::new(file)) else {
             continue; // the session created it; nothing to seed
         };
-        let data = repo.find_blob(entry.id())?.content().to_vec();
+        // The base branch can hold a directory where this session now has a
+        // file: flattening src/thing/mod.rs into src/thing.rs does exactly
+        // that, and so does any refactor that collapses a module. Asking for a
+        // blob there ended the whole publish, every file of it, with "the
+        // requested type does not match the type in the ODB" and no branch.
+        // What the replay needs is the directory the file replaces, or its
+        // removal reads as a conflict with content the seed never had.
+        let blob = match repo.find_blob(entry.id()) {
+            Ok(blob) => blob,
+            Err(_) => {
+                if let Ok(tree) = repo.find_tree(entry.id()) {
+                    seed_directory(shadow, repo, &mut index, file, &tree)?;
+                }
+                continue;
+            }
+        };
+        let data = blob.content().to_vec();
         let id = shadow.blob(&data)?;
         index.add(&entry_for(file, id, entry.filemode() as u32, data.len()))?;
     }
@@ -539,6 +583,35 @@ fn base_seed<'r>(
     let sig = Signature::now("ortak", "publish@ortak.local")?;
     let oid = shadow.commit(None, &sig, &sig, "publish base", &tree, &[])?;
     Ok(shadow.find_commit(oid)?)
+}
+
+/// Copy every file the base branch keeps under `at` into the seed, so a session
+/// that replaced that directory with a file starts its replay from what it
+/// actually replaced.
+fn seed_directory(
+    shadow: &Repository,
+    repo: &Repository,
+    index: &mut git2::Index,
+    at: &str,
+    tree: &Tree,
+) -> Result<()> {
+    let mut files: Vec<(String, Oid, u32)> = Vec::new();
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if let (Some(git2::ObjectType::Blob), Some(name)) = (entry.kind(), entry.name()) {
+            files.push((
+                format!("{at}/{root}{name}"),
+                entry.id(),
+                entry.filemode() as u32,
+            ));
+        }
+        git2::TreeWalkResult::Ok
+    })?;
+    for (path, id, mode) in files {
+        let data = repo.find_blob(id)?.content().to_vec();
+        let seeded = shadow.blob(&data)?;
+        index.add(&entry_for(&path, seeded, mode, data.len()))?;
+    }
+    Ok(())
 }
 
 /// Rebuild the workspace as if only this session had touched it, by replaying
@@ -761,6 +834,22 @@ fn blob_at(shadow: &Repository, commit: &str, file: &str) -> Option<Vec<u8>> {
     Some(shadow.find_blob(entry.id()).ok()?.content().to_vec())
 }
 
+/// The session's files this project's ignore rules now cover, which the branch
+/// must not carry whatever the journal remembers.
+///
+/// Only files the base branch does not already have: a tracked file is not
+/// ignored by git however well it matches a pattern, and dropping one would
+/// strip a real change out of a branch without anybody asking.
+fn ignored_now(repo: &Repository, base_tree: &Tree, files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .map(|(f, _)| f.clone())
+        .filter(|f| {
+            repo.is_path_ignored(f).unwrap_or(false) && base_tree.get_path(Path::new(f)).is_err()
+        })
+        .collect()
+}
+
 /// Drop the `--exclude` paths from the publish, returning the ones that matched
 /// nothing. A mistyped path is silent otherwise, and the file it was meant to
 /// keep out of the branch ships anyway.
@@ -829,17 +918,14 @@ fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
 /// tree happens to sit on, which may be another session's task branch. A repo
 /// whose trunk is `master` published every task off HEAD and still printed
 /// `--base main`.
-fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
+pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
     repo.find_branch(base, BranchType::Local)
         .and_then(|b| b.get().peel_to_commit())
         .map_err(|_| {
             // A repository with no commits has no branch to name either, so the
             // advice below sends the reader to ortak.toml to try other names
             // when nothing they could write there would work.
-            // `is_empty` is not the question: it answers false once HEAD names
-            // a branch other than libgit2's own default. An unborn HEAD is what
-            // "no commits" actually looks like.
-            if matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch) {
+            if unborn(repo) {
                 return anyhow!(
                     "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
                 );
@@ -856,6 +942,27 @@ fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
                 head
             )
         })
+}
+
+/// The git repository this path sits inside, when the path is not its root.
+///
+/// `Repository::open` does not walk up, and both `init` and `doctor` read its
+/// failure as "not a git repository", which is what somebody working in a
+/// subdirectory of a checkout was told. The verdict is right, since publish
+/// builds from the workspace root and cannot work from there, but the reason
+/// given was false and the rest of the report reads as unreliable after it.
+pub(crate) fn repository_above(root: &Path) -> Option<std::path::PathBuf> {
+    let work = Repository::discover(root).ok()?.workdir()?.to_path_buf();
+    let same = work.canonicalize().ok()? == root.canonicalize().ok()?;
+    (!same).then_some(work)
+}
+
+/// A repository with no commits: HEAD names a branch nothing has been written
+/// to yet. `is_empty` is not the question, because it answers false once HEAD
+/// names a branch other than libgit2's own default, and an unborn HEAD is what
+/// "no commits" actually looks like.
+pub(crate) fn unborn(repo: &Repository) -> bool {
+    matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch)
 }
 
 /// How many commits the workspace's own checkout is missing from the branch a
@@ -1213,6 +1320,78 @@ mod tests {
             !out.contains("BBB"),
             "session B's edit leaked into A's branch:\n{out}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file journaled before .gitignore learned about it. The rows are real
+    /// and the branch is still the wrong place for it, and it went out at the
+    /// version it had when the rule landed, since nothing has journaled it
+    /// since.
+    #[test]
+    fn a_file_the_project_ignores_now_stays_out_of_the_branch() {
+        let (dir, repo) = scratch("ignored");
+        std::fs::write(dir.join(".gitignore"), "secret.env\napp.py\n").unwrap();
+        // app.py is on the base branch, so git does not ignore it whatever the
+        // pattern says, and neither may this.
+        let base = tree_with(&repo, Some("tracked\n"));
+        let files = vec![
+            ("secret.env".to_string(), "create".to_string()),
+            ("app.py".to_string(), "modify".to_string()),
+            ("src/main.rs".to_string(), "modify".to_string()),
+        ];
+
+        assert_eq!(ignored_now(&repo, &base, &files), vec!["secret.env"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The base branch keeps a directory where the session now has a file, the
+    /// shape of any module flattened into one file. Reading a blob out of that
+    /// tree entry ended the whole publish with "the requested type does not
+    /// match the type in the ODB", and skipping the entry left the replay
+    /// merging a deletion against content the seed had never been given.
+    #[test]
+    fn a_directory_the_session_replaced_with_a_file_replays() {
+        let (dir, repo) = scratch("dir-to-file");
+        let inner = {
+            let mut sub = repo.treebuilder(None).unwrap();
+            let blob = repo.blob(b"pub fn go() {}\n").unwrap();
+            sub.insert("mod.rs", blob, 0o100644).unwrap();
+            sub.write().unwrap()
+        };
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("thing", inner, 0o040000).unwrap();
+        let base = repo.find_tree(tb.write().unwrap()).unwrap();
+        let before = parentless(&repo, &base);
+        // The session's own micro-commit, with thing as a file.
+        let flat = commit_file(&repo, Some(&before), "thing", "pub fn walk() {}\n");
+
+        let files = vec![("thing".to_string(), "modify".to_string())];
+        let seed = base_seed(&repo, &repo, &base, &files).unwrap();
+        let (tree, skipped) = session_only_tree(&repo, &seed, &base, &[flat.to_string()]).unwrap();
+
+        assert!(skipped.is_empty(), "left out: {skipped:?}");
+        assert_eq!(named_file_in(&tree, &repo, "thing"), "pub fn walk() {}\n");
+        assert!(
+            tree.get_path(Path::new("thing/mod.rs")).is_err(),
+            "the branch still carries the directory the file replaced"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ortak init` in a subdirectory of a checkout, which both init and doctor
+    /// used to call a directory with no git repository at all. Publish still
+    /// cannot work from there; the reason given was the false part.
+    #[test]
+    fn a_workspace_inside_a_checkout_knows_where_the_repository_is() {
+        let (dir, _repo) = scratch("inside");
+        let sub = dir.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let found = repository_above(&sub).expect("the repository one directory up");
+        assert_eq!(found.canonicalize().unwrap(), dir.canonicalize().unwrap());
+        // The root of a repository is not inside another one, and a directory
+        // with no repository above it has nothing to name.
+        assert_eq!(repository_above(&dir), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

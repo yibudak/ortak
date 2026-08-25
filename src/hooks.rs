@@ -435,6 +435,12 @@ fn verdict(
         let Some(targets) = target_regions(ws, rel, tool_name, tool_input) else {
             continue;
         };
+        if targets.is_empty() {
+            if let Some(reason) = vanished_target(&db, &cfg, rel, me)? {
+                return Ok(Some(reason));
+            }
+            continue;
+        }
         let conflicts = db.conflicts(
             rel,
             &targets,
@@ -554,6 +560,44 @@ fn group_by_workspace(base: Option<&Workspace>, paths: &[String]) -> Vec<(Worksp
 /// Which line ranges is this tool call about to touch inside `rel`?
 /// `None` means nothing can be checked, so leave the file alone. Conservative
 /// fallbacks return a whole-file range.
+/// Why the text an Edit meant to replace is not in the file, when the answer is
+/// another session. `None` when nobody is working there, and then the tool's
+/// own "String to replace not found" is the whole story.
+///
+/// The edit cannot land either way, so this denial costs nothing and buys the
+/// one thing the tool's own error cannot say: which session rewrote those lines
+/// while this one was reading them.
+fn vanished_target(db: &Db, cfg: &Config, rel: &str, me: i64) -> Result<Option<String>> {
+    let whole = [Region {
+        start: 1,
+        end: WHOLE_FILE,
+    }];
+    let hot = db.conflicts(
+        rel,
+        &whole,
+        me,
+        cfg.gate.margin_lines,
+        cfg.gate.presence_minutes * 60,
+    )?;
+    let Some(c) = hot.first() else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "The text this edit replaces is no longer in {}. ortak-{} {} has been writing there \
+         (lines {}-{}, last edit {} min ago), intent: {}\n\
+         Read the file again before retrying: as written this edit cannot apply, and the lines \
+         it was aimed at are somebody else's work now. Inspect it with: ortak log --session ortak-{}",
+        rel,
+        c.session_id,
+        c.agent_name,
+        c.start,
+        c.end,
+        ((crate::db::now_ts() - c.last_ts) / 60).max(0),
+        c.intent.as_deref().unwrap_or("(not reported)"),
+        c.session_id
+    )))
+}
+
 fn target_regions(
     ws: &Workspace,
     rel: &str,
@@ -666,9 +710,9 @@ fn ranged(
             }
         }
     }
-    if targets.is_empty() {
-        return None;
-    }
+    // Empty is not None. A file that is not there has nothing to protect; a
+    // file whose old_string is gone has lines somebody may be holding, and who
+    // took the text away is the question worth answering.
     Some(targets)
 }
 
@@ -1071,5 +1115,52 @@ mod tests {
         assert_eq!(groups[1].0.root, two);
         assert_eq!(groups[1].1, vec!["api.rs"]);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An Edit whose `old_string` has been rewritten under it has no target to
+    /// protect, so the gate used to skip the file in silence and let the tool
+    /// fail with "String to replace not found". Who took the text is the
+    /// question, and only the journal can answer it.
+    #[test]
+    fn a_target_that_vanished_names_the_session_that_took_it() {
+        let path = std::env::temp_dir().join(format!(
+            "ortak-hooks-vanished-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let cfg = Config::default();
+        let me = db
+            .upsert_session("mine", "claude-mine", "llm", None)
+            .unwrap();
+        let them = db
+            .upsert_session("theirs", "claude-theirs", "llm", None)
+            .unwrap();
+
+        // Nobody else is working here: the tool's own error is the whole story.
+        assert!(vanished_target(&db, &cfg, "src/x.rs", me)
+            .unwrap()
+            .is_none());
+
+        let hunk = crate::regions::Hunk {
+            old_start: 20,
+            old_lines: 1,
+            new_start: 20,
+            new_lines: 1,
+        };
+        db.apply_edit_regions(them, "src/x.rs", &[hunk], None)
+            .unwrap();
+        db.insert_edit(them, "src/x.rs", "modify", None, &[hunk], None)
+            .unwrap();
+
+        let said = vanished_target(&db, &cfg, "src/x.rs", me)
+            .unwrap()
+            .expect("the other session is named");
+        assert!(said.contains("claude-theirs"), "{said}");
+        assert!(said.contains("src/x.rs"), "{said}");
+        // Nobody is told they are in their own way.
+        assert!(vanished_target(&db, &cfg, "src/x.rs", them)
+            .unwrap()
+            .is_none());
     }
 }
