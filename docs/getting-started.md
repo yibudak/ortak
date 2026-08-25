@@ -87,6 +87,12 @@ ortak daemon --stop
     codex plugin add ortak@ortak
     ```
 
+=== "OpenCode"
+
+    ```bash
+    ortak opencode install
+    ```
+
 Start a new agent session after installation. The plugin loads its hooks at
 session startup.
 

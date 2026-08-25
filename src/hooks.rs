@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-// Claude Code and Codex hook adapters read hook event JSON from stdin. They
+// Claude Code, Codex, and OpenCode hook adapters read hook event JSON from stdin. They
 // must never break the agent's session: callers swallow errors and exit 0.
 
 fn read_stdin_json() -> Result<Value> {
@@ -25,6 +25,9 @@ fn workspace_for(input: &Value) -> Result<Workspace> {
 }
 
 fn harness_for(input: &Value) -> &'static str {
+    if input.get("harness").and_then(Value::as_str) == Some("opencode") {
+        return "opencode";
+    }
     let transcript_is_codex = input
         .get("transcript_path")
         .and_then(|v| v.as_str())
@@ -50,10 +53,10 @@ fn agent_name_for(external_id: &str, harness: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
-    let prefix = if harness == "codex" {
-        "codex"
-    } else {
-        "claude"
+    let prefix = match harness {
+        "codex" => "codex",
+        "opencode" => "opencode",
+        _ => "claude",
     };
     format!("{}-{}", prefix, short)
 }
@@ -218,7 +221,7 @@ fn intended_content(base: &[u8], tool_name: &str, tool_input: &Value) -> Option<
             .map(|c| c.as_bytes().to_vec());
     }
     let edits: Vec<&Value> = match tool_name {
-        "Edit" => vec![tool_input],
+        "Edit" | "OpenCodeEdit" => vec![tool_input],
         "MultiEdit" => tool_input.get("edits")?.as_array()?.iter().collect(),
         _ => return None,
     };
@@ -507,7 +510,7 @@ fn target_paths(tool_name: &str, tool_input: &Value) -> Vec<String> {
         "apply_patch" => patch_command(tool_input)
             .map(patch_paths)
             .unwrap_or_default(),
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => tool_input
+        "Write" | "Edit" | "OpenCodeEdit" | "MultiEdit" | "NotebookEdit" => tool_input
             .get("file_path")
             .or_else(|| tool_input.get("notebook_path"))
             .and_then(|v| v.as_str())
@@ -606,7 +609,7 @@ fn target_regions(
         end: WHOLE_FILE,
     }];
     match tool_name {
-        "Edit" => {
+        "Edit" | "OpenCodeEdit" => {
             let old = tool_input
                 .get("old_string")
                 .and_then(|v| v.as_str())
@@ -615,7 +618,14 @@ fn target_regions(
                 .get("replace_all")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            ranged(ws, rel, &[(old, all)], whole)
+            let ranges = ranged(ws, rel, &[(old, all)], whole.clone());
+            if tool_name == "OpenCodeEdit" {
+                // OpenCode may fuzzy-match oldString. If the literal text is
+                // absent, protect the file instead of assuming the tool fails.
+                Some(ranges.unwrap_or(whole))
+            } else {
+                ranges
+            }
         }
         "MultiEdit" => {
             let edits: Vec<(&str, bool)> = tool_input
@@ -1010,6 +1020,33 @@ mod tests {
             "codex"
         );
         assert_eq!(harness_for(&serde_json::json!({})), "claude-code");
+    }
+
+    #[test]
+    fn detects_opencode_from_the_explicit_adapter_marker() {
+        let input = serde_json::json!({ "harness": "opencode", "tool_name": "apply_patch" });
+        assert_eq!(harness_for(&input), "opencode");
+        assert_eq!(
+            agent_name_for("session-123456789", "opencode"),
+            "opencode-session1"
+        );
+    }
+
+    #[test]
+    fn opencode_fuzzy_edits_fall_back_to_whole_file_protection() {
+        let input = serde_json::json!({
+            "file_path": "/tmp/ortak-missing.rs",
+            "old_string": "text OpenCode may fuzzy match",
+            "new_string": "replacement"
+        });
+        let ws = Workspace::at(Path::new("/tmp/ortak-project"));
+        assert_eq!(
+            target_regions(&ws, "missing.rs", "OpenCodeEdit", &input),
+            Some(vec![Region {
+                start: 1,
+                end: WHOLE_FILE,
+            }])
+        );
     }
 
     #[test]

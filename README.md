@@ -65,6 +65,12 @@ codex plugin marketplace add yibudak/ortak
 codex plugin add ortak@ortak
 ```
 
+OpenCode:
+
+```bash
+ortak opencode install
+```
+
 Start a new agent session after installing the plugin so the hooks load.
 
 ## How it works

@@ -62,8 +62,8 @@ ortak init
 ortak daemon --detach
 ```
 
-Then [connect Claude Code or Codex](reference/agent-integrations.md) and start
-your agent sessions in the same checkout.
+Then [connect Claude Code, Codex, or OpenCode](reference/agent-integrations.md)
+and start your agent sessions in the same checkout.
 
 <div class="ortak-callout">
 Keep mutating Git commands out of a live ortak workspace. Use
