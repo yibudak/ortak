@@ -6,6 +6,9 @@ ortak lets people and coding agents edit one live checkout without stepping on
 the same lines. It journals edits by session and publishes one session's work as
 a branch.
 
+Read the [documentation](https://yibudak.github.io/ortak/) for workflows,
+configuration, command reference, and architecture.
+
 ## Install
 
 ```bash
