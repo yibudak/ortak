@@ -10,6 +10,7 @@ mod orchestrator;
 mod publish;
 mod regions;
 mod shadow;
+mod uninstall;
 mod update;
 mod workspace;
 
@@ -34,6 +35,8 @@ struct Cli {
 enum Command {
     /// Update the current binary and installed agent plugins
     Update,
+    /// Remove the binary, agent plugins, bundled skills, and marketplaces
+    Uninstall,
     /// Initialize this directory as an ortak workspace
     Init,
     /// Run the journal daemon (file watcher and shadow repository)
@@ -288,6 +291,7 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Update => update::run(),
+        Command::Uninstall => uninstall::run(),
         Command::Init => init(),
         Command::Daemon { detach, stop } => {
             let ws = Workspace::discover_from_cwd()?;
