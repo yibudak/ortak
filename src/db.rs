@@ -28,6 +28,11 @@ const LIVE_CLAIMANTS: &str =
     "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
       WHERE h.file = ?1 AND s.status = 'active'
         AND (h.closed_at IS NULL OR h.closed_at >= ?2)";
+/// The session columns `row_to_session` reads, in the order it reads them. One
+/// copy, because a query that selects them in another order fills the fields
+/// with each other's values and nothing complains.
+const SESSION_COLS: &str =
+    "id, external_id, agent_name, kind, harness, task_intent, status, started_at, last_seen";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
 /// How long an outage is still worth reporting in `status` (seconds). The
@@ -70,6 +75,13 @@ pub struct Session {
     pub status: String,
     #[allow(dead_code)]
     pub started_at: i64,
+    /// When any hook last spoke for this session. Null on a row written before
+    /// the stamp existed.
+    ///
+    /// ponytail: evidence, not a verdict. A session thinking for twenty minutes
+    /// and one killed mid-turn look identical from here, so nothing in the tool
+    /// reads this to decide anything; a person looks at the number and decides.
+    pub last_seen: Option<i64>,
 }
 
 /// How the daemon worked out who owns an edit. An edit hook naming the file is
@@ -276,7 +288,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   task_intent  TEXT,
   status       TEXT NOT NULL DEFAULT 'active', -- 'active' | 'done'
   started_at   INTEGER NOT NULL,
-  ended_at     INTEGER
+  ended_at     INTEGER,
+  last_seen    INTEGER                    -- newest hook from this session
 );
 CREATE TABLE IF NOT EXISTS edits (
   id            INTEGER PRIMARY KEY,
@@ -395,11 +408,17 @@ impl Db {
         let _ = conn.execute("ALTER TABLE errors ADD COLUMN owner_told_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE regions ADD COLUMN attributed_by TEXT", []);
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN closed_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen INTEGER", []);
         Ok(Db { conn })
     }
 
     // ---- sessions -------------------------------------------------------
 
+    /// Register a session, or mark an existing one active again.
+    ///
+    /// Every hook runs this before it does anything else, which is why the
+    /// `last_seen` stamp lives here rather than in the seven hook bodies: one
+    /// write, in the write that was already happening, and no hook to forget.
     pub fn upsert_session(
         &self,
         external_id: &str,
@@ -408,9 +427,11 @@ impl Db {
         harness: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (external_id, agent_name, kind, harness, status, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5)
-             ON CONFLICT(external_id) DO UPDATE SET status = 'active', ended_at = NULL",
+            "INSERT INTO sessions
+                 (external_id, agent_name, kind, harness, status, started_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
+             ON CONFLICT(external_id) DO UPDATE
+                 SET status = 'active', ended_at = NULL, last_seen = ?5",
             params![external_id, agent_name, kind, harness, now_ts()],
         )?;
         let id: i64 = self.conn.query_row(
@@ -450,8 +471,7 @@ impl Db {
         let s = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE id = ?1",
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = ?1"),
                 params![id],
                 row_to_session,
             )
@@ -463,10 +483,9 @@ impl Db {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-             FROM sessions ORDER BY id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {SESSION_COLS} FROM sessions ORDER BY id"))?;
         let rows = stmt.query_map([], row_to_session)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -482,8 +501,7 @@ impl Db {
         let by_ext = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE external_id = ?1",
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE external_id = ?1"),
                 params![reference],
                 row_to_session,
             )
@@ -494,8 +512,10 @@ impl Db {
         let by_agent = self
             .conn
             .query_row(
-                "SELECT id, external_id, agent_name, kind, harness, task_intent, status, started_at
-                 FROM sessions WHERE agent_name = ?1 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT {SESSION_COLS} FROM sessions
+                      WHERE agent_name = ?1 ORDER BY id DESC LIMIT 1"
+                ),
                 params![reference],
                 row_to_session,
             )
@@ -1706,6 +1726,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         task_intent: r.get(5)?,
         status: r.get(6)?,
         started_at: r.get(7)?,
+        last_seen: r.get(8)?,
     })
 }
 
@@ -1721,6 +1742,36 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         Db::open(&path).unwrap()
+    }
+
+    /// Every hook registers before it does anything, so the stamp has to move
+    /// on a session that is only reading, and it has to survive the session
+    /// ending: what a stopped session last said is the whole point of keeping
+    /// it.
+    #[test]
+    fn a_session_is_stamped_whenever_a_hook_speaks_for_it() {
+        let db = temp_db("last-seen");
+        let id = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let first = db.get_session(id).unwrap().last_seen.unwrap();
+
+        // Registration and the second hook land in the same second, so age the
+        // row rather than wait for the clock.
+        db.conn
+            .execute(
+                "UPDATE sessions SET last_seen = ?2 WHERE id = ?1",
+                params![id, first - 600],
+            )
+            .unwrap();
+        db.upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        assert_eq!(db.get_session(id).unwrap().last_seen, Some(first));
+
+        db.end_session("sess-a").unwrap();
+        let ended = db.get_session(id).unwrap();
+        assert_eq!(ended.status, "done");
+        assert_eq!(ended.last_seen, Some(first), "the last word is kept");
     }
 
     #[test]
