@@ -99,6 +99,13 @@ pub fn session_start() -> Result<()> {
     let harness = harness_for(&input);
     let agent = agent_name_for(&external_id, harness);
     let id = db.upsert_session(&external_id, &agent, "llm", Some(harness))?;
+    // Nothing of this session's is running yet, so a Bash claim in its name is
+    // what a harness killed mid-command left behind. It matters because the
+    // line above has just stamped the session live again: `--resume` comes back
+    // under the same id, and without this the leftover claim starts answering
+    // for other people's writes again, until a command of this session's
+    // happens to finish and `post-bash` closes it.
+    db.drop_bash_claims(id)?;
     // Two things are being said at once here. The no-git rule belongs in this
     // hook rather than only in the skill: a skill loads when the model judges
     // it relevant, and this is the rule people get burned by. Advisory on

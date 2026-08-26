@@ -29,15 +29,45 @@ pub const CLAIM_GRACE_SECS: i64 = 3;
 /// enough that a person typing in the file a few seconds later is still a
 /// person.
 pub const SETTLE_SECS: i64 = 5;
+/// How long a session can go without a hook of any kind before its Bash claim
+/// stops speaking for a write (seconds).
+///
+/// A claim has no expiry on purpose: a build outlives every other window in
+/// this file. What ended one instead was `end_session` and the `active` status,
+/// and both of those need the harness to still be alive to say anything. Kill
+/// it mid-command and `closed_at` stays NULL and the status stays active for
+/// good, so from then on every unhinted write in that workspace, the person's
+/// own editor saves included, is credited to a session that has stopped.
+///
+/// `last_seen` is the one thing about a session that is measured rather than
+/// declared, so the rule hangs off that. Nothing separates a ten-minute build
+/// from a harness killed ten minutes ago: a session makes no tool calls while
+/// its command runs, so nothing refreshes the stamp in either case. What is
+/// left is bounding the damage, and half an hour is the span the gate already
+/// uses to decide a session has left a file (`presence_minutes`). No real
+/// command reaches it: Claude Code caps a foreground command at ten minutes,
+/// and a session that backgrounds a long one goes on making tool calls, each of
+/// which stamps it again.
+///
+/// The command that does run past it hands its later writes to the human, and
+/// `ortak claim <file>` takes them back afterwards, which is what the `claimed`
+/// marker is for. Nothing marks a row this drops, though: every marker in
+/// `attribution_note` says how the session named on the row was arrived at, and
+/// a dropped claim names nobody. One here would land on every write in the
+/// workspace after any harness dies and say nothing a person can act on, and
+/// what they can act on is already in `status`, which prints how long ago each
+/// session was last seen.
+pub const CLAIM_STALE_SECS: i64 = 30 * 60;
 
 /// The sessions whose Bash claim speaks for a write right now: a command still
-/// running, or one that ended inside the grace. `?1` is `BASH_CLAIM` and `?2`
-/// the grace cutoff, so it reads the same alone and as a subquery. One copy,
+/// running, or one that ended inside the grace, from a session that has been
+/// heard from since. `?1` is `BASH_CLAIM`, `?2` the grace cutoff and `?3` the
+/// stale cutoff, so it reads the same alone and as a subquery. One copy,
 /// because two that drift hand a write to different sessions in different
 /// places.
 const LIVE_CLAIMANTS: &str =
     "SELECT DISTINCT h.session_id FROM hints h JOIN sessions s ON s.id = h.session_id
-      WHERE h.file = ?1 AND s.status = 'active'
+      WHERE h.file = ?1 AND s.status = 'active' AND s.last_seen >= ?3
         AND (h.closed_at IS NULL OR h.closed_at >= ?2)";
 /// The session columns `row_to_session` reads, in the order it reads them. One
 /// copy, because a query that selects them in another order fills the fields
@@ -58,6 +88,11 @@ pub fn now_ts() -> i64 {
 /// The oldest `closed_at` a Bash claim can carry and still be heard.
 fn claim_grace_cutoff() -> i64 {
     now_ts() - CLAIM_GRACE_SECS
+}
+
+/// The oldest `last_seen` a claiming session can carry and still be believed.
+fn claim_stale_cutoff() -> i64 {
+    now_ts() - CLAIM_STALE_SECS
 }
 
 /// Render a stored timestamp on the machine's local clock.
@@ -89,9 +124,11 @@ pub struct Session {
     /// When any hook last spoke for this session. Null on a row written before
     /// the stamp existed.
     ///
-    /// ponytail: evidence, not a verdict. A session thinking for twenty minutes
-    /// and one killed mid-turn look identical from here, so nothing in the tool
-    /// reads this to decide anything; a person looks at the number and decides.
+    /// ponytail: evidence rather than a verdict, everywhere but one. A session
+    /// thinking for twenty minutes and one killed mid-turn look identical from
+    /// here, so `status` prints the number and lets a person weigh it. The
+    /// exception is the Bash claim, which nobody is there to weigh: see
+    /// `CLAIM_STALE_SECS`.
     pub last_seen: Option<i64>,
 }
 
@@ -617,7 +654,10 @@ impl Db {
         // falls through to the human with a contested marker.
         let mut stmt = self.conn.prepare(&format!("{LIVE_CLAIMANTS} LIMIT 2"))?;
         let claimants: Vec<i64> = stmt
-            .query_map(params![BASH_CLAIM, claim_grace_cutoff()], |r| r.get(0))?
+            .query_map(
+                params![BASH_CLAIM, claim_grace_cutoff(), claim_stale_cutoff()],
+                |r| r.get(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(match claimants.as_slice() {
             // Nothing named this write and nobody has a command open. Before it
@@ -666,10 +706,10 @@ impl Db {
             .query_row(
                 &format!(
                     "SELECT e.session_id FROM edits e
-                      WHERE e.session_id IN ({LIVE_CLAIMANTS}) AND e.file = ?3
+                      WHERE e.session_id IN ({LIVE_CLAIMANTS}) AND e.file = ?4
                       ORDER BY e.id DESC LIMIT 1"
                 ),
-                params![BASH_CLAIM, claim_grace_cutoff(), file],
+                params![BASH_CLAIM, claim_grace_cutoff(), claim_stale_cutoff(), file],
                 |r| r.get(0),
             )
             .optional()?)
@@ -683,6 +723,21 @@ impl Db {
             "UPDATE hints SET closed_at = ?3
              WHERE file = ?1 AND session_id = ?2 AND closed_at IS NULL",
             params![BASH_CLAIM, session_id, now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Throw away whatever Bash claims a session is holding, grace and all.
+    ///
+    /// A claim says a command of this session's is running. A session that is
+    /// starting, or resuming after its harness was killed mid-command, has none
+    /// by definition, so anything standing in its name is a leftover of the run
+    /// that died. `end_session` does the same on the way out, keyed by external
+    /// id, for the harness that got to say goodbye.
+    pub fn drop_bash_claims(&self, session_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM hints WHERE file = ?1 AND session_id = ?2",
+            params![BASH_CLAIM, session_id],
         )?;
         Ok(())
     }
@@ -2135,6 +2190,105 @@ mod tests {
         // This one also went to the human, but because the daemon refused to
         // pick between two claims. That is a decision, and it shows.
         assert_eq!(note("contested.rs"), "two sessions had commands open");
+    }
+
+    /// Backdate a session's stamp. The alternative is a test that waits half an
+    /// hour for a constant to expire.
+    fn last_seen(db: &Db, session_id: i64, ts: i64) {
+        db.conn
+            .execute(
+                "UPDATE sessions SET last_seen = ?2 WHERE id = ?1",
+                params![session_id, ts],
+            )
+            .unwrap();
+    }
+
+    /// The harness is killed mid-command. `post-bash` never runs, so the claim
+    /// never closes; `end_session` never runs, so the status stays active. Both
+    /// halves of the rule were satisfied for good, and from then on every write
+    /// in the workspace that no hook named, the person's own editor saves
+    /// included, was credited to a session that had stopped.
+    #[test]
+    fn a_claim_stops_speaking_once_its_session_goes_quiet() {
+        let db = temp_db("stale-claim");
+        let agent = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim))
+        );
+
+        // A command that has been running a while and a session that is still
+        // there. Surviving this is the whole reason a claim has no expiry.
+        last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS + 60);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim))
+        );
+
+        // Past the cutoff with nothing heard from it since. The write is the
+        // person's, and the row says so by naming nobody else.
+        last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS - 1);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+    }
+
+    /// A killed harness leaves its claim open, and `--resume` brings the
+    /// session back under the same id with a fresh stamp on it. So the claim
+    /// has to go on the way in as well as on the way out, or the thirty-minute
+    /// rule is undone by the one thing that reliably follows a session dying.
+    #[test]
+    fn a_session_starting_again_drops_the_claim_it_left_behind() {
+        let db = temp_db("resume-claim");
+        let agent = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
+        last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS - 1);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+
+        // Same session id, same row, live again, and the leftover with it.
+        let again = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        assert_eq!(again, agent);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim)),
+            "a stamp is all it took to give the dead command its voice back"
+        );
+
+        db.drop_bash_claims(again).unwrap();
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+    }
+
+    /// Two commands open and one of them belongs to a harness that is gone.
+    /// Refusing to choose is for two sessions that are both there; a ghost must
+    /// not cost the session that is working the credit for its own write.
+    #[test]
+    fn a_ghost_claimant_does_not_contest_a_live_one() {
+        let db = temp_db("ghost-claim");
+        let live = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        let ghost = db
+            .upsert_session("sess-b", "claude-b", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, live, None).unwrap();
+        db.insert_hint(BASH_CLAIM, ghost, None).unwrap();
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((db.ensure_human().unwrap(), Attribution::Contested)),
+            "while both are there, neither can be named"
+        );
+
+        last_seen(&db, ghost, now_ts() - CLAIM_STALE_SECS - 1);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((live, Attribution::Claim)),
+            "one command open is one command open"
+        );
     }
 
     #[test]
