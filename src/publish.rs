@@ -32,6 +32,9 @@ pub struct PublishOpts<'a> {
     /// Run the whole publish and stop before anything is recorded: no branch,
     /// no publish row, no freed regions, no push.
     pub dry_run: bool,
+    /// Ship a file whose history cannot be replayed as its net change instead
+    /// of failing the publish. Per file, and only where the replay was blocked.
+    pub squash: bool,
 }
 
 /// Assemble a session's net change into a real branch on the workspace's git
@@ -47,6 +50,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         push,
         message: subject,
         dry_run,
+        squash,
     } = opts;
     let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
@@ -156,41 +160,64 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // An excluded file leaves the replay too, not just the branch. Its commits
     // can still fail to apply, and a file nobody asked to publish has no
     // business failing the publish.
-    let commits: Vec<String> = db
+    let session_commits: Vec<(String, String)> = db
         .session_commits(session.id, after)?
         .into_iter()
         .filter(|(_, f)| files.iter().any(|(g, _)| g == f))
-        .map(|(c, _)| c)
         .collect();
     // A file another session has journaled and not released is genuinely built
     // on work that has not shipped. One it has released is not, whatever the
     // shadow history still looks like. Erring towards "theirs" keeps today's
     // behaviour when the lookup fails.
     let still_theirs = |file: &str| -> bool { db.shared_file(session.id, file).unwrap_or(true) };
-    let replay = match session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs) {
-        Ok(replayed) => replayed,
-        // The replay merges this session's edits into the base branch's content,
-        // so a checkout that never caught up with the base fails it on every
-        // file at once. That reads exactly like a collision with another
-        // session, and the message below used to say so.
-        // Only when the base is the one this workspace tracks. A publish that
-        // names another branch with --base is deliberately stacking on work the
-        // checkout does not have, so being behind it is the point rather than
-        // the fault, and saying "update the checkout" there sends the reader to
-        // fix the one thing that is not wrong.
-        Err(e) => match commits_behind(&repo, &base_commit).filter(|_| base_override.is_none()) {
-            Some(n) => bail!(
-                "{e}\n\nthis workspace is {n} commit(s) behind {base}, which is enough on its own to fail the replay: publish rebuilds each file on {base}'s content, not on the older content you have been editing. Update the checkout and publish again; --exclude will not help while it is behind."
-            ),
-            None => return Err(e),
-        },
+    // A blocked file costs the whole publish, so `--squash` takes its commits
+    // out of the replay and puts its net change back afterwards. Round-trip
+    // rather than one pass: the replay stops at the first file it cannot
+    // apply, so a second blocked file only shows up once the first is out of
+    // the way. Each turn removes a file, so this ends.
+    let mut squashed: Vec<String> = Vec::new();
+    let (session_tree, unreplayable) = loop {
+        let commits: Vec<String> = session_commits
+            .iter()
+            .filter(|(_, f)| !squashed.contains(f))
+            .map(|(c, _)| c.clone())
+            .collect();
+        let replay = match session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs) {
+            Ok(replayed) => replayed,
+            // The replay merges this session's edits into the base branch's content,
+            // so a checkout that never caught up with the base fails it on every
+            // file at once. That reads exactly like a collision with another
+            // session, and the message below used to say so.
+            // Only when the base is the one this workspace tracks. A publish that
+            // names another branch with --base is deliberately stacking on work the
+            // checkout does not have, so being behind it is the point rather than
+            // the fault, and saying "update the checkout" there sends the reader to
+            // fix the one thing that is not wrong.
+            Err(e) => match commits_behind(&repo, &base_commit).filter(|_| base_override.is_none())
+            {
+                Some(n) => bail!(
+                    "{e}\n\nthis workspace is {n} commit(s) behind {base}, which is enough on its own to fail the replay: publish rebuilds each file on {base}'s content, not on the older content you have been editing. Update the checkout and publish again; --exclude will not help while it is behind."
+                ),
+                None => return Err(e),
+            },
+        };
+        match replay {
+            Replay::Tree(tree, unreplayable) => break (tree, unreplayable),
+            Replay::Blocked(paths) if squash && paths.iter().any(|p| !squashed.contains(p)) => {
+                for p in paths {
+                    if !squashed.contains(&p) {
+                        squashed.push(p);
+                    }
+                }
+            }
+            // The advice a blocked replay owes the reader is which branch already
+            // holds those lines, and only here is the publish history in reach.
+            Replay::Blocked(paths) => bail!(blocked_message(&db, &history, session.id, &paths)?),
+        }
     };
-    let (session_tree, unreplayable) = match replay {
-        Replay::Tree(tree, unreplayable) => (tree, unreplayable),
-        // The advice a blocked replay owes the reader is which branch already
-        // holds those lines, and only here is the publish history in reach.
-        Replay::Blocked(paths) => bail!(blocked_message(&db, &history, session.id, &paths)?),
-    };
+    let session_tree = squashed.iter().try_fold(session_tree, |tree, file| {
+        squash_file(&shadow, &tree, &session_commits, file)
+    })?;
 
     // A file whose history cannot be replayed has no correct content to ship, so
     // it leaves the branch and the rest of the session's work still goes out.
@@ -243,15 +270,21 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             .ok()
             .and_then(|e| repo.find_blob(e.id()).ok())
             .map(|b| b.content().to_vec());
-        if differs_from_last_write(
-            &db,
-            &shadow,
-            session.id,
-            file,
-            &data,
-            after,
-            on_base.as_deref(),
-        )? {
+        // A squashed file is expected to differ: its net change was merged onto
+        // whatever the base branch has now, and the base moving is the reason
+        // it was squashed. Sending the reader after a lost journal row there
+        // would point at the one thing that is not wrong.
+        if !squashed.contains(file)
+            && differs_from_last_write(
+                &db,
+                &shadow,
+                session.id,
+                file,
+                &data,
+                after,
+                on_base.as_deref(),
+            )?
+        {
             stale.push(file.clone());
         }
         let mode = tracked.filemode() as u32;
@@ -381,6 +414,24 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             }
         }
         println!("the branch is incomplete; publish and merge that work, then publish again");
+    }
+    // Squashing is not free and a rehearsal that squashed has to say so, or the
+    // rehearsal is not one.
+    if !squashed.is_empty() {
+        println!("\nsquashed, so the branch carries their net change and not their history:");
+        for f in &squashed {
+            println!("  {}", f);
+        }
+        println!(
+            "their replay was blocked. The merge that keeps a concurrent session's lines out of the branch is given up for those files, so read them{} before the PR",
+            // A rehearsal has no branch to diff against yet, and sending
+            // somebody to a command that answers "unknown revision" is the
+            // rehearsal lying about what it did.
+            match dry_run {
+                true => String::new(),
+                false => format!(" in `git diff {base}..{branch_name}`"),
+            }
+        );
     }
     for f in &stale {
         println!(
@@ -712,6 +763,88 @@ enum Replay<'r> {
     Blocked(Vec<String>),
 }
 
+/// Put one file's net change into the replayed tree, in place of the history
+/// that could not be replayed onto it.
+///
+/// The replay's price is that every intermediate state has to apply, not just
+/// the last one: a session that edits line 3, has the base branch change line 3
+/// underneath it, and then rewrites the file without its own line-3 edit is
+/// blocked on a hunk it threw away itself, while the content it means to ship
+/// merges cleanly. What goes in instead is one synthetic commit carrying the
+/// whole slice's change to that file, from the content the session first saw to
+/// the content it ended with. It is still a cherry-pick, so a trunk change
+/// elsewhere in the file is still merged rather than overwritten; what is given
+/// up is the chance to resolve the session's own discarded hunks separately,
+/// and any of another session's lines that its snapshots picked up.
+///
+/// ponytail: the overwrite is the floor, for when even the net diff collides.
+/// Nothing below it would be true, so there is no third strategy to add.
+fn squash_file<'r>(
+    shadow: &'r Repository,
+    head: &Tree<'r>,
+    commits: &[(String, String)],
+    file: &str,
+) -> Result<Tree<'r>> {
+    let ids: Vec<&str> = commits
+        .iter()
+        .filter(|(_, f)| f == file)
+        .map(|(c, _)| c.as_str())
+        .collect();
+    let (Some(first), Some(last)) = (ids.first(), ids.last()) else {
+        return Ok(head.clone()); // nothing of this file in the slice
+    };
+    let path = Path::new(file);
+    let first = shadow.find_commit(Oid::from_str(first)?)?;
+    let last = shadow.find_commit(Oid::from_str(last)?)?;
+    let ends_at = last
+        .tree()?
+        .get_path(path)
+        .with_context(|| format!("{file} is missing from shadow commit {}", last.id()))?;
+    let ends_at = (ends_at.id(), ends_at.filemode() as u32);
+    // What the session started from: the file as the parent of its first
+    // micro-commit had it. A session that created the file has no such parent
+    // entry, and the empty tree is the right ancestor for one.
+    let starts_at = first
+        .parent(0)
+        .and_then(|p| p.tree())
+        .ok()
+        .and_then(|t| t.get_path(path).ok())
+        .map(|e| (e.id(), e.filemode() as u32));
+
+    let sig = Signature::now("ortak", "publish@ortak.local")?;
+    let one_file = |entry: Option<(Oid, u32)>| -> Result<Tree<'r>> {
+        let mut index = git2::Index::new()?;
+        if let Some((id, mode)) = entry {
+            let len = shadow.find_blob(id)?.content().len();
+            index.add(&entry_for(file, id, mode, len))?;
+        }
+        Ok(shadow.find_tree(index.write_tree_to(shadow)?)?)
+    };
+    let before = shadow.commit(None, &sig, &sig, "squash from", &one_file(starts_at)?, &[])?;
+    let before = shadow.find_commit(before)?;
+    let net = shadow.commit(
+        None,
+        &sig,
+        &sig,
+        "squash to",
+        &one_file(Some(ends_at))?,
+        &[&before],
+    )?;
+    let net = shadow.find_commit(net)?;
+    // `cherrypick_commit` reads its `ours` from a commit, and the replayed tree
+    // has none of its own. Only the tree is looked at.
+    let ours = shadow.commit(None, &sig, &sig, "replayed", head, &[])?;
+    let mut merged = shadow.cherrypick_commit(&net, &shadow.find_commit(ours)?, 0, None)?;
+    if merged.has_conflicts() {
+        merged = git2::Index::new()?;
+        merged.read_tree(head)?;
+        let (id, mode) = ends_at;
+        let len = shadow.find_blob(id)?.content().len();
+        merged.add(&entry_for(file, id, mode, len))?;
+    }
+    Ok(shadow.find_tree(merged.write_tree_to(shadow)?)?)
+}
+
 /// The error a blocked replay ends the publish with, including which of the
 /// session's own branches already carries the file it choked on.
 ///
@@ -726,10 +859,12 @@ fn blocked_message(
     paths: &[String],
 ) -> Result<String> {
     let flags = format!("--exclude {}", paths.join(" --exclude "));
+    // Nobody can know `--squash` exists before they need it: a blocked replay
+    // is only reachable by trying, so this error is the one place it can be
+    // learned. What it gives up belongs in the same sentence as the offer.
     let mut msg = format!(
-        "cannot replay this session's change to {}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {}",
-        paths.join(", "),
-        flags
+        "cannot replay this session's change to {paths}: the merge could not separate it from the edits already at those lines. They may be another session's or this session's own, already published; publish cannot tell which. Run `ortak log` to see who else is in the file, or ship the rest of the session's work with {flags}.\n\n--squash ships {paths} as one net change instead of its history, which gets past a hunk the session has since thrown away. It gives up the merge that keeps a concurrent session's lines out of the branch, and only there: everything else still replays.",
+        paths = paths.join(", "),
     );
     for file in paths {
         let Some(branch) = published_branch_for(db, history, session_id, file)? else {
@@ -1559,6 +1694,76 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The history round 9 found: the session edits line 3, the base branch
+    /// moves line 3 underneath it, and the session then rewrites the file
+    /// without its own line-3 edit. The replay dies on a hunk the session threw
+    /// away itself, while the content it means to ship merges cleanly.
+    #[test]
+    fn a_squash_ships_a_history_that_cannot_replay() {
+        let (dir, repo) = scratch("squash");
+        let start = commit(&repo, None, Some(&lines(&[])));
+        let start = repo.find_commit(start).unwrap();
+        let edit = commit(&repo, Some(&start), Some(&lines(&[(3, "MINE")])));
+        let rewrite = repo.find_commit(edit).unwrap();
+        // The rewrite drops line 3 back and leaves the work this branch is for.
+        let rewrite = commit(&repo, Some(&rewrite), Some(&lines(&[(20, "REAL-WORK")])));
+
+        let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
+        let seed = parentless(&repo, &base);
+        let commits = vec![edit.to_string(), rewrite.to_string()];
+        match super::session_only_tree(&repo, &seed, &base, &commits, &shared_none).unwrap() {
+            Replay::Blocked(paths) => assert_eq!(paths, vec!["app.py".to_string()]),
+            Replay::Tree(..) => panic!("the discarded line-3 edit replayed as if it were clean"),
+        }
+
+        // What --squash does instead: the file's commits leave the replay, and
+        // its net change goes on the base once.
+        let pairs: Vec<(String, String)> = commits
+            .iter()
+            .map(|c| (c.clone(), "app.py".to_string()))
+            .collect();
+        let (replayed, _) = session_only_tree(&repo, &seed, &base, &[]).unwrap();
+        let squashed = squash_file(&repo, &replayed, &pairs, "app.py").unwrap();
+        let out = file_in(&squashed, &repo);
+        assert!(
+            out.contains("REAL-WORK"),
+            "the session's work is missing:\n{out}"
+        );
+        assert!(
+            out.contains("ALREADY-SHIPPED"),
+            "the base's line 3 was overwritten:\n{out}"
+        );
+        assert!(
+            !out.contains("MINE"),
+            "the discarded edit came back:\n{out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The floor under the net change: when that collides too, the content the
+    /// session ended with is the only answer left, and it replaces the file.
+    /// It takes the base branch's line with it, which is why the publish says
+    /// which files it squashed and where to read them.
+    #[test]
+    fn a_squash_that_still_collides_takes_the_sessions_own_content() {
+        let (dir, repo) = scratch("squash-collide");
+        let start = commit(&repo, None, Some(&lines(&[])));
+        let start = repo.find_commit(start).unwrap();
+        let mine = commit(&repo, Some(&start), Some(&lines(&[(3, "MINE")])));
+
+        let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
+        let seed = parentless(&repo, &base);
+        let (replayed, _) = session_only_tree(&repo, &seed, &base, &[]).unwrap();
+        let pairs = vec![(mine.to_string(), "app.py".to_string())];
+        let out = file_in(
+            &squash_file(&repo, &replayed, &pairs, "app.py").unwrap(),
+            &repo,
+        );
+        assert!(out.contains("MINE"), "{out}");
+        assert!(!out.contains("ALREADY-SHIPPED"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Stacking on another branch means the checkout is behind it by design, so
     /// the count is real and the explanation is wrong: it sends the reader to
     /// update a checkout that is exactly where it should be, and says nothing
@@ -2334,6 +2539,7 @@ mod tests {
             push: false,
             message: None,
             dry_run,
+            squash: false,
         };
         let session = format!("ortak-{me}");
         run(&ws, &cfg, &session, opts(true)).unwrap();

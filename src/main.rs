@@ -167,6 +167,12 @@ enum Command {
         /// Say what the branch would carry and record nothing
         #[arg(long)]
         dry_run: bool,
+        /// Ship a file whose history cannot be replayed as one net change
+        ///
+        /// Only the files the replay was blocked on, and it gives up the merge
+        /// that keeps a concurrent session's edits out of the branch.
+        #[arg(long)]
+        squash: bool,
     },
     /// Report an error unrelated to your changes and stop the line
     Report {
@@ -368,6 +374,7 @@ fn run(cli: Cli) -> Result<()> {
             amend,
             push,
             dry_run,
+            squash,
         } => {
             let ws = Workspace::discover_from_cwd()?;
             let cfg = Config::load(&ws.config_path)?;
@@ -390,6 +397,7 @@ fn run(cli: Cli) -> Result<()> {
                     push,
                     message: message.as_deref(),
                     dry_run,
+                    squash,
                 },
             )
         }
