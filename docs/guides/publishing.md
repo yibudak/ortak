@@ -38,7 +38,7 @@ ortak publish ortak-2 \
 
 ## Leave a file out
 
-Repeat `--exclude` for workspace-relative files that must stay out of this
+Repeat `--exclude` for workspace-relative paths that must stay out of this
 branch:
 
 ```bash
@@ -47,7 +47,38 @@ ortak publish ortak-2 \
   --exclude tmp/generated.json
 ```
 
-A miss produces a warning. Excluded edits remain eligible for a later publish.
+A pattern is a path prefix, so naming a directory keeps everything under it out
+and stops at the separator: `--exclude src` holds back `src/db.rs` and leaves
+`srcgen/main.rs` alone.
+
+A miss produces a warning, because a pattern matching nothing is a typo and the
+warning is the only thing that says so. Excluded edits remain eligible for a
+later publish.
+
+## Ship a history that cannot be replayed
+
+Publish rebuilds each file by replaying the session's own micro-commits onto the
+base branch, which is what keeps a concurrent session's edits out of the branch.
+The price is that every intermediate state has to apply, not only the last one.
+
+A hunk the session discarded itself can therefore block the publish: edit line 3,
+let the trunk change line 3 underneath, then rewrite the file without that line-3
+edit. The final content merges cleanly and the replay still dies on the middle
+step.
+
+`--squash` takes such a file out of the replay and puts its net change back as
+one commit, from the content the session first saw to the content it ended with:
+
+```bash
+ortak publish ortak-2 --squash
+```
+
+It applies per file and only where the replay was blocked, so everything else
+replays as before. The net change is still merged rather than pasted over, which
+keeps an unrelated trunk change elsewhere in the file. You give up the merge that
+holds another session's lines out of that one file. Publish prints which files it
+squashed and where to read them, and the blocked-replay error names the flag,
+which is where you will meet it.
 
 ## Publish a complete session history
 

@@ -64,13 +64,14 @@ ortak publish [OPTIONS] <SESSION>
 | Option | Purpose |
 | --- | --- |
 | `--branch <name>` | Choose the branch name. |
-| `--exclude <path>` | Keep a workspace-relative file out. Repeat as needed. |
+| `--exclude <path>` | Keep a workspace-relative file or directory out. Repeat as needed. |
 | `--base <branch>` | Build on another base for this run. |
 | `-m, --message <subject>` | Override the commit subject. |
 | `--all` | Include the session's complete journal history. |
 | `--amend` | Rebuild or extend the named branch. Conflicts with `--all`. |
 | `--push` | Push the branch and print the forge-specific PR command. |
 | `--dry-run` | Rehearse without creating a branch or publish record. |
+| `--squash` | Ship a file whose history cannot be replayed as one net change. |
 
 The default mode includes edits after the session's latest publish.
 
