@@ -2,11 +2,11 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::regions::{Region, WHOLE_FILE};
 use crate::workspace::Workspace;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Claude Code, Codex, and OpenCode hook adapters read hook event JSON from stdin. They
 // must never break the agent's session: callers swallow errors and exit 0.
@@ -17,11 +17,21 @@ fn read_stdin_json() -> Result<Value> {
     Ok(serde_json::from_str(&buf)?)
 }
 
+/// The directory the tool call ran in, as the payload gives it. Every path a
+/// command writes without naming a root is relative to this one.
+fn cwd_for(input: &Value) -> Option<PathBuf> {
+    input
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
 fn workspace_for(input: &Value) -> Result<Workspace> {
-    if let Some(cwd) = input.get("cwd").and_then(|v| v.as_str()) {
-        return Workspace::discover(Path::new(cwd));
+    match cwd_for(input) {
+        Some(cwd) => Workspace::discover(&cwd),
+        None => bail!("no working directory in the hook payload"),
     }
-    Workspace::discover_from_cwd()
 }
 
 fn harness_for(input: &Value) -> &'static str {
@@ -722,26 +732,23 @@ fn ranged(
 /// hooks cannot see a shell redirect or an in-place rewrite, so without this the
 /// daemon attributes that work to the human and the session publishes nothing.
 pub fn pre_bash() -> Result<()> {
-    let input = read_stdin_json()?;
-    let Ok(ws) = workspace_for(&input) else {
+    pre_bash_for(&read_stdin_json()?)
+}
+
+fn pre_bash_for(input: &Value) -> Result<()> {
+    let (home, reached) = bash_sessions(input);
+    for (db, me) in home.iter().chain(reached.iter()) {
+        // ponytail: the claim covers every unhinted change until the command
+        // ends, so a human editor save during a long build lands on this
+        // session too. Coarse, but the alternative loses the agent's own work.
+        let _ = db.insert_hint(crate::db::BASH_CLAIM, *me, None);
+    }
+    // Messages after the claims rather than between them, so a workspace that
+    // fails on its way to a verdict cannot cost the workspaces behind it the
+    // claim they were about to get.
+    let Some((db, me)) = home else {
         return Ok(());
     };
-    let db = Db::open(&ws.db_path)?;
-    let external_id = input
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let harness = harness_for(&input);
-    let me = db.upsert_session(
-        external_id,
-        &agent_name_for(external_id, harness),
-        "llm",
-        Some(harness),
-    )?;
-    // ponytail: the claim covers every unhinted change until the command ends,
-    // so a human editor save during a long build lands on this session too.
-    // Coarse, but the alternative loses the agent's own work.
-    db.insert_hint(crate::db::BASH_CLAIM, me, None)?;
     // A session can go a long way between edits while it reads, greps and runs
     // tests, and a message that waits for the next edit can wait that long.
     // Bash is the call an agent makes constantly, so it opens the same door.
@@ -751,28 +758,159 @@ pub fn pre_bash() -> Result<()> {
     Ok(())
 }
 
-pub fn post_bash() -> Result<()> {
-    let input = read_stdin_json()?;
-    let Ok(ws) = workspace_for(&input) else {
-        return Ok(());
+/// How many distinct paths out of one command are worth resolving. A command
+/// naming more places than this is a batch job, and by then the workspaces it
+/// reaches have been named several times over. It is a bound on the work as
+/// much as a cap on the answer: dropping repeats is a scan of what is already
+/// there, and this hook runs on every Bash call an agent makes.
+const COMMAND_PATHS_MAX: usize = 16;
+
+/// Absolute paths a shell command names, resolved against the directory it runs
+/// in, in the order they appear and without repeats.
+///
+/// A word with no separator in it is skipped: a bare filename is in `cwd`, and
+/// `cwd`'s own workspace is claimed regardless. Everything else is taken as
+/// typed, which is enough for a redirect written against the path, a quoted
+/// path and `--out=/x/y`. `$VAR/file` and a path the shell reads from somewhere
+/// resolve to nonsense and `Workspace::discover` drops them.
+fn command_paths(cwd: &Path, command: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for word in command.split(|c: char| c.is_whitespace() || ";|&<>()\"'`".contains(c)) {
+        // `--out=/x/y` and `DIR=/x/y` both carry their path after the sign.
+        let word = word.rsplit_once('=').map_or(word, |(_, tail)| tail);
+        if !word.contains('/') {
+            continue;
+        }
+        let path = Path::new(word);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        if !out.contains(&abs) {
+            out.push(abs);
+        }
+        if out.len() == COMMAND_PATHS_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// Every ortak workspace one shell command can write to: the one it runs in
+/// first, then one for each path in the command text that lands in a different
+/// one.
+///
+/// An edit call carries a file list and a shell command does not, which is the
+/// whole reason the Bash hooks claimed in a single workspace while
+/// `group_by_workspace` spread an edit across all of them. Three files deleted
+/// in another checkout by a session working here were recorded there against
+/// the person, with nothing in the row saying it was a guess. This is the same
+/// move that function makes, from the only paths a Bash payload carries: its
+/// command text. `cd /other/repo && rm x` is covered too, because the claim is
+/// on the workspace and not on a file.
+///
+/// It misses what the shell works out while it runs: `$VAR/file`, a path read
+/// out of a file, a `cd` through a variable. Those land where they landed
+/// before, on the workspace `cwd` names, so this finds more of a command's work
+/// than the old code and never less.
+///
+/// ponytail: the ceiling is that the command text is not the command. The exact
+/// version diffs the tree afterwards and groups what actually changed, at the
+/// price of a workspace walk on every Bash call, which is the call an agent
+/// makes constantly; it is parked with that price on it. This spends one
+/// `Workspace::discover` per distinct path named, capped at
+/// `COMMAND_PATHS_MAX`, so a handful of `is_dir` calls and no walk. The other
+/// cost is real: a command that only reads another workspace claims it just the
+/// same, and one more claimant there is one more way for that workspace's own
+/// sessions to end up contested.
+fn command_workspaces(home: Option<&Workspace>, input: &Value) -> Vec<Workspace> {
+    let mut out: Vec<Workspace> = home.into_iter().cloned().collect();
+    let Some(cwd) = cwd_for(input) else {
+        return out;
     };
-    let db = Db::open(&ws.db_path)?;
+    let command = input
+        .get("tool_input")
+        .and_then(|t| t.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    for abs in command_paths(&cwd, command) {
+        let Ok(ws) = Workspace::discover(&abs) else {
+            continue;
+        };
+        if !out.iter().any(|w| w.root == ws.root) {
+            out.push(ws);
+        }
+    }
+    out
+}
+
+/// One workspace's journal and the id this session goes by inside it.
+type BashSession = (Db, i64);
+
+/// This session's journal and its id in every workspace one shell command
+/// reaches: the workspace it runs in, then the rest. Both Bash hooks walk this
+/// list, built from the same command text, so every claim `pre-bash` opens is
+/// one `post-bash` closes.
+///
+/// The workspace the command runs in is kept apart because it is the only one
+/// that answers for anything besides the claim: the messages waiting for this
+/// session and the nudge after a failed command are its own workspace's
+/// business.
+///
+/// The id is read per workspace on purpose. `sessions` is per workspace and
+/// hands out its own numbers, so the id this session holds in one journal names
+/// somebody else in the next, and registering here is also what puts the
+/// session in that workspace's `ortak status`. A workspace whose journal will
+/// not open is dropped in silence: a hook that cannot do its job says nothing,
+/// and the workspaces either side of it still get their claim.
+fn bash_sessions(input: &Value) -> (Option<BashSession>, Vec<BashSession>) {
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let harness = harness_for(&input);
-    let me = db.upsert_session(
-        external_id,
-        &agent_name_for(external_id, harness),
-        "llm",
-        Some(harness),
-    )?;
+    let harness = harness_for(input);
+    let home = workspace_for(input).ok();
+    let (mut here, mut reached) = (None, Vec::new());
+    for ws in command_workspaces(home.as_ref(), input) {
+        let Ok(db) = Db::open(&ws.db_path) else {
+            continue;
+        };
+        let Ok(me) = db.upsert_session(
+            external_id,
+            &agent_name_for(external_id, harness),
+            "llm",
+            Some(harness),
+        ) else {
+            continue;
+        };
+        if home.as_ref().is_some_and(|h| h.root == ws.root) {
+            here = Some((db, me));
+        } else {
+            reached.push((db, me));
+        }
+    }
+    (here, reached)
+}
+
+pub fn post_bash() -> Result<()> {
+    post_bash_for(&read_stdin_json()?)
+}
+
+fn post_bash_for(input: &Value) -> Result<()> {
     // The command has finished, but what it wrote has not reached the daemon
     // yet: an unhinted change waits out a quiet window first. Closing the claim
     // stamps it rather than deleting it, so it still answers for that window.
-    // Before the early returns below, so a failing command closes it too.
-    db.clear_bash_claim(me)?;
+    // Before the early returns below, so a failing command closes it too, and
+    // over every workspace the command reached, so one that wrote into three of
+    // them leaves none of the three holding an open claim.
+    let (home, reached) = bash_sessions(input);
+    for (db, me) in home.iter().chain(reached.iter()) {
+        let _ = db.clear_bash_claim(*me);
+    }
+    let Some((db, me)) = home else {
+        return Ok(());
+    };
 
     let resp = input.get("tool_response").cloned().unwrap_or(Value::Null);
     let exit = resp
@@ -1114,6 +1252,96 @@ mod tests {
         assert_eq!(groups[0].1, vec!["src/app.py", "notes.md"]);
         assert_eq!(groups[1].0.root, two);
         assert_eq!(groups[1].1, vec!["api.rs"]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The paths a command hands over, and the ones it does not. A word with no
+    /// separator in it names a file in `cwd`, and that workspace is claimed
+    /// whatever the command says.
+    #[test]
+    fn a_command_gives_up_the_paths_it_names() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(
+            command_paths(
+                cwd,
+                "printf hi >/other/repo/out.txt; cp -r sub/tree --dest=/third/repo/x /other/repo/out.txt",
+            ),
+            vec![
+                PathBuf::from("/other/repo/out.txt"),
+                PathBuf::from("/work/repo/sub/tree"),
+                PathBuf::from("/third/repo/x"),
+            ],
+            "a redirect written against its path, a relative path, a flag's value, and no repeats"
+        );
+        assert!(command_paths(cwd, "cargo test --locked").is_empty());
+    }
+
+    /// A command that writes into another checkout is claimed there too. Three
+    /// files deleted in `/opt/odoo/v16` by a session whose workspace was
+    /// somewhere else went into that journal against the person, with nothing
+    /// in the row saying anybody had guessed.
+    #[test]
+    fn a_command_reaching_another_workspace_claims_the_write_there() {
+        let base = std::env::temp_dir().join(format!("ortak-hooks-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (mine, theirs) = (base.join("mine"), base.join("theirs"));
+        for root in [&mine, &theirs] {
+            std::fs::create_dir_all(root.join(crate::workspace::ORTAK_DIR)).unwrap();
+        }
+        std::fs::create_dir_all(base.join("loose")).unwrap();
+        // The two journals have to number this session differently, or a claim
+        // written with the wrong workspace's id would pass unnoticed.
+        let their_db = Db::open(&Workspace::at(&theirs).db_path).unwrap();
+        their_db.ensure_human().unwrap();
+        their_db
+            .upsert_session("someone-else", "claude-else", "llm", None)
+            .unwrap();
+
+        let payload = |response: Value| {
+            serde_json::json!({
+                "cwd": mine.to_str().unwrap(),
+                "session_id": "sess-reach",
+                "tool_input": { "command": format!(
+                    "rm -f {}/api.rs {}/loose/file.txt", theirs.display(), base.display()) },
+                "tool_response": response,
+            })
+        };
+        pre_bash_for(&payload(Value::Null)).unwrap();
+
+        let my_db = Db::open(&Workspace::at(&mine).db_path).unwrap();
+        let mine_id = my_db.resolve_session("sess-reach").unwrap().id;
+        let theirs_id = their_db.resolve_session("sess-reach").unwrap().id;
+        assert_ne!(mine_id, theirs_id, "the journals number sessions apart");
+        assert_eq!(
+            their_db.peek_hint("api.rs").unwrap(),
+            Some((theirs_id, crate::db::Attribution::Claim)),
+            "the workspace written into names the session that wrote"
+        );
+        assert_eq!(
+            my_db.peek_hint("src/x.rs").unwrap(),
+            Some((mine_id, crate::db::Attribution::Claim)),
+            "and the workspace the command ran in still does"
+        );
+
+        // Whatever `pre-bash` opened, `post-bash` has to close, and it gets
+        // there from the same command text. A path in no workspace is dropped
+        // by both.
+        let after = payload(serde_json::json!({ "exit_code": 0 }));
+        assert_eq!(
+            command_workspaces(workspace_for(&after).ok().as_ref(), &after)
+                .into_iter()
+                .map(|w| w.root)
+                .collect::<Vec<_>>(),
+            vec![mine.clone(), theirs.clone()],
+            "its own workspace first, and a path in no workspace dropped"
+        );
+        post_bash_for(&after).unwrap();
+        // Closed, and still inside its grace, so it answers for what the
+        // command wrote a moment ago.
+        assert_eq!(
+            their_db.peek_hint("api.rs").unwrap(),
+            Some((theirs_id, crate::db::Attribution::Claim))
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
