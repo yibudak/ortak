@@ -146,7 +146,7 @@ enum Command {
         /// Branch name (default: <prefix>ortak-<id>-<slug>)
         #[arg(long)]
         branch: Option<String>,
-        /// Workspace-relative path to keep out of the branch (repeatable)
+        /// Workspace-relative file or directory to keep out of the branch (repeatable)
         #[arg(long)]
         exclude: Vec<String>,
         /// Branch to build on, for this run only (default: [publish] base_branch)

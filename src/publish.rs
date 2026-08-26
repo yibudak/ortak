@@ -853,12 +853,31 @@ fn ignored_now(repo: &Repository, base_tree: &Tree, files: &[(String, String)]) 
 /// Drop the `--exclude` paths from the publish, returning the ones that matched
 /// nothing. A mistyped path is silent otherwise, and the file it was meant to
 /// keep out of the branch ships anyway.
+///
+/// A pattern is a path prefix, so a directory takes everything under it.
+/// `--exclude src` used to match one exact path called `src`, warn that it had
+/// matched nothing, and then publish every file in the directory: a warning
+/// that reads like a typo report while the flag does the opposite of what it
+/// was asked.
+///
+/// ponytail: a prefix, not a glob. A glob is a dependency and a syntax to
+/// document; if somebody needs `--exclude '*.json'` they will ask.
 fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<String> {
     let mut unmatched = Vec::new();
     for pattern in exclude {
-        let path = pattern.trim_start_matches("./");
+        // Every path starts with the empty one, so `--exclude ./` would hold
+        // back the whole publish while `--exclude .` warns: two spellings of
+        // one intent doing opposite things. It is a typo like any other.
+        let Some(path) = Some(pattern.trim_start_matches("./")).filter(|p| !p.is_empty()) else {
+            unmatched.push(pattern.clone());
+            continue;
+        };
+        // `Path::starts_with` matches whole components, which is the boundary
+        // this needs: `src` takes `src/db.rs` and leaves `srcgen/main.rs`
+        // alone. It ignores the trailing slash tab completion adds, too.
+        let path = Path::new(path);
         let before = files.len();
-        files.retain(|(f, _)| f != path);
+        files.retain(|(f, _)| !Path::new(f).starts_with(path));
         if files.len() == before {
             unmatched.push(pattern.clone());
         }
@@ -1781,6 +1800,40 @@ mod tests {
         let unmatched = drop_excluded(&mut files, &["./notes.md".into(), "src/gone.rs".into()]);
         assert_eq!(files, vec![("src/db.rs".to_string(), "modify".to_string())]);
         assert_eq!(unmatched, vec!["src/gone.rs".to_string()]);
+    }
+
+    /// `--exclude src` warned that it had matched nothing and then published
+    /// every file under `src/`. It is a path prefix now, and the separator is
+    /// what keeps `srcgen/` out of it.
+    #[test]
+    fn exclude_takes_a_directory_and_stops_at_the_separator() {
+        let touched = || {
+            vec![
+                ("src/db.rs".to_string(), "modify".to_string()),
+                ("src/publish.rs".to_string(), "modify".to_string()),
+                ("srcgen/main.rs".to_string(), "create".to_string()),
+            ]
+        };
+        let kept = vec![("srcgen/main.rs".to_string(), "create".to_string())];
+
+        let mut files = touched();
+        let unmatched = drop_excluded(&mut files, &["src".into()]);
+        assert_eq!(files, kept);
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+
+        let mut files = touched();
+        drop_excluded(&mut files, &["./src/".into()]);
+        assert_eq!(files, kept);
+
+        // A directory the session did not touch is still a typo, and the
+        // warning is the only thing that says so. `./` trims to the empty
+        // string, which every path starts with, so it holds nothing back
+        // rather than everything.
+        for typo in ["doc", "./"] {
+            let mut files = touched();
+            assert_eq!(drop_excluded(&mut files, &[typo.into()]), vec![typo]);
+            assert_eq!(files, touched(), "{typo} held files back");
+        }
     }
 
     /// Excluding a file has to take its commits out of the replay as well.
