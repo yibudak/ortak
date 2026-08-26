@@ -37,6 +37,26 @@ Existing workspace files created before global config support may contain a
 complete `[orchestrator]` block. Remove or comment out fields that should inherit
 from the global file.
 
+## Does `ortak.toml` belong in git?
+
+Commit it. Everything the file holds is project policy that the whole team should
+share: the trunk to publish onto, the branch prefix, the gate's margin and
+presence window, the extra ignore patterns.
+
+The one setting that could not be committed was the push remote, which differs
+per clone, a fork for one contributor and upstream for another. That lives in git
+config now, where per-clone settings already belong and where nothing can commit
+it by accident:
+
+```bash
+git config ortak.remote <name>
+```
+
+`.ortak/` is the opposite case and stays out of git. It holds the journal
+database and the shadow repository, both of them machine-local. It needs no entry
+in the project's `.gitignore`, because `ortak init` writes one inside the
+directory itself rather than editing a file the whole team shares.
+
 ## workspace
 
 ```toml
