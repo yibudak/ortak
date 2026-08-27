@@ -715,13 +715,35 @@ impl Db {
             .optional()?)
     }
 
-    /// Close a session's Bash claim now its command has finished. The row stays
-    /// until the grace runs out; `CLAIM_GRACE_SECS` says why deleting it here
-    /// loses the writes the command itself made.
+    /// Close one open Bash claim of this session's, now that one of its
+    /// commands has finished. The row stays until the grace runs out;
+    /// `CLAIM_GRACE_SECS` says why deleting it here loses the writes the
+    /// command itself made.
+    ///
+    /// One row, not all of them. `pre-bash` opens a row per Bash call and a
+    /// harness can have several calls in flight from one message, so closing
+    /// every open row let the first command to return end the claim of the one
+    /// still running, and three seconds later everything that one wrote fell to
+    /// the person. The rows are interchangeable: each says this session has a
+    /// command open and none of them says which, so closing any one leaves the
+    /// right number standing. The oldest goes first, which keeps the newest
+    /// command's claim alive longest.
+    ///
+    /// The row is picked by rowid because `LIMIT` on an `UPDATE` needs
+    /// SQLite's optional `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which the bundled
+    /// build does not have.
+    ///
+    /// ponytail: a harness that fired `post-bash` twice for one call would
+    /// close a row belonging to a command still running. Defending that needs
+    /// the claim to carry the identity of the command that opened it, which
+    /// nothing the hook is handed provides, and the same interchangeability
+    /// that makes this fix work is what leaves a doubled call and two commands
+    /// finishing at once looking identical from here.
     pub fn clear_bash_claim(&self, session_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE hints SET closed_at = ?3
-             WHERE file = ?1 AND session_id = ?2 AND closed_at IS NULL",
+              WHERE rowid = (SELECT MIN(rowid) FROM hints
+                              WHERE file = ?1 AND session_id = ?2 AND closed_at IS NULL)",
             params![BASH_CLAIM, session_id, now_ts()],
         )?;
         Ok(())
@@ -1982,6 +2004,36 @@ mod tests {
         );
 
         // Once the grace is out, the claim speaks for nothing.
+        grace_expired(&db, agent);
+        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+    }
+
+    /// One message, two Bash calls, and the quick one returns first. Closing
+    /// every open row ended the slow one's claim with it, and three seconds
+    /// later what that command wrote fell to the person. Since #95 one call can
+    /// hold rows in several workspaces as well, so the count per command stopped
+    /// being one long before anybody noticed this.
+    #[test]
+    fn one_command_finishing_leaves_the_other_commands_claim_open() {
+        let db = temp_db("two-claims-one-session");
+        let agent = db
+            .upsert_session("sess-a", "claude-a", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
+        db.insert_hint(BASH_CLAIM, agent, None).unwrap();
+
+        // The quick command returns; the slow one is still writing. Age the
+        // closed row past its grace so only a genuinely open claim can answer.
+        db.clear_bash_claim(agent).unwrap();
+        grace_expired(&db, agent);
+        assert_eq!(
+            db.peek_hint("src/x.rs").unwrap(),
+            Some((agent, Attribution::Claim)),
+            "the command still running kept a claim of its own"
+        );
+
+        // The slow one returns too, and now nothing of this session's is open.
+        db.clear_bash_claim(agent).unwrap();
         grace_expired(&db, agent);
         assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
     }
