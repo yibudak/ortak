@@ -170,19 +170,23 @@ fn inherited_messages(db: &Db, me: i64) -> Result<Option<String>> {
 }
 
 pub fn post_edit() -> Result<()> {
-    let input = read_stdin_json()?;
-    let cwd_ws = workspace_for(&input).ok();
+    post_edit_for(&read_stdin_json()?)
+}
+
+fn post_edit_for(input: &Value) -> Result<()> {
+    let cwd_ws = workspace_for(input).ok();
     let external_id = input
         .get("session_id")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let harness = harness_for(&input);
+    let harness = harness_for(input);
     let tool_name = input
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
+    let mut far = Vec::new();
     for (ws, files) in group_by_workspace(cwd_ws.as_ref(), &target_paths(tool_name, &tool_input)) {
         let db = Db::open(&ws.db_path)?;
         // Session may be unknown if the daemon/plugin were enabled mid-session,
@@ -194,6 +198,9 @@ pub fn post_edit() -> Result<()> {
             "llm",
             Some(harness),
         )?;
+        if !cwd_ws.as_ref().is_some_and(|home| home.root == ws.root) {
+            far.push(ws.root.clone());
+        }
         // Record what THIS call wrote, rebuilt from the tool's own input rather
         // than read back off disk. Another session can write the same file
         // between the tool returning and this hook running.
@@ -207,7 +214,49 @@ pub fn post_edit() -> Result<()> {
             db.insert_hint(&rel, session_id, blob.as_deref())?;
         }
     }
+    note_far_workspaces(cwd_ws.as_ref(), &external_id, harness, &far);
     Ok(())
+}
+
+/// Write down, in this session's own journal, the workspaces this call
+/// registered it in.
+///
+/// #101 closed this for the Bash door and left the Edit door open. Registering
+/// in another workspace hands that journal a session row reading active, and it
+/// has no way of ever learning otherwise: `session_end` is handed one
+/// workspace, the one the harness ran in. So the roots go where the session
+/// lives and are read back on the way out.
+///
+/// Nothing here is worth failing the hook for. A session that cannot be
+/// recorded as having reached somewhere leaves a row that reads active in a
+/// workspace it is not working in, which is the old behaviour and not a reason
+/// to cost the agent its edit.
+fn note_far_workspaces(
+    home: Option<&Workspace>,
+    external_id: &str,
+    harness: &str,
+    far: &[PathBuf],
+) {
+    if far.is_empty() {
+        return;
+    }
+    let Some(home) = home else {
+        return;
+    };
+    let Ok(db) = Db::open(&home.db_path) else {
+        return;
+    };
+    let Ok(me) = db.upsert_session(
+        external_id,
+        &agent_name_for(external_id, harness),
+        "llm",
+        Some(harness),
+    ) else {
+        return;
+    };
+    for root in far {
+        let _ = db.note_reached(me, root);
+    }
 }
 
 /// The content this session's edit applies to: its own newest pending snapshot
@@ -1431,6 +1480,51 @@ mod tests {
             elsewhere.resolve_session("sess-ends").unwrap().status,
             "active",
             "a workspace the session never named is not touched"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same leak through the other door. #101 recorded the workspaces a
+    /// shell command reached; an Edit whose path lands in another workspace
+    /// registers a session there too, and that row read active for as long as
+    /// the journal lived.
+    #[test]
+    fn an_edit_into_another_workspace_ends_there_too() {
+        let base = std::env::temp_dir().join(format!("ortak-hooks-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (mine, theirs) = (base.join("mine"), base.join("theirs"));
+        for root in [&mine, &theirs] {
+            std::fs::create_dir_all(root.join(crate::workspace::ORTAK_DIR)).unwrap();
+        }
+        let their_file = theirs.join("api.rs");
+        std::fs::write(&their_file, "pub fn go() {}\n").unwrap();
+
+        let edit = serde_json::json!({
+            "cwd": mine.to_str().unwrap(),
+            "session_id": "sess-edit",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": their_file.to_str().unwrap(),
+                "old_string": "go",
+                "new_string": "went",
+            },
+        });
+        post_edit_for(&edit).unwrap();
+        let their_db = Db::open(&Workspace::at(&theirs).db_path).unwrap();
+        assert_eq!(
+            their_db.resolve_session("sess-edit").unwrap().status,
+            "active",
+            "editing a file over there is enough to be registered there"
+        );
+
+        let ending = serde_json::json!({
+            "cwd": mine.to_str().unwrap(),
+            "session_id": "sess-edit",
+        });
+        session_end_for(&ending).unwrap();
+        assert_eq!(
+            their_db.resolve_session("sess-edit").unwrap().status,
+            "done"
         );
         std::fs::remove_dir_all(&base).ok();
     }
