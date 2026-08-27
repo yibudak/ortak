@@ -110,6 +110,19 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             session.id
         );
     }
+    // Settled before the branch is built, not after. Nothing is lost by
+    // stopping here: the branch is a function of the journal, so the same one
+    // comes back once the remote is named. Stopping after the build would leave
+    // a publish row and a moved high-water mark behind, and the re-run then
+    // answers "already carries that work" instead of pushing, which is the trap
+    // `push_advice` exists to talk people out of. It sits below the file list so
+    // that a session with nothing to publish hears that first: a push that never
+    // happens has no remote to be wrong about. A rehearsal reports it instead of
+    // raising it, because reporting what the real run does is the whole job.
+    let unsettled = push.then(|| unsettled_remote(&repo, cfg)).flatten();
+    if let (Some(problem), false) = (&unsettled, dry_run) {
+        bail!("{problem}");
+    }
 
     // An amend rebuilds the branch where it already stands, so leaving --base
     // off does not quietly rebase a stacked branch onto the trunk and pull its
@@ -468,11 +481,14 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             "\nnothing was created: no branch, no publish record, and this session still holds its lines"
         );
         if push {
-            println!(
-                "--push would push {} to {}",
-                branch_name,
-                remote_for(&repo, cfg)
-            );
+            match &unsettled {
+                Some(problem) => println!("--push would stop here: {problem}"),
+                None => println!(
+                    "--push would push {} to {}",
+                    branch_name,
+                    remote_for(&repo, cfg)
+                ),
+            }
         }
         return Ok(());
     }
@@ -1038,16 +1054,67 @@ fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<S
     unmatched
 }
 
-/// The push remote: `ortak.remote` in git config, then ortak.toml, then origin.
-/// One contributor pushes to a fork while another pushes to upstream, so this is
-/// a per-clone setting; git config is where per-clone settings already live, and
-/// it survives the `.ortak` wipes that resetting a workspace involves.
-pub fn remote_for(repo: &Repository, cfg: &Config) -> String {
+/// The remote somebody actually chose: `ortak.remote` in git config, then
+/// ortak.toml. `repo.config()` reads the global and system files too, so
+/// `git config --global ortak.remote fork` answers for every clone at once,
+/// which is the right scope for somebody who forks everything.
+fn chosen_remote(repo: &Repository, cfg: &Config) -> Option<String> {
     repo.config()
         .and_then(|c| c.get_string("ortak.remote"))
         .ok()
         .or_else(|| cfg.publish.remote.clone())
-        .unwrap_or_else(|| "origin".to_string())
+}
+
+fn remote_names(repo: &Repository) -> Vec<String> {
+    repo.remotes()
+        .map(|names| names.iter().flatten().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The push remote: what somebody chose, then the only one there is, then
+/// origin. One contributor pushes to a fork while another pushes to upstream, so
+/// this is a per-clone setting; git config is where per-clone settings already
+/// live, and it survives the `.ortak` wipes that resetting a workspace involves.
+///
+/// A lone remote is used whatever it is called, because there is nothing to be
+/// wrong about, and a clone whose one remote is `upstream` used to be told there
+/// was no remote called origin. The origin at the end is now only reached with
+/// no remotes at all, where the push fails whatever this returns and
+/// `push_advice` is what explains it.
+pub fn remote_for(repo: &Repository, cfg: &Config) -> String {
+    if let Some(chosen) = chosen_remote(repo, cfg) {
+        return chosen;
+    }
+    match remote_names(repo).as_slice() {
+        [only] => only.clone(),
+        _ => "origin".to_string(),
+    }
+}
+
+/// Why `--push` cannot go ahead: nobody named a remote and there is more than
+/// one here, so whichever publish picked would be a guess. `origin` is the guess
+/// it used to make, and in a vendored repository origin is the vendor: the push
+/// either fails with a permission error that says nothing about ortak, or lands
+/// somebody's task branch on somebody else's project.
+///
+/// It names the candidates rather than prompting, which is the call `init`
+/// already made for this same question: a prompt hangs in a script, and nothing
+/// on disk says which remote you can write to anyway.
+fn unsettled_remote(repo: &Repository, cfg: &Config) -> Option<String> {
+    if chosen_remote(repo, cfg).is_some() {
+        return None;
+    }
+    let names = remote_names(repo);
+    if names.len() < 2 {
+        return None;
+    }
+    let at = repo.workdir().unwrap_or_else(|| repo.path());
+    Some(format!(
+        "--push will not guess a remote: nothing has chosen one and {} has {} ({}). `origin` in a repository you did not create is somebody else's upstream, so name yours inside that repository:\n  git config ortak.remote <name>\nNothing was built or recorded, so publishing again after that produces the same branch.",
+        at.display(),
+        names.len(),
+        names.join(", ")
+    ))
 }
 
 /// What a failed push has to say: where it went, and that the branch is already
@@ -2218,6 +2285,55 @@ mod tests {
             .set_str("ortak.remote", "fork")
             .unwrap();
         assert_eq!(remote_for(&repo, &cfg), "fork");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_push_only_guesses_where_there_is_nothing_to_guess_between() {
+        let dir = std::env::temp_dir().join(format!("ortak-unsettled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = Repository::init(&dir).unwrap();
+        let mut cfg = Config::default();
+
+        // One remote, whatever it is called. A clone whose only remote is
+        // `upstream` was told there was no remote called origin.
+        repo.remote("upstream", "https://example.invalid/a.git")
+            .unwrap();
+        assert_eq!(remote_for(&repo, &cfg), "upstream");
+        assert!(unsettled_remote(&repo, &cfg).is_none());
+
+        // A second one, and now nothing in the repository picks between them.
+        repo.remote("fork", "https://example.invalid/b.git")
+            .unwrap();
+        let problem = unsettled_remote(&repo, &cfg).expect("two remotes and no answer");
+        for expected in [
+            "upstream",
+            "fork",
+            "git config ortak.remote",
+            dir.file_name().unwrap().to_str().unwrap(),
+        ] {
+            assert!(
+                problem.contains(expected),
+                "{expected} missing from: {problem}"
+            );
+        }
+        assert!(!problem.contains("ortak.toml"), "{problem}");
+
+        // ortak.toml is still an answer, for anyone already relying on it.
+        cfg.publish.remote = Some("fork".into());
+        assert!(unsettled_remote(&repo, &cfg).is_none());
+        cfg.publish.remote = None;
+
+        // A chosen remote that is not in this clone is still chosen: that push
+        // reaches git and push_advice names what it looked for, which is a
+        // better answer than a second guess on top of the first.
+        repo.config()
+            .unwrap()
+            .set_str("ortak.remote", "gone")
+            .unwrap();
+        assert!(unsettled_remote(&repo, &cfg).is_none());
+        assert_eq!(remote_for(&repo, &cfg), "gone");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
