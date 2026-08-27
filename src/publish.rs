@@ -483,8 +483,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // GitHub and Forgejo both refuse a pull request whose base branch they
         // cannot find, so --base builds the stack locally and then strands it.
         // Only a branch --base named explicitly, and never the configured trunk,
-        // which is nobody's to push on a publish's initiative.
-        if let Some(stack) = base_override.filter(|b| !on_remote(ws, &remote, b)) {
+        // which is nobody's to push on a publish's initiative. A remote-tracking
+        // ref is skipped too: it is on a remote by definition, and pushing one
+        // would put a branch called `origin/main` on the fork.
+        if let Some(stack) = base_override
+            .filter(|b| repo.find_branch(b, BranchType::Remote).is_err())
+            .filter(|b| !on_remote(ws, &remote, b))
+        {
             let status = std::process::Command::new("git")
                 .arg("-C")
                 .arg(&ws.root)
@@ -537,7 +542,10 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             println!("\ncreate the PR with:");
             println!(
                 "  {} pr create --base {} --head {} --title \"{}\"",
-                tool, base, branch_name, subject
+                tool,
+                forge_base(&repo, base),
+                branch_name,
+                subject
             );
         }
     } else if amend {
@@ -1083,29 +1091,61 @@ fn branch_name_for(prefix: &str, id: i64, intent: Option<&str>) -> String {
 /// whose trunk is `master` published every task off HEAD and still printed
 /// `--base main`.
 pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Commit<'r>> {
-    repo.find_branch(base, BranchType::Local)
+    // The local branch first, so nothing about a workspace that has one changes.
+    if let Ok(commit) = repo
+        .find_branch(base, BranchType::Local)
         .and_then(|b| b.get().peel_to_commit())
-        .map_err(|_| {
-            // A repository with no commits has no branch to name either, so the
-            // advice below sends the reader to ortak.toml to try other names
-            // when nothing they could write there would work.
-            if unborn(repo) {
-                return anyhow!(
-                    "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
-                );
-            }
-            let head = repo
-                .head()
-                .ok()
-                .and_then(|h| h.shorthand().map(String::from))
-                .map(|h| format!(" (HEAD is on '{h}')"))
-                .unwrap_or_default();
-            anyhow!(
-                "base branch '{}' does not exist in this repository{}. Set [publish] base_branch in ortak.toml to the branch these tasks merge into",
-                base,
-                head
-            )
+    {
+        return Ok(commit);
+    }
+    // Then anything else git can turn into a commit. `origin/main` is the one
+    // that matters: somebody who has just been told their trunk is behind needs
+    // a way to say "build on what the remote has" that does not start with
+    // moving a branch by hand, which is the moment they are least sure what
+    // they are allowed to touch. A tag and a raw sha come along for free.
+    if let Ok(commit) = repo.revparse_single(base).and_then(|o| o.peel_to_commit()) {
+        return Ok(commit);
+    }
+    // A repository with no commits has no branch to name either, so the advice
+    // below sends the reader to ortak.toml to try other names when nothing they
+    // could write there would work. It stays behind the fallback rather than
+    // ahead of it, because `unborn` asks whether HEAD points at a branch that
+    // exists, not whether the repository has commits: a checkout whose HEAD is
+    // unborn beside branches that do have commits would be told it has none.
+    if unborn(repo) {
+        bail!(
+            "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
+        );
+    }
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|h| h.shorthand().map(String::from))
+        .map(|h| format!(" (HEAD is on '{h}')"))
+        .unwrap_or_default();
+    bail!(
+        "'{}' does not name a branch, ref or commit in this repository{}. Set [publish] base_branch in ortak.toml to the branch these tasks merge into",
+        base,
+        head
+    )
+}
+
+/// What a forge would call this base. A pull request wants a branch on the
+/// remote, and `--base origin/main` printed `gh pr create --base origin/main`,
+/// which every forge rejects: the branch there is `main`.
+///
+/// ponytail: the remotes are asked by name rather than splitting on the first
+/// slash, because a remote may have one in its name and a branch certainly may.
+fn forge_base<'a>(repo: &Repository, base: &'a str) -> &'a str {
+    repo.remotes()
+        .ok()
+        .and_then(|remotes| {
+            remotes
+                .iter()
+                .flatten()
+                .find_map(|r| base.strip_prefix(&format!("{r}/")))
         })
+        .unwrap_or(base)
 }
 
 /// The git repository this path sits inside, when the path is not its root.
@@ -2211,9 +2251,72 @@ mod tests {
 
         assert!(base_commit_for(&repo, "master").is_ok());
         let err = base_commit_for(&repo, "main").unwrap_err().to_string();
-        assert!(err.contains("'main' does not exist"), "{err}");
+        assert!(err.contains("'main' does not name a branch"), "{err}");
         assert!(err.contains("HEAD is on 'master'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--base origin/main` used to come back as "does not exist in this
+    /// repository", which was wrong twice over: the ref is right there, and the
+    /// advice pointed at `ortak.toml`, which is not where the problem was.
+    /// Somebody whose trunk has just been reported behind needs a way to build
+    /// on what the remote has without moving a branch by hand first.
+    #[test]
+    fn base_takes_a_remote_ref_a_tag_or_a_sha() {
+        let (dir, repo) = scratch("base-revparse");
+        let first = commit_on(&repo, "main", None, "first", "one\n");
+        let second = commit_on(&repo, "trunk", Some(&first), "second", "two\n");
+        // A checkout standing on its trunk, the way a workspace is.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.reference("refs/remotes/origin/main", second.id(), true, "test")
+            .unwrap();
+        repo.tag_lightweight("v1", second.as_object(), true)
+            .unwrap();
+
+        assert_eq!(base_commit_for(&repo, "main").unwrap().id(), first.id());
+        assert_eq!(
+            base_commit_for(&repo, "origin/main").unwrap().id(),
+            second.id()
+        );
+        assert_eq!(base_commit_for(&repo, "v1").unwrap().id(), second.id());
+        assert_eq!(
+            base_commit_for(&repo, &second.id().to_string())
+                .unwrap()
+                .id(),
+            second.id()
+        );
+
+        // A local branch of that name still wins, so no workspace that has one
+        // changes behaviour because a remote grew a ref beside it.
+        repo.branch("origin/main", &first, true).unwrap();
+        assert_eq!(
+            base_commit_for(&repo, "origin/main").unwrap().id(),
+            first.id()
+        );
+
+        // And a name that is nothing at all still reads like a typo report.
+        let err = base_commit_for(&repo, "no-such-thing")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not name a branch, ref or commit"),
+            "{err}"
+        );
+        assert!(err.contains("ortak.toml"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pull request wants a branch on the forge, and `origin/main` is not one.
+    #[test]
+    fn a_remote_ref_is_named_to_the_forge_without_its_remote() {
+        let (dir, repo) = scratch("forge-base");
+        repo.remote("origin", "https://example.invalid/x.git")
+            .unwrap();
+        assert_eq!(forge_base(&repo, "origin/main"), "main");
+        assert_eq!(forge_base(&repo, "main"), "main");
+        // Not a remote in this clone, so it is a branch name with a slash in it.
+        assert_eq!(forge_base(&repo, "upstream/main"), "upstream/main");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A trunk that has fallen behind its remote publishes a branch of old
