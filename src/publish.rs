@@ -336,15 +336,25 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // whatever the base branch has now, and the base moving is the reason
         // it was squashed. Sending the reader after a lost journal row there
         // would point at the one thing that is not wrong.
+        // What the file held when this slice began: the parent of the session's
+        // first micro-commit in it. `session_commits` is in the order the replay
+        // applies them, so the first row for a file is that commit.
+        let started_from = session_commits
+            .iter()
+            .find(|(_, f)| f == file)
+            .and_then(|(commit, _)| parent_blob(&shadow, commit, file));
         if !squashed.contains(file)
             && differs_from_last_write(
                 &db,
                 &shadow,
                 session.id,
                 file,
-                &data,
                 after,
-                on_base.as_deref(),
+                Versions {
+                    replayed: &data,
+                    on_base: on_base.as_deref(),
+                    started_from: started_from.as_deref(),
+                },
             )?
         {
             stale.push(file.clone());
@@ -1004,6 +1014,16 @@ fn branch_carrying(history: &[PublishRow], edit: i64) -> Option<&str> {
         .map(|p| p.branch.as_str())
 }
 
+/// The three versions of one file this check reasons about: what the branch
+/// carries, what the base branch has, and what the file held when the slice
+/// began. A struct because the three arrive together and the fourth argument of
+/// bytes is where clippy stops counting.
+struct Versions<'a> {
+    replayed: &'a [u8],
+    on_base: Option<&'a [u8]>,
+    started_from: Option<&'a [u8]>,
+}
+
 /// Whether the branch's content for a file differs from what the session last
 /// wrote to it inside this publish's slice.
 ///
@@ -1033,9 +1053,8 @@ fn differs_from_last_write(
     shadow: &Repository,
     session_id: i64,
     file: &str,
-    replayed: &[u8],
     after: i64,
-    on_base: Option<&[u8]>,
+    seen: Versions,
 ) -> Result<bool> {
     if db.shared_file(session_id, file)? {
         return Ok(false);
@@ -1050,14 +1069,38 @@ fn differs_from_last_write(
     // session left in the file before the slice, the difference below is the
     // earlier slice and not a missing row.
     if let Some(earlier) = before_slice {
-        if blob_at(shadow, &earlier, file).as_deref() != on_base {
+        if blob_at(shadow, &earlier, file).as_deref() != seen.on_base {
+            return Ok(false);
+        }
+    }
+    // And unless the base still holds what this slice started from. The replay
+    // merges the session's edits onto the base branch, so a base that moved
+    // under the session produces a file that differs from the session's last
+    // write for a reason that has nothing to do with a lost row.
+    //
+    // This is the disagreement round 11 could not explain: a rehearsal warned
+    // twice, the trunk was fast-forwarded, and the real publish a minute later
+    // said nothing about a branch that was byte-identical. Two runs, two base
+    // trees, one message blaming the journal for both. A moved trunk has its own
+    // warning now, printed before the replay and naming the count and the
+    // remote, so the quiet here loses nothing a reader needed.
+    if let Some(started) = seen.started_from {
+        if Some(started) != seen.on_base {
             return Ok(false);
         }
     }
     let Some(last) = blob_at(shadow, &commit, file) else {
         return Ok(false);
     };
-    Ok(last != replayed)
+    Ok(last != seen.replayed)
+}
+
+/// A file as it was just before this shadow commit changed it, which for the
+/// first micro-commit of a slice is what the session started that slice from.
+fn parent_blob(shadow: &Repository, commit: &str, file: &str) -> Option<Vec<u8>> {
+    let oid = Oid::from_str(commit).ok()?;
+    let parent = shadow.find_commit(oid).ok()?.parent(0).ok()?;
+    blob_at(shadow, &parent.id().to_string(), file)
 }
 
 /// A file's content at a shadow commit, when both are still readable.
@@ -2308,15 +2351,21 @@ mod tests {
         let short = lines(&[(3, "ONE")]);
         let whole = lines(&[(3, "ONE"), (9, "TWO")]);
         let base = lines(&[]);
+        // This session's first micro-commit here is the root of the shadow, so
+        // there is no parent to say what it started from, and the check runs on
+        // what it does know.
         let check = |replayed: &str| {
             differs_from_last_write(
                 &db,
                 &repo,
                 mine,
                 "app.py",
-                replayed.as_bytes(),
                 0,
-                Some(base.as_bytes()),
+                Versions {
+                    replayed: replayed.as_bytes(),
+                    on_base: Some(base.as_bytes()),
+                    started_from: parent_blob(&repo, &first.to_string(), "app.py").as_deref(),
+                },
             )
             .unwrap()
         };
@@ -2350,6 +2399,7 @@ mod tests {
         // other two are this publish's slice.
         let mut parent = None;
         let mut published = 0;
+        let mut written: Vec<Oid> = Vec::new();
         for content in [
             lines(&[(3, "ONE")]),
             lines(&[(3, "ONE"), (9, "TWO")]),
@@ -2363,17 +2413,24 @@ mod tests {
             if published == 0 {
                 published = db.max_edit_id(mine).unwrap().unwrap();
             }
+            written.push(oid);
             parent = Some(repo.find_commit(oid).unwrap());
         }
+        // The slice begins at the second write, so what it started from is what
+        // the first one left.
+        let started = parent_blob(&repo, &written[1].to_string(), "app.py");
         let check = |replayed: &str, on_base: &str| {
             differs_from_last_write(
                 &db,
                 &repo,
                 mine,
                 "app.py",
-                replayed.as_bytes(),
                 published,
-                Some(on_base.as_bytes()),
+                Versions {
+                    replayed: replayed.as_bytes(),
+                    on_base: Some(on_base.as_bytes()),
+                    started_from: started.as_deref(),
+                },
             )
             .unwrap()
         };
@@ -2392,6 +2449,72 @@ mod tests {
         ));
         // The row behind "TWO" went missing, so the replay skipped it.
         assert!(check(&lines(&[(3, "ONE"), (20, "THREE")]), &stacked));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The disagreement round 11 wrote down and could not explain: a rehearsal
+    /// warned that edits were missing from the journal, the trunk was
+    /// fast-forwarded, and the real publish a minute later said nothing about a
+    /// branch that came out byte-identical. Two runs, two base trees. The trunk
+    /// moving in a file the session is editing is enough on its own, and it is
+    /// not what the message claims.
+    #[test]
+    fn a_trunk_that_moved_is_not_a_missing_row() {
+        let (dir, repo) = scratch("moved-base");
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let mine = db
+            .upsert_session("claude-a", "claude-a", "llm", None)
+            .unwrap();
+
+        // The workspace as the session found it, then one edit of its own.
+        let start = lines(&[]);
+        let began = commit_file(&repo, None, "app.py", &start);
+        let mine_now = lines(&[(3, "MINE")]);
+        let wrote = commit_file(
+            &repo,
+            Some(&repo.find_commit(began).unwrap()),
+            "app.py",
+            &mine_now,
+        );
+        db.insert_edit(
+            mine,
+            "app.py",
+            "modify",
+            Some(&wrote.to_string()),
+            &[],
+            None,
+        )
+        .unwrap();
+        let started = parent_blob(&repo, &wrote.to_string(), "app.py");
+        let check = |replayed: &str, on_base: &str| {
+            differs_from_last_write(
+                &db,
+                &repo,
+                mine,
+                "app.py",
+                0,
+                Versions {
+                    replayed: replayed.as_bytes(),
+                    on_base: Some(on_base.as_bytes()),
+                    started_from: started.as_deref(),
+                },
+            )
+            .unwrap()
+        };
+
+        // Built on the trunk the session started from, a replay that is not
+        // this session's last write is still worth saying out loud.
+        assert!(check(&lines(&[]), &start));
+        assert!(!check(&mine_now, &start));
+
+        // Somebody else lands a commit on the trunk, in the same file and far
+        // from this session's line, and the replay merges onto it. The result
+        // differs from the session's last write by exactly that commit.
+        let moved = lines(&[(20, "THEIRS")]);
+        assert!(
+            !check(&lines(&[(3, "MINE"), (20, "THEIRS")]), &moved),
+            "the trunk moving under the session is not a lost journal row"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
