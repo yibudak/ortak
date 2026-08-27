@@ -67,6 +67,31 @@ impl Workspace {
         self.relativize(&abs)
     }
 
+    /// The git repository a workspace-relative path belongs to: the nearest
+    /// directory at or above it that holds a `.git`, as a workspace-relative
+    /// directory path. `Some("")` is the workspace root itself. `None` when
+    /// nothing at or above the file inside the workspace is a repository.
+    ///
+    /// A workspace can hold sixty repositories under one root, and each of them
+    /// is the only thing entitled to say what it tracks and what it ignores. An
+    /// ancestor's `.gitignore` describes what *that* repository does not hold,
+    /// which is why this answers with the nearest one rather than the outermost.
+    ///
+    /// `.git` is a file rather than a directory in a linked worktree and in a
+    /// submodule, so this tests for existence. The walk stops at the workspace
+    /// root and never goes above it: a repository containing the workspace has
+    /// no say over a tree it was never told about.
+    pub fn repo_of(&self, rel: &str) -> Option<String> {
+        let mut parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+        loop {
+            let dir = parts.join("/");
+            if self.root.join(&dir).join(".git").exists() {
+                return Some(dir);
+            }
+            parts.pop()?;
+        }
+    }
+
     /// Workspace-relative, forward-slash path for an absolute path inside the root.
     pub fn relativize(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
@@ -106,5 +131,46 @@ mod tests {
         assert_eq!(arg("src/gone.rs").as_deref(), Some("src/gone.rs"));
         assert_eq!(ws.relativize_arg("/etc/hosts"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workspace holding sixty repositories under one root has sixty
+    /// different answers to "who says what happens to this file", and the
+    /// nearest one is always the right one.
+    #[test]
+    fn the_nearest_repository_above_a_file_is_the_one_that_owns_it() {
+        let outer = std::env::temp_dir().join(format!("ortak-ws-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outer);
+        let root = outer.join("workspace");
+        std::fs::create_dir_all(root.join("repos/inner/models")).unwrap();
+        std::fs::create_dir_all(root.join("addons/sale")).unwrap();
+        std::fs::create_dir_all(root.join("worktree")).unwrap();
+        // A repository the workspace sits inside, which has no say over it.
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let ws = Workspace::at(&root);
+
+        // Nothing inside the workspace is a repository yet, and the one above
+        // it does not count.
+        assert_eq!(ws.repo_of("addons/sale/models.py"), None);
+        assert_eq!(ws.repo_of(""), None);
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("repos/inner/.git")).unwrap();
+        // A linked worktree and a submodule keep a `.git` file rather than a
+        // directory, and both are repositories.
+        std::fs::write(root.join("worktree/.git"), "gitdir: /elsewhere\n").unwrap();
+
+        assert_eq!(ws.repo_of("addons/sale/models.py").as_deref(), Some(""));
+        assert_eq!(
+            ws.repo_of("repos/inner/models/sale.py").as_deref(),
+            Some("repos/inner")
+        );
+        assert_eq!(ws.repo_of("worktree/x.rs").as_deref(), Some("worktree"));
+        // The repository root itself, and the directory above it, which the
+        // root still owns.
+        assert_eq!(ws.repo_of("repos/inner").as_deref(), Some("repos/inner"));
+        assert_eq!(ws.repo_of("repos").as_deref(), Some(""));
+        assert_eq!(ws.repo_of("").as_deref(), Some(""));
+        let _ = std::fs::remove_dir_all(&outer);
     }
 }

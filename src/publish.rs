@@ -2753,7 +2753,7 @@ mod tests {
         let cfg = Config::default();
         std::fs::create_dir_all(&ws.ortak_dir).unwrap();
         let shadow = crate::shadow::init(&ws, &cfg).unwrap();
-        crate::shadow::baseline(&shadow).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
         let db = Db::open(&ws.db_path).unwrap();
         let me = db
             .upsert_session("ext", "claude-a", "llm", Some("rehearse a publish"))
