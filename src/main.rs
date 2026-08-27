@@ -772,6 +772,28 @@ fn commits_behind_base(ws: &Workspace, cfg: &Config) -> Option<(String, i64)> {
 /// who committed; `regions` records the session that wrote the lines, and keeps
 /// shifting them as later edits move the code around, so this is the one place
 /// that can answer for an agent.
+/// What a blame on one line says after listing its owners, or nothing when
+/// there is one owner and one row.
+///
+/// Sessions, not rows: one session can hold two regions that overlap at a line,
+/// and an `ortak claim` that moves a row onto a session that already owns the
+/// range leaves exactly that. Counting the rows told a denied session that two
+/// others were in its way when the answer was one, which is the opposite of the
+/// thing blame is read for. Two rows of one session still get a line, because
+/// two entries under one name need explaining as much as two names do.
+fn holders_note(at: &[&db::Owner]) -> Option<String> {
+    let sessions: std::collections::BTreeSet<i64> = at.iter().map(|o| o.session_id).collect();
+    let order = "the newest write is listed first";
+    match (sessions.len(), at.len()) {
+        (held, _) if held > 1 => Some(format!("{held} sessions hold this line; {order}")),
+        (_, rows) if rows > 1 => Some(format!(
+            "ortak-{} holds this line in {rows} regions; {order}",
+            at[0].session_id
+        )),
+        _ => None,
+    }
+}
+
 fn blame(target: &str) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
@@ -818,11 +840,8 @@ fn blame(target: &str) -> Result<()> {
                 o.intent.as_deref().unwrap_or("(not reported)")
             );
         }
-        if at.len() > 1 {
-            println!(
-                "  {} sessions hold this line; the newest write is listed first",
-                at.len()
-            );
+        if let Some(note) = holders_note(&at) {
+            println!("  {note}");
         }
         return Ok(());
     }
@@ -1187,6 +1206,40 @@ mod tests {
             Report
         );
         assert_eq!(classify_parse_failure(K::InvalidSubcommand, None), Report);
+    }
+
+    fn owner(session_id: i64) -> db::Owner {
+        db::Owner {
+            session_id,
+            agent_name: "claude-x".into(),
+            intent: None,
+            start: 1,
+            end: 9,
+            last_ts: 0,
+            attributed_by: None,
+        }
+    }
+
+    #[test]
+    fn blame_counts_the_sessions_holding_a_line_and_not_their_rows() {
+        let (mine, theirs, mine_again) = (owner(3), owner(4), owner(3));
+        assert_eq!(holders_note(&[&mine]), None, "one owner needs no summary");
+
+        // Two rows, one session, which is what an `ortak claim` leaves behind:
+        // it used to read as two sessions and send the reader after a stranger.
+        assert_eq!(
+            holders_note(&[&mine, &mine_again]).as_deref(),
+            Some("ortak-3 holds this line in 2 regions; the newest write is listed first")
+        );
+        assert_eq!(
+            holders_note(&[&mine, &theirs]).as_deref(),
+            Some("2 sessions hold this line; the newest write is listed first")
+        );
+        assert_eq!(
+            holders_note(&[&mine, &theirs, &mine_again]).as_deref(),
+            Some("2 sessions hold this line; the newest write is listed first"),
+            "three rows, two sessions"
+        );
     }
 }
 
