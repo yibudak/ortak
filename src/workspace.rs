@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 pub const ORTAK_DIR: &str = ".ortak";
 pub const CONFIG_FILE: &str = "ortak.toml";
 
+/// How far under the root to look for repositories. A tree of them keeps them
+/// one or two levels down; past three this is walking somebody's node_modules
+/// hoping to find a stray `.git`.
+const REPO_DEPTH: usize = 3;
+
 /// Resolved paths of an ortak workspace.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -92,6 +97,52 @@ impl Workspace {
         }
     }
 
+    /// Every git repository this workspace covers, workspace-relative and
+    /// sorted, with `""` first when the root is one itself.
+    ///
+    /// The walk stops at each repository it finds, because whatever a
+    /// repository holds is that repository's business, and it does not care
+    /// whether a parent's `.gitignore` hides the directory: that is the whole
+    /// point of a workspace laid over a tree of them.
+    pub fn repositories(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        if self.root.join(".git").exists() {
+            found.push(String::new());
+        }
+        self.collect_repositories(&self.root, 0, &mut found);
+        found.sort();
+        found
+    }
+
+    fn collect_repositories(&self, dir: &Path, depth: usize, out: &mut Vec<String>) {
+        if depth >= REPO_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == ".git" || name == ORTAK_DIR {
+                continue;
+            }
+            // Not `is_dir`, which follows a symlink: a link back up the tree
+            // would walk this in circles.
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(rel) = self.relativize(&path) else {
+                continue;
+            };
+            if path.join(".git").exists() {
+                out.push(rel);
+                continue;
+            }
+            self.collect_repositories(&path, depth + 1, out);
+        }
+    }
+
     /// Workspace-relative, forward-slash path for an absolute path inside the root.
     pub fn relativize(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
@@ -171,6 +222,17 @@ mod tests {
         assert_eq!(ws.repo_of("repos/inner").as_deref(), Some("repos/inner"));
         assert_eq!(ws.repo_of("repos").as_deref(), Some(""));
         assert_eq!(ws.repo_of("").as_deref(), Some(""));
+
+        // The same tree, counted rather than asked about one path: the root
+        // first, then the two under it, and never the one above.
+        assert_eq!(
+            ws.repositories(),
+            vec![
+                "".to_string(),
+                "repos/inner".to_string(),
+                "worktree".to_string()
+            ]
+        );
         let _ = std::fs::remove_dir_all(&outer);
     }
 }

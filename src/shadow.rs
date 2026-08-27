@@ -179,28 +179,42 @@ pub fn compute_hunks(
 /// the first touch classifies as a create and produces one whole-file hunk, so
 /// a session that edits one line of a 4000-line model claims all 4000 and the
 /// gate locks everybody else out of the file.
-pub fn baseline(repo: &Repository, ws: &Workspace, cfg: &Config) -> Result<Oid> {
+/// Returns the commit, and every path the walk could not read. One file it
+/// cannot open used to fail the whole baseline, and the workspace was then left
+/// with a database, a shadow repository with no HEAD and no way back: the
+/// repair on the next `init` reaches the same file and fails the same way,
+/// every time. A tree that holds sixty repositories holds logs, backups and
+/// filestores too, some of them another user's.
+pub fn baseline(repo: &Repository, ws: &Workspace, cfg: &Config) -> Result<(Oid, Vec<String>)> {
     let excludes = exclude_rules(ws, cfg);
     let mut index = repo.index()?;
-    add_tree(&mut index, repo, ws, &excludes, "")?;
+    let mut unread = Vec::new();
+    add_tree(&mut index, repo, ws, &excludes, "", &mut unread)?;
     index.write()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
     let sig = Signature::now("ortak", "daemon@ortak.local")?;
     let oid = repo.commit(Some("HEAD"), &sig, &sig, "baseline", &tree, &[])?;
-    Ok(oid)
+    unread.sort();
+    Ok((oid, unread))
 }
 
 /// Add every file under one workspace-relative directory to the index, deciding
-/// each one the way the daemon will.
+/// each one the way the daemon will, and collecting what could not be read.
 fn add_tree(
     index: &mut git2::Index,
     repo: &Repository,
     ws: &Workspace,
     excludes: &str,
     rel: &str,
+    unread: &mut Vec<String>,
 ) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(ws.root.join(rel)) else {
+        // A directory this process cannot open. Nothing under it reaches the
+        // baseline, which is worth one line rather than silence.
+        if !rel.is_empty() {
+            unread.push(format!("{rel}/"));
+        }
         return Ok(());
     };
     for entry in entries.flatten() {
@@ -222,11 +236,19 @@ fn add_tree(
             if ignored(ws, repo, excludes, &child) && !hides_a_repository(&path) {
                 continue;
             }
-            add_tree(index, repo, ws, excludes, &child)?;
+            add_tree(index, repo, ws, excludes, &child, unread)?;
         // A symlink is a file here whatever it points at, which is what
         // `add_all` does with one and what keeps this walk out of a loop.
         } else if (kind.is_file() || kind.is_symlink()) && !ignored(ws, repo, excludes, &child) {
-            index.add_path(Path::new(&child))?;
+            // A file ortak cannot read is a file it cannot journal either, so
+            // it is the caller's business rather than an error: one `chmod 000`
+            // anywhere in the tree used to cost the workspace its whole
+            // baseline. This also covers a file that went away between the
+            // directory listing and here, which is a build running during
+            // `init`.
+            if index.add_path(Path::new(&child)).is_err() {
+                unread.push(child);
+            }
         }
         // Anything left is a fifo, a socket or a device node. git has no way to
         // store one and `add_all` passed over them without a word; `add_path`
@@ -496,7 +518,17 @@ mod tests {
         assert!(ignored(&ws, &repo, &excludes, "build/junk.o"));
         assert!(ignored(&ws, &repo, &excludes, "target/junk.o"));
 
-        let oid = baseline(&repo, &ws, &cfg).unwrap();
+        // One unreadable file, which used to fail the whole baseline and leave
+        // the workspace with none at all.
+        std::fs::write(dir.join("addons/locked.py"), "secret = 1\n").unwrap();
+        let mut perms = std::fs::metadata(dir.join("addons/locked.py"))
+            .unwrap()
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(dir.join("addons/locked.py"), perms).unwrap();
+
+        let (oid, unread) = baseline(&repo, &ws, &cfg).unwrap();
+        assert_eq!(unread, ["addons/locked.py"]);
         let mut paths = Vec::new();
         repo.find_commit(oid)
             .unwrap()

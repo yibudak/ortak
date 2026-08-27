@@ -133,12 +133,23 @@ pub fn run(ws: &Workspace, cfg: &Config, as_json: bool) -> Result<bool> {
 /// and every later check reads whether the earlier ones held.
 fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
+    // Every check below this one is about the repository at the workspace root.
+    // A workspace can cover a tree of them now, and each of the others answers
+    // these four for itself.
+    //
+    // ponytail: counted, not asked. Sixty repositories are sixty commits, sixty
+    // base branches and sixty push remotes, and a report with two hundred and
+    // forty rows in it is not a report. `ortak doctor` inside one of them
+    // answers for that one.
+    let others = ws.repositories().iter().filter(|d| !d.is_empty()).count();
     let Ok(repo) = git2::Repository::open(&ws.root) else {
         // A workspace one directory inside a checkout is the common way to land
         // here, and calling that "not a git repository" is false enough to cost
-        // the reader their trust in the four lines under it.
-        checks.push(match crate::publish::repository_above(&ws.root) {
-            Some(above) => failed(
+        // the reader their trust in the four lines under it. A directory
+        // holding a tree of repositories is the other way, and `git init` at
+        // the root of one is close to the worst advice this tool could give.
+        checks.push(match (others, crate::publish::repository_above(&ws.root)) {
+            (0, Some(above)) => failed(
                 "git_repository",
                 format!(
                     "{} is inside the repository at {}, not the root of one, and publish builds from the workspace root",
@@ -147,25 +158,43 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
                 ),
                 format!("run `ortak init` in {}, or make this directory a repository of its own with `git init`", above.display()),
             ),
-            None => failed(
+            (0, None) => failed(
                 "git_repository",
                 format!("{} is not a git repository", ws.root.display()),
                 "`git init` here, or run ortak in the checkout you meant to work in",
+            ),
+            (n, _) => failed(
+                "git_repository",
+                format!(
+                    "{} holds no repository of its own, and {n} under it that this workspace journals",
+                    ws.root.display()
+                ),
+                "publish the repository the files live in: `ortak publish <session> --repo <directory>`",
             ),
         });
         // None of the three below can be asked at all without a repository, and
         // failing them would send somebody off to configure a base branch in a
         // directory git has never heard of.
+        let why = match others {
+            0 => "not checked: there is no git repository at the workspace root".to_string(),
+            n => format!("not checked: the workspace root is not a repository, and each of the {n} under it answers this for itself"),
+        };
         for check in ["commits", "base_branch", "push_remote"] {
-            checks.push(skipped(
-                check,
-                "not checked: there is no git repository at the workspace root",
-            ));
+            checks.push(skipped(check, why.clone()));
         }
         checks.push(daemon_check(ws));
         return checks;
     };
-    checks.push(ok("git_repository", ws.root.display().to_string()));
+    checks.push(ok(
+        "git_repository",
+        match others {
+            0 => ws.root.display().to_string(),
+            n => format!(
+                "{}, and {n} more repositories in this tree",
+                ws.root.display()
+            ),
+        },
+    ));
 
     let has_commits = !crate::publish::unborn(&repo);
     checks.push(if has_commits {
@@ -322,6 +351,39 @@ mod tests {
         assert!(checks
             .iter()
             .all(|c| c.state != State::Failed || c.fix.is_some()));
+        let _ = std::fs::remove_dir_all(&ws.root);
+    }
+
+    /// A directory that is not a repository and holds three, which is the
+    /// workspace this round is for. Before this, doctor failed the first check
+    /// with "is not a git repository" and told the reader to `git init` here,
+    /// which at the root of a tree of repositories is about the worst thing it
+    /// could say.
+    #[test]
+    fn a_tree_of_repositories_is_not_told_to_git_init_over_itself() {
+        let ws = workspace("tree");
+        for sub in ["odoo-server", "repos/altinkaya", "repos/other"] {
+            std::fs::create_dir_all(ws.root.join(sub)).unwrap();
+            git2::Repository::init(ws.root.join(sub)).unwrap();
+        }
+        let checks = run_checks(&ws, &Config::default());
+        let repo_check = checks.iter().find(|c| c.check == "git_repository").unwrap();
+        assert_eq!(repo_check.state, State::Failed);
+        assert!(
+            repo_check.detail.contains("3 under it"),
+            "doctor does not say what the workspace covers: {}",
+            repo_check.detail
+        );
+        let fix = repo_check.fix.as_deref().unwrap_or("");
+        assert!(
+            !fix.contains("git init"),
+            "still sending them to git init: {fix}"
+        );
+        assert!(fix.contains("--repo"), "no way out of it either: {fix}");
+        // The three below still cannot be asked here, and now say why.
+        for check in ["commits", "base_branch", "push_remote"] {
+            assert_eq!(state_of(&checks, check), State::Skipped);
+        }
         let _ = std::fs::remove_dir_all(&ws.root);
     }
 
