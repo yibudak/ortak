@@ -878,7 +878,7 @@ fn bash_sessions(input: &Value) -> (Option<BashSession>, Vec<BashSession>) {
         .unwrap_or("unknown");
     let harness = harness_for(input);
     let home = workspace_for(input).ok();
-    let (mut here, mut reached) = (None, Vec::new());
+    let (mut here, mut reached, mut far) = (None, Vec::new(), Vec::new());
     for ws in command_workspaces(home.as_ref(), input) {
         let Ok(db) = Db::open(&ws.db_path) else {
             continue;
@@ -894,7 +894,17 @@ fn bash_sessions(input: &Value) -> (Option<BashSession>, Vec<BashSession>) {
         if home.as_ref().is_some_and(|h| h.root == ws.root) {
             here = Some((db, me));
         } else {
+            far.push(ws.root);
             reached.push((db, me));
+        }
+    }
+    // Registering in a far workspace hands it a row that reads active, and that
+    // journal has no way of learning the session ended: `session_end` is handed
+    // one workspace, the one the harness ran in. So the roots are written down
+    // here, where they are in hand, and read back on the way out.
+    if let Some((db, me)) = &here {
+        for root in &far {
+            let _ = db.note_reached(*me, root);
         }
     }
     (here, reached)
@@ -1042,12 +1052,33 @@ fn emit_prompt_context(parts: Vec<String>) -> Result<()> {
 }
 
 pub fn session_end() -> Result<()> {
-    let input = read_stdin_json()?;
-    let ws = workspace_for(&input)?;
+    session_end_for(&read_stdin_json()?)
+}
+
+fn session_end_for(input: &Value) -> Result<()> {
+    let ws = workspace_for(input)?;
     let db = Db::open(&ws.db_path)?;
-    if let Some(external_id) = input.get("session_id").and_then(|v| v.as_str()) {
-        db.end_session(external_id)?;
+    let Some(external_id) = input.get("session_id").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    // The workspaces this session's commands reached hold a row for it too, and
+    // they are ended first so that nothing about them can stop the one that
+    // matters. Nothing includes reading the list: a `?` here would hand the far
+    // workspaces the power to cost this session its own ending, which is the
+    // one thing this hook exists to do. A far workspace that has been deleted,
+    // unmounted or had its `.ortak` wiped is passed over in silence, and a
+    // journal that is gone is never rebuilt on the way out: `Db::open` would
+    // create the file.
+    for root in db.reached_roots(external_id).unwrap_or_default() {
+        let far = Workspace::at(Path::new(&root));
+        if !far.db_path.exists() {
+            continue;
+        }
+        if let Ok(far_db) = Db::open(&far.db_path) {
+            let _ = far_db.end_session(external_id);
+        }
     }
+    db.end_session(external_id)?;
     Ok(())
 }
 
@@ -1348,6 +1379,58 @@ mod tests {
         assert_eq!(
             their_db.peek_hint("api.rs").unwrap(),
             Some((theirs_id, crate::db::Attribution::Claim))
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A session that reached another workspace is ended there too. #95 gives
+    /// it a row in every workspace its commands name, and `cat /other/repo/x`
+    /// names one, so those journals were left calling it active for as long as
+    /// they live: nothing but the session's own journal knows where they are.
+    #[test]
+    fn a_session_ends_in_every_workspace_it_reached() {
+        let base = std::env::temp_dir().join(format!("ortak-hooks-ends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (mine, theirs, untouched) = (
+            base.join("mine"),
+            base.join("theirs"),
+            base.join("untouched"),
+        );
+        for root in [&mine, &theirs, &untouched] {
+            std::fs::create_dir_all(root.join(crate::workspace::ORTAK_DIR)).unwrap();
+        }
+        // A third workspace this session is registered in and never named. It
+        // has to be left alone: the list is of workspaces reached, not of every
+        // journal that happens to hold this session.
+        let elsewhere = Db::open(&Workspace::at(&untouched).db_path).unwrap();
+        elsewhere
+            .upsert_session("sess-ends", "claude-ends", "llm", None)
+            .unwrap();
+
+        let input = serde_json::json!({
+            "cwd": mine.to_str().unwrap(),
+            "session_id": "sess-ends",
+            "tool_input": { "command": format!("cat {}/api.rs", theirs.display()) },
+        });
+        pre_bash_for(&input).unwrap();
+        let their_db = Db::open(&Workspace::at(&theirs).db_path).unwrap();
+        assert_eq!(
+            their_db.resolve_session("sess-ends").unwrap().status,
+            "active",
+            "reading a path over there is enough to be registered there"
+        );
+
+        session_end_for(&input).unwrap();
+        assert_eq!(
+            their_db.resolve_session("sess-ends").unwrap().status,
+            "done"
+        );
+        let my_db = Db::open(&Workspace::at(&mine).db_path).unwrap();
+        assert_eq!(my_db.resolve_session("sess-ends").unwrap().status, "done");
+        assert_eq!(
+            elsewhere.resolve_session("sess-ends").unwrap().status,
+            "active",
+            "a workspace the session never named is not touched"
         );
         std::fs::remove_dir_all(&base).ok();
     }
