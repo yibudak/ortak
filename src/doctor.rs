@@ -128,7 +128,7 @@ pub fn run(ws: &Workspace, cfg: &Config, as_json: bool) -> Result<bool> {
     Ok(can_publish)
 }
 
-/// The five checks a publish needs, in the order it needs them. A list, not a
+/// The checks a publish needs, in the order it needs them. A list, not a
 /// framework: each one is a few lines that call what already knows the answer,
 /// and every later check reads whether the earlier ones held.
 fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
@@ -183,6 +183,7 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
             checks.push(skipped(check, why.clone()));
         }
         checks.push(daemon_check(ws));
+        checks.push(baseline_check(ws));
         return checks;
     };
     checks.push(ok(
@@ -242,6 +243,7 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
     });
 
     checks.push(daemon_check(ws));
+    checks.push(baseline_check(ws));
     checks
 }
 
@@ -319,6 +321,42 @@ fn daemon_check(ws: &Workspace) -> Check {
     }
 }
 
+/// Whether the shadow repository has a baseline commit.
+///
+/// A workspace whose baseline never landed passes every other check here and is
+/// not a workspace: with no shadow HEAD there is nothing to diff a file
+/// against, so the first touch of one classifies as a create and produces a
+/// whole-file hunk, and one edited line of a 4000-line model claims all 4000
+/// and locks every other session out of it. `init` says `already initialized`
+/// and exits 0 on the second run, so nothing else ever mentions it.
+///
+/// The shadow repository is opened directly rather than through `shadow::open`,
+/// which rewrites the exclude file on its way past. Reading a workspace should
+/// not change it.
+fn baseline_check(ws: &Workspace) -> Check {
+    let head = git2::Repository::open(&ws.shadow_dir)
+        .and_then(|repo| repo.head()?.peel_to_commit().map(|c| c.id().to_string()));
+    match head {
+        Ok(id) => ok("baseline", format!("captured ({})", &id[..8])),
+        // Not "run ortak init": that is what somebody already did. Since #106 a
+        // second run captures the baseline it finds missing, and says so. Two
+        // states reach here and both end at that one command, so they differ in
+        // what they report and not in what to do about it.
+        Err(_) => failed(
+            "baseline",
+            if ws.shadow_dir.exists() {
+                "the shadow repository here has no baseline commit, so the first edit to any file is recorded as a change to the whole of it".to_string()
+            } else {
+                format!(
+                    "there is no shadow repository at {}",
+                    ws.shadow_dir.display()
+                )
+            },
+            "`ortak init` again here: it captures a baseline it finds missing",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +389,23 @@ mod tests {
         assert!(checks
             .iter()
             .all(|c| c.state != State::Failed || c.fix.is_some()));
+        let _ = std::fs::remove_dir_all(&ws.root);
+    }
+
+    /// The state a failed `ortak init` leaves on disk: a database, a shadow
+    /// repository, and no baseline commit. Every git check passes, the daemon
+    /// check answers for the daemon, and until this one nothing in the report
+    /// was about the thing that is actually broken.
+    #[test]
+    fn a_workspace_whose_baseline_never_landed_is_told_so() {
+        let ws = workspace("no-baseline");
+        git2::Repository::init(&ws.root).unwrap();
+        let cfg = Config::default();
+        let repo = crate::shadow::init(&ws, &cfg).unwrap();
+        assert_eq!(state_of(&run_checks(&ws, &cfg), "baseline"), State::Failed);
+
+        crate::shadow::baseline(&repo, &ws, &cfg).unwrap();
+        assert_eq!(state_of(&run_checks(&ws, &cfg), "baseline"), State::Ok);
         let _ = std::fs::remove_dir_all(&ws.root);
     }
 
