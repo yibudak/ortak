@@ -467,8 +467,9 @@ fn init() -> Result<()> {
             if repo.head().is_err() {
                 let cfg = Config::load(&ws.config_path)?;
                 print!("the baseline here was never captured; capturing it now... ");
-                let oid = shadow::baseline(&repo, &ws, &cfg)?;
+                let (oid, unread) = shadow::baseline(&repo, &ws, &cfg)?;
                 println!("done ({})", &oid.to_string()[..8]);
+                name_what_could_not_be_read(&unread);
             }
         }
         return Ok(());
@@ -484,10 +485,11 @@ fn init() -> Result<()> {
     db.ensure_human()?;
     let repo = shadow::init(&ws, &cfg)?;
     print!("capturing baseline... ");
-    let oid = shadow::baseline(&repo, &ws, &cfg)?;
+    let (oid, unread) = shadow::baseline(&repo, &ws, &cfg)?;
     println!("done ({})", &oid.to_string()[..8]);
-    warn_about_ignored_repos(&repo, &ws.root);
-    name_the_push_remote(&root, &cfg);
+    name_what_could_not_be_read(&unread);
+    name_the_repositories(&ws);
+    name_the_push_remote(&ws, &cfg);
     println!("\nworkspace ready: {}", ws.root.display());
     println!("next: run `ortak daemon` in another terminal or in the background");
     Ok(())
@@ -529,21 +531,26 @@ fn trunk_branch(root: &std::path::Path) -> String {
 /// It looks rather than asks. A prompt hangs in a script, and nothing on disk
 /// says which remote you can write to anyway, so naming the target and the
 /// one-line change beats guessing at one.
-fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
+fn name_the_push_remote(ws: &Workspace, cfg: &Config) {
+    let root = &ws.root;
+    let nested = ws.repositories().iter().filter(|d| !d.is_empty()).count();
     let Ok(repo) = git2::Repository::open(root) else {
         // Not an error: the journal and the gate work fine without git. But
         // "workspace ready" is the only thing init said, and publishing is the
         // reason the workspace exists, so say the one thing that will not work.
         // A directory inside a checkout is not a directory without one, and
         // saying so sends somebody to `git init` in a repository they already
-        // have.
-        match publish::repository_above(root) {
-            Some(above) => println!(
+        // have. A directory holding a tree of them is neither.
+        match (nested, publish::repository_above(root)) {
+            (0, Some(above)) => println!(
                 "\nthis directory is inside the git repository at {}, rather than the root of one, so `ortak publish` has nowhere to build a branch; run `ortak init` there instead",
                 above.display()
             ),
-            None => println!(
+            (0, None) => println!(
                 "\nthis directory is not a git repository, so `ortak publish` has nowhere to build a branch"
+            ),
+            (n, _) => println!(
+                "\nthis directory is not a git repository itself, so publish one of the {n} under it: `ortak publish <session> --repo <directory>`"
             ),
         }
         return;
@@ -566,6 +573,14 @@ fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
         None => println!(
             "\n`ortak publish --push` pushes to {chosen}, and this clone has no remote by that name"
         ),
+    }
+    // One remote, for one repository, and in a tree that is one of sixty.
+    // `publish` picks the remote of the repository it is building in, so
+    // whatever is said here is about the root and nothing else.
+    if nested > 0 {
+        println!(
+            "  that is the root's remote; each of the {nested} repositories under it has its own"
+        );
     }
     // Somebody who has already answered this does not need to be asked again,
     // unless what they answered names a remote that is not here.
@@ -590,70 +605,56 @@ fn name_the_push_remote(root: &std::path::Path, cfg: &Config) {
     }
 }
 
-/// How deep to look for hidden repositories. A repo-of-repos keeps them one or
-/// two levels down; past three this is walking somebody's node_modules.
-const SUBREPO_DEPTH: usize = 3;
-/// How many to name before summarizing. The point is that they exist.
+/// How many repositories to name before summarizing. Sixty is a wall of text
+/// and the point is what the workspace covers, not an inventory of it.
 const SUBREPO_LISTED: usize = 10;
 
-/// A directory the project's git ignores is invisible to the journal, so a
-/// layout that keeps other repositories behind one ignore rule gets a workspace
-/// that reports success and then records nothing anybody does in them. Name them
-/// once, here, while somebody is reading the output.
-fn warn_about_ignored_repos(repo: &git2::Repository, root: &std::path::Path) {
-    let mut found = Vec::new();
-    collect_ignored_repos(repo, root, root, 0, &mut found);
-    if found.is_empty() {
+/// What the baseline walk could not open. These files are not in it, so the
+/// first edit to one of them classifies as a create and claims the whole file,
+/// and somebody who has just watched `init` print `done` has no other way to
+/// learn that. A tree of sixty repositories holds logs, backups and filestores,
+/// and some of them belong to another user.
+fn name_what_could_not_be_read(paths: &[String]) {
+    if paths.is_empty() {
         return;
     }
-    found.sort();
     eprintln!(
-        "\nwarning: these directories are ignored by this project's .gitignore and hold their own\n\
-         git repositories, so ortak will not journal anything inside them:"
+        "\nwarning: {} path(s) could not be read, so they are not in the baseline:",
+        paths.len()
     );
-    for dir in found.iter().take(SUBREPO_LISTED) {
-        eprintln!("  {}", dir);
+    for p in paths.iter().take(SUBREPO_LISTED) {
+        eprintln!("  {}", p);
     }
-    if found.len() > SUBREPO_LISTED {
-        eprintln!("  and {} more", found.len() - SUBREPO_LISTED);
+    if paths.len() > SUBREPO_LISTED {
+        eprintln!("  and {} more", paths.len() - SUBREPO_LISTED);
     }
-    eprintln!("Run `ortak init` inside each one you actually work in.");
+    eprintln!("The first edit to any of those is recorded as a whole-file change.");
 }
 
-fn collect_ignored_repos(
-    repo: &git2::Repository,
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    depth: usize,
-    out: &mut Vec<String>,
-) {
-    if depth >= SUBREPO_DEPTH {
+/// What this workspace covers, said once while somebody is reading the output of
+/// `init`.
+///
+/// This used to be a warning: these directories are ignored by your
+/// `.gitignore` and hold their own repositories, so ortak will not journal
+/// anything in them, run `ortak init` inside each one you actually work in.
+/// Every clause of that is now false, and the advice was sixty workspaces and
+/// sixty daemons, which is the arrangement one workspace over a tree replaces.
+fn name_the_repositories(ws: &Workspace) {
+    let found = ws.repositories();
+    // An ordinary checkout is one repository and has nothing to say here.
+    if found.len() < 2 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        if name == ".git" || name == workspace::ORTAK_DIR {
-            continue;
-        }
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if path.join(".git").exists() {
-            if repo.is_path_ignored(&rel).unwrap_or(false) {
-                out.push(rel);
-            }
-            // Whatever a nested repository holds is that repository's business.
-            continue;
-        }
-        collect_ignored_repos(repo, root, &path, depth + 1, out);
+    println!(
+        "\nthis workspace covers {} git repositories, whatever the root's .gitignore says\n\
+         about the directories they sit in:",
+        found.len()
+    );
+    for dir in found.iter().take(SUBREPO_LISTED) {
+        println!("  {}", if dir.is_empty() { "(the root)" } else { dir });
+    }
+    if found.len() > SUBREPO_LISTED {
+        println!("  and {} more", found.len() - SUBREPO_LISTED);
     }
 }
 
