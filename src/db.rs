@@ -646,10 +646,14 @@ impl Db {
     /// Falls back to an open Bash claim: the harness hooks cover the edit tools
     /// only, so a file written by `sed -i`, a heredoc or a codegen step reaches
     /// the daemon unattributed and would otherwise land on the human session.
-    /// One command running makes that unambiguous. Two overlapping commands are
-    /// settled by the journal instead, and only a file none of the claimants
-    /// has written falls through to the human; see below.
-    pub fn peek_hint(&self, file: &str) -> Result<Option<(i64, Attribution)>> {
+    /// One command running makes that unambiguous unless somebody else has a
+    /// stake in the file. Two overlapping commands are settled by the journal
+    /// instead, and either way a file none of the claimants has written falls
+    /// through to the human; see below.
+    ///
+    /// `presence_secs` is the gate's `presence_minutes`, and it bounds how far
+    /// back another session's write counts as a stake.
+    pub fn peek_hint(&self, file: &str, presence_secs: i64) -> Result<Option<(i64, Attribution)>> {
         let cutoff = now_ts() - HINT_TTL_SECS;
         let hit: Option<i64> = self
             .conn
@@ -701,28 +705,57 @@ impl Db {
             // falls to the human, the journal gets asked: a file rewritten
             // seconds after a session wrote it is that write settling.
             [] => self
-                .settling_writer(file)?
+                .recent_writer(file, SETTLE_SECS, None)?
                 .map(|id| (id, Attribution::Settled)),
-            [only] => Some((*only, Attribution::Claim)),
-            _ => match self.claimant_in_file(file)? {
+            // One claimant used to be taken on trust, and it is the only place
+            // in this ladder that asked the journal nothing at all. A workspace
+            // -wide fact, that one session has some command open, outranked
+            // hook-backed evidence about this one file, which is how one
+            // agent's `cargo fmt` was credited with lines the other had written
+            // forty seconds earlier: the formatter reached a file its session
+            // had never touched, and nothing looked.
+            //
+            // So the stake test runs whatever the count is, and the rule is one
+            // sentence: the claimant who has written this file takes it; a lone
+            // claimant nobody is competing with takes it; anything else is
+            // contested, which is what `ortak claim` exists to settle.
+            claimants => match self.claimant_in_file(file)? {
                 Some(id) => Some((id, Attribution::Claim)),
+                // Nobody else has a stake, so the one open command is the only
+                // candidate there is and this is not a guess against anything.
+                // Most Bash writes land here: new files, and files nobody else
+                // has been near for half an hour.
+                None if claimants.len() == 1
+                    && self
+                        .recent_writer(file, presence_secs, Some(claimants[0]))?
+                        .is_none() =>
+                {
+                    Some((claimants[0], Attribution::Claim))
+                }
                 None => Some((self.ensure_human()?, Attribution::Contested)),
             },
         })
     }
 
-    /// The session that wrote this file within `SETTLE_SECS`, if it is still
-    /// working here. `None` once the window has passed, and for the human's own
+    /// The agent session that most recently wrote this file within `secs` and
+    /// is still working here, ignoring `except`. `None` for the human's own
     /// rows: a person's write is not evidence about the next one.
-    fn settling_writer(&self, file: &str) -> Result<Option<i64>> {
+    ///
+    /// Two questions are asked of this. At `SETTLE_SECS` and nobody excluded it
+    /// is "is this write the last one settling"; at `presence_minutes` and the
+    /// claimant excluded it is "does somebody else have a stake in this file",
+    /// which is the gate's own window and the one that already tells a session
+    /// it owns those lines.
+    fn recent_writer(&self, file: &str, secs: i64, except: Option<i64>) -> Result<Option<i64>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT e.session_id FROM edits e JOIN sessions s ON s.id = e.session_id
                   WHERE e.file = ?1 AND e.ts >= ?2 AND e.disowned = 0
+                    AND e.session_id IS NOT ?3
                     AND s.status = 'active' AND s.kind != 'human'
                   ORDER BY e.id DESC LIMIT 1",
-                params![file, now_ts() - SETTLE_SECS],
+                params![file, now_ts() - secs, except],
                 |r| r.get(0),
             )
             .optional()?)
@@ -1917,6 +1950,11 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 mod tests {
     use super::*;
 
+    /// `gate.presence_minutes` at its default, which is what the daemon hands
+    /// `peek_hint`. It bounds how far back another session's write counts as a
+    /// stake in the file.
+    const PRESENCE: i64 = 30 * 60;
+
     fn temp_db(name: &str) -> Db {
         let path = std::env::temp_dir().join(format!(
             "ortak-db-test-{}-{}.sqlite",
@@ -1970,7 +2008,7 @@ mod tests {
             .unwrap();
 
         // Nobody has touched it: an unclaimed write is the human's own.
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
 
         db.insert_edit(
             agent,
@@ -1982,24 +2020,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Settled))
         );
         // Only the file that was written, and only while the window is open.
-        assert_eq!(db.peek_hint("src/y.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/y.rs", PRESENCE).unwrap(), None);
         db.conn
             .execute(
                 "UPDATE edits SET ts = ?1 WHERE file = 'src/x.rs'",
                 params![now_ts() - SETTLE_SECS - 1],
             )
             .unwrap();
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
 
         // The human's own write says nothing about the next one, or every
         // change to a file a person is editing would echo the one before it.
         db.insert_edit(human, "src/z.rs", "modify", None, &[], None)
             .unwrap();
-        assert_eq!(db.peek_hint("src/z.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/z.rs", PRESENCE).unwrap(), None);
     }
 
     #[test]
@@ -2011,23 +2049,23 @@ mod tests {
             .unwrap();
 
         // Nothing claimed: this is where the work used to fall through to human.
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
 
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim))
         );
         // The claim survives, because one command can write many files.
         assert_eq!(
-            db.peek_hint("src/y.rs").unwrap(),
+            db.peek_hint("src/y.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim))
         );
 
         // A hint from the edit hooks still outranks the claim.
         db.insert_hint("src/z.rs", human, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/z.rs").unwrap(),
+            db.peek_hint("src/z.rs", PRESENCE).unwrap(),
             Some((human, Attribution::Hook))
         );
 
@@ -2036,13 +2074,13 @@ mod tests {
         // its work.
         db.clear_bash_claim(agent).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim))
         );
 
         // Once the grace is out, the claim speaks for nothing.
         grace_expired(&db, agent);
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
     }
 
     /// One message, two Bash calls, and the quick one returns first. Closing
@@ -2064,7 +2102,7 @@ mod tests {
         db.clear_bash_claim(agent).unwrap();
         grace_expired(&db, agent);
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim)),
             "the command still running kept a claim of its own"
         );
@@ -2072,7 +2110,7 @@ mod tests {
         // The slow one returns too, and now nothing of this session's is open.
         db.clear_bash_claim(agent).unwrap();
         grace_expired(&db, agent);
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
     }
 
     /// Age a session's closed claim past its grace. Timestamps are whole
@@ -2085,6 +2123,91 @@ mod tests {
                 params![BASH_CLAIM, now_ts() - CLAIM_GRACE_SECS - 1, session_id],
             )
             .unwrap();
+    }
+
+    /// Round 11's incident, and the case the ladder had no rule for. One
+    /// session runs `cargo fmt`, which reaches a file that session has never
+    /// touched and rewrites lines the other agent wrote a minute earlier. One
+    /// claim was open, so the claim answered, and the regions moved with it:
+    /// the agent who wrote those lines was then denied their own function by
+    /// the gate. The claimant having no history in the file and somebody else
+    /// having some is the whole of the evidence, and it says contested.
+    #[test]
+    fn a_command_that_reaches_a_file_it_has_no_history_in_does_not_take_it() {
+        let db = temp_db("one-claimant-stake");
+        let owner = db
+            .upsert_session("sess-owner", "claude-owner", "llm", Some("claude-code"))
+            .unwrap();
+        let formatter = db
+            .upsert_session("sess-fmt", "claude-fmt", "llm", Some("claude-code"))
+            .unwrap();
+        db.insert_edit(
+            owner,
+            "src/publish.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+        db.insert_hint(BASH_CLAIM, formatter, None).unwrap();
+
+        assert_eq!(
+            db.peek_hint("src/publish.rs", PRESENCE).unwrap(),
+            Some((db.ensure_human().unwrap(), Attribution::Contested)),
+            "one command open is not a claim on a file that session has never written"
+        );
+        // A file nobody else has a stake in is still the claimant's: the
+        // command is the only candidate there is, so this is not a guess
+        // against anything. Most Bash writes land here.
+        assert_eq!(
+            db.peek_hint("src/fresh.rs", PRESENCE).unwrap(),
+            Some((formatter, Attribution::Claim))
+        );
+        // And once the claimant has written the file itself, it answers
+        // straight away, whoever else has been in there.
+        db.insert_edit(
+            formatter,
+            "src/publish.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+        assert_eq!(
+            db.peek_hint("src/publish.rs", PRESENCE).unwrap(),
+            Some((formatter, Attribution::Claim))
+        );
+        // The stake is bounded by the gate's own window: an owner who has not
+        // been in the file for longer than that is no longer contesting it.
+        let db2 = temp_db("one-claimant-stale");
+        let old = db2
+            .upsert_session("sess-old", "claude-old", "llm", Some("claude-code"))
+            .unwrap();
+        let now = db2
+            .upsert_session("sess-now", "claude-now", "llm", Some("claude-code"))
+            .unwrap();
+        db2.insert_edit(
+            old,
+            "src/x.rs",
+            "modify",
+            None,
+            &[],
+            Some(Attribution::Hook),
+        )
+        .unwrap();
+        db2.conn
+            .execute(
+                "UPDATE edits SET ts = ?1 WHERE session_id = ?2",
+                params![now_ts() - PRESENCE - 1, old],
+            )
+            .unwrap();
+        db2.insert_hint(BASH_CLAIM, now, None).unwrap();
+        assert_eq!(
+            db2.peek_hint("src/x.rs", PRESENCE).unwrap(),
+            Some((now, Attribution::Claim))
+        );
     }
 
     /// Two commands open and a file neither of them has ever written. Nobody
@@ -2101,7 +2224,7 @@ mod tests {
 
         db.insert_hint(BASH_CLAIM, a, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((a, Attribution::Claim))
         );
 
@@ -2111,14 +2234,14 @@ mod tests {
         // edit the human made.
         db.insert_hint(BASH_CLAIM, b, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((db.ensure_human().unwrap(), Attribution::Contested))
         );
 
         // A hook naming the file is evidence and still outranks both claims.
         db.insert_hint("src/x.rs", b, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((b, Attribution::Hook))
         );
         db.clear_hints("src/x.rs").unwrap();
@@ -2127,14 +2250,14 @@ mod tests {
         // the daemon may be about to journal something that command wrote.
         db.clear_bash_claim(b).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((db.ensure_human().unwrap(), Attribution::Contested))
         );
 
         // Grace out, and a is an unambiguous guess again.
         grace_expired(&db, b);
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((a, Attribution::Claim))
         );
     }
@@ -2167,18 +2290,22 @@ mod tests {
         db.insert_hint(BASH_CLAIM, other, None).unwrap();
         db.clear_bash_claim(writer).unwrap();
         assert_eq!(
-            db.peek_hint("tests/end_to_end.rs").unwrap(),
+            db.peek_hint("tests/end_to_end.rs", PRESENCE).unwrap(),
             Some((writer, Attribution::Claim)),
             "the command that just ended is the one that wrote the file"
         );
 
-        // Long enough after and nothing connects the write to that command any
-        // more, so the one open claim answers for it, as it did before any of
-        // this. The window is what the daemon waits, not a share of the file.
+        // Long enough after, and nothing connects the write to that command any
+        // more. What is left is one open claim belonging to a session that has
+        // never touched this file, and an active session that wrote it minutes
+        // ago. This used to answer with the claimant, which is a guess against
+        // the only evidence there is; it now says contested, which is what the
+        // two-claimant case says in the same position and what `ortak claim`
+        // settles. The window is what the daemon waits, not a share of the file.
         grace_expired(&db, writer);
         assert_eq!(
-            db.peek_hint("tests/end_to_end.rs").unwrap(),
-            Some((other, Attribution::Claim))
+            db.peek_hint("tests/end_to_end.rs", PRESENCE).unwrap(),
+            Some((db.ensure_human().unwrap(), Attribution::Contested))
         );
     }
 
@@ -2208,7 +2335,7 @@ mod tests {
         // heredoc, codegen step or `sed -i` there is a's work.
         edited(a, "src/publish.rs");
         assert_eq!(
-            db.peek_hint("src/publish.rs").unwrap(),
+            db.peek_hint("src/publish.rs", PRESENCE).unwrap(),
             Some((a, Attribution::Claim))
         );
 
@@ -2217,7 +2344,7 @@ mod tests {
         // beats a session that has never opened it.
         edited(b, "src/publish.rs");
         assert_eq!(
-            db.peek_hint("src/publish.rs").unwrap(),
+            db.peek_hint("src/publish.rs", PRESENCE).unwrap(),
             Some((b, Attribution::Claim))
         );
 
@@ -2226,7 +2353,7 @@ mod tests {
         // own editor while two agents run commands is a real case, and the
         // honest answer there is the human, whatever the fall-through calls it.
         edited(quiet, "src/notes.rs");
-        let ambiguous = db.peek_hint("src/notes.rs").unwrap();
+        let ambiguous = db.peek_hint("src/notes.rs", PRESENCE).unwrap();
         assert!(
             !matches!(ambiguous, Some((s, _)) if s == a || s == b),
             "a claimant with no stake in the file was named anyway: {ambiguous:?}"
@@ -2305,7 +2432,7 @@ mod tests {
             .unwrap();
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim))
         );
 
@@ -2313,14 +2440,14 @@ mod tests {
         // there. Surviving this is the whole reason a claim has no expiry.
         last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS + 60);
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim))
         );
 
         // Past the cutoff with nothing heard from it since. The write is the
         // person's, and the row says so by naming nobody else.
         last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS - 1);
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
     }
 
     /// A killed harness leaves its claim open, and `--resume` brings the
@@ -2335,7 +2462,7 @@ mod tests {
             .unwrap();
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         last_seen(&db, agent, now_ts() - CLAIM_STALE_SECS - 1);
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
 
         // Same session id, same row, live again, and the leftover with it.
         let again = db
@@ -2343,13 +2470,13 @@ mod tests {
             .unwrap();
         assert_eq!(again, agent);
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Claim)),
             "a stamp is all it took to give the dead command its voice back"
         );
 
         db.drop_bash_claims(again).unwrap();
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
     }
 
     /// Two commands open and one of them belongs to a harness that is gone.
@@ -2367,14 +2494,14 @@ mod tests {
         db.insert_hint(BASH_CLAIM, live, None).unwrap();
         db.insert_hint(BASH_CLAIM, ghost, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((db.ensure_human().unwrap(), Attribution::Contested)),
             "while both are there, neither can be named"
         );
 
         last_seen(&db, ghost, now_ts() - CLAIM_STALE_SECS - 1);
         assert_eq!(
-            db.peek_hint("src/x.rs").unwrap(),
+            db.peek_hint("src/x.rs", PRESENCE).unwrap(),
             Some((live, Attribution::Claim)),
             "one command open is one command open"
         );
@@ -2388,7 +2515,7 @@ mod tests {
             .unwrap();
         db.insert_hint(BASH_CLAIM, agent, None).unwrap();
         db.end_session("sess-b").unwrap();
-        assert_eq!(db.peek_hint("src/x.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/x.rs", PRESENCE).unwrap(), None);
     }
 
     fn names(files: Vec<(String, String)>) -> Vec<String> {
@@ -2618,16 +2745,16 @@ mod tests {
         // The daemon reads the hint, its shadow commit fails, and it never
         // reaches clear_hints. The retry has to find the same owner.
         assert_eq!(
-            db.peek_hint("src/lib.rs").unwrap(),
+            db.peek_hint("src/lib.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Hook))
         );
         assert_eq!(
-            db.peek_hint("src/lib.rs").unwrap(),
+            db.peek_hint("src/lib.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Hook))
         );
 
         db.clear_hints("src/lib.rs").unwrap();
-        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/lib.rs", PRESENCE).unwrap(), None);
     }
 
     #[test]
@@ -2639,9 +2766,9 @@ mod tests {
 
         db.clear_hints("src/lib.rs").unwrap();
 
-        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/lib.rs", PRESENCE).unwrap(), None);
         assert_eq!(
-            db.peek_hint("src/main.rs").unwrap(),
+            db.peek_hint("src/main.rs", PRESENCE).unwrap(),
             Some((agent, Attribution::Hook))
         );
     }
@@ -2654,7 +2781,7 @@ mod tests {
         db.insert_hint("src/lib.rs", first, None).unwrap();
         db.insert_hint("src/lib.rs", second, None).unwrap();
         assert_eq!(
-            db.peek_hint("src/lib.rs").unwrap(),
+            db.peek_hint("src/lib.rs", PRESENCE).unwrap(),
             Some((second, Attribution::Hook))
         );
 
@@ -2664,7 +2791,7 @@ mod tests {
                 params![now_ts() - HINT_TTL_SECS - 1],
             )
             .unwrap();
-        assert_eq!(db.peek_hint("src/lib.rs").unwrap(), None);
+        assert_eq!(db.peek_hint("src/lib.rs", PRESENCE).unwrap(), None);
     }
 
     #[test]

@@ -1351,12 +1351,12 @@ mod tests {
         let theirs_id = their_db.resolve_session("sess-reach").unwrap().id;
         assert_ne!(mine_id, theirs_id, "the journals number sessions apart");
         assert_eq!(
-            their_db.peek_hint("api.rs").unwrap(),
+            their_db.peek_hint("api.rs", 30 * 60).unwrap(),
             Some((theirs_id, crate::db::Attribution::Claim)),
             "the workspace written into names the session that wrote"
         );
         assert_eq!(
-            my_db.peek_hint("src/x.rs").unwrap(),
+            my_db.peek_hint("src/x.rs", 30 * 60).unwrap(),
             Some((mine_id, crate::db::Attribution::Claim)),
             "and the workspace the command ran in still does"
         );
@@ -1377,7 +1377,7 @@ mod tests {
         // Closed, and still inside its grace, so it answers for what the
         // command wrote a moment ago.
         assert_eq!(
-            their_db.peek_hint("api.rs").unwrap(),
+            their_db.peek_hint("api.rs", 30 * 60).unwrap(),
             Some((theirs_id, crate::db::Attribution::Claim))
         );
         std::fs::remove_dir_all(&base).ok();
