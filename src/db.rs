@@ -351,6 +351,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   ended_at     INTEGER,
   last_seen    INTEGER                    -- newest hook from this session
 );
+-- Other workspaces this session has registered itself in, written down by the
+-- hook that reached one. A session gets a row in every workspace its commands
+-- name, and only its own journal ever knows where those are, so without this
+-- list `session_end` leaves them all reading active for as long as they live.
+CREATE TABLE IF NOT EXISTS reached (
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  root       TEXT NOT NULL,             -- that workspace's root directory
+  UNIQUE(session_id, root)
+);
 CREATE TABLE IF NOT EXISTS edits (
   id            INTEGER PRIMARY KEY,
   session_id    INTEGER NOT NULL REFERENCES sessions(id),
@@ -522,6 +531,34 @@ impl Db {
             params![BASH_CLAIM, external_id],
         )?;
         Ok(())
+    }
+
+    /// Write down that this session has registered in another workspace, so its
+    /// end can reach that journal too.
+    ///
+    /// Kept in the session's own journal by the hook that reached the far
+    /// workspace, because that hook is holding the path and nothing later can
+    /// work it out. `Workspace::discover` walks upward from a path, and by the
+    /// time a session ends there is no path left to walk from. Repeats are
+    /// ignored: the same command shape runs all day.
+    pub fn note_reached(&self, session_id: i64, root: &Path) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO reached (session_id, root) VALUES (?1, ?2)",
+            params![session_id, root.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// The roots of the other workspaces a session has registered in. Keyed by
+    /// external id, because that is the one name a session carries into a
+    /// journal that numbers it differently.
+    pub fn reached_roots(&self, external_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.root FROM reached r JOIN sessions s ON s.id = r.session_id
+              WHERE s.external_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![external_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn set_intent(&self, session_id: i64, intent: &str) -> Result<()> {
