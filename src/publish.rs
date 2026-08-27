@@ -126,7 +126,17 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             b
         ),
         (Some(a), None) => repo.find_commit(a.base)?,
-        _ => base_commit_for(&repo, base)?,
+        // Before the replay, not after it: a replay that succeeds is exactly
+        // how a stale trunk gets away with it, and by the time anything else
+        // speaks the branch is already built. An amend never lands here, and
+        // rightly: it rebuilds on its own branch's parent, and there is no
+        // trunk in that answer to have fallen behind anything.
+        _ => {
+            if let Some(warning) = base_behind_warning(&repo, &remote_for(&repo, cfg), base) {
+                println!("{warning}");
+            }
+            base_commit_for(&repo, base)?
+        }
     };
     let base_tree = base_commit.tree()?;
 
@@ -1126,6 +1136,71 @@ fn commits_behind(repo: &Repository, base: &Commit) -> Option<usize> {
     let head = repo.head().ok()?.target()?;
     let (_, behind) = repo.graph_ahead_behind(head, base.id()).ok()?;
     (behind > 0).then_some(behind)
+}
+
+/// What a publish owes the reader when the branch it is building on has itself
+/// fallen behind the remote it tracks. `None` while there is nothing to say.
+///
+/// The session that found this seeded its replay from a trunk thirty-eight
+/// commits stale and got a branch of old content with a new hunk on top, with
+/// every check passing on the way. `commits_behind` asks the mirror question,
+/// whether the checkout is behind the base, and it only speaks from the `Err`
+/// arm of a replay that has already failed. Nothing was asking whether the base
+/// was current, and a replay only fails where two contents actually collide, so
+/// nothing did.
+///
+/// A warning and not a refusal. What comes out is a real branch that merges,
+/// and a deliberately pinned older base is somebody's prerogative; publish
+/// refuses only where it cannot build a correct branch at all. What failed last
+/// time was that the one line hinting at it sat under the branch, so this one
+/// goes out before the branch exists.
+///
+/// ponytail: local refs only, never `git ls-remote`. A publish that needs the
+/// network to succeed is a publish that fails on a plane, and the answer here
+/// is on disk from the last fetch either way.
+fn base_behind_warning(repo: &Repository, remote: &str, base: &str) -> Option<String> {
+    let branch = repo.find_branch(base, BranchType::Local).ok()?;
+    let local = branch.get().target()?;
+    // The branch's own upstream, and the push remote only where there is none.
+    // Those are different questions, and in a fork workflow they are different
+    // answers: with `ortak.remote` on the fork, comparing the trunk against the
+    // fork's copy of it reported nothing while the real trunk ran ten commits
+    // ahead. That was the workspace this was written in.
+    let (upstream, from, fetch) = match branch.upstream() {
+        Ok(up) => {
+            let tracked = up.name().ok().flatten()?.to_string();
+            let from = repo.branch_upstream_remote(branch.get().name()?).ok()?;
+            let from = from.as_str()?.to_string();
+            // A branch may track one under another name, so the refspec below
+            // carries both halves rather than assuming they match.
+            let fetch = tracked.strip_prefix(&format!("{from}/"))?.to_string();
+            (up.get().target()?, from, fetch)
+        }
+        Err(_) => {
+            let up = repo
+                .find_branch(&format!("{remote}/{base}"), BranchType::Remote)
+                .ok()?;
+            (up.get().target()?, remote.to_string(), base.to_string())
+        }
+    };
+    let (_, behind) = repo.graph_ahead_behind(local, upstream).ok()?;
+    if behind == 0 {
+        return None;
+    }
+    // Git refuses to fetch into the branch that is checked out, and in this
+    // workspace the trunk is usually the branch checked out, so both cases are
+    // ordinary and each has exactly one command that works.
+    let fix = match repo
+        .head()
+        .ok()
+        .is_some_and(|h| h.shorthand() == Some(base))
+    {
+        true => format!("git pull --ff-only {from} {fetch}"),
+        false => format!("git fetch {from} {fetch}:{base}"),
+    };
+    Some(format!(
+        "warning: {base} is {behind} commit(s) behind {from}/{fetch}, so this branch is being built on the older {base}: its diff will carry work that is already on the trunk, and it will not carry what landed there since.\n  {fix}\nand publish again. Nothing is wrong if you meant to build on that older base."
+    ))
 }
 
 /// Whether the remote already carries this branch. Local refs go stale, and a
@@ -2139,6 +2214,77 @@ mod tests {
         assert!(err.contains("'main' does not exist"), "{err}");
         assert!(err.contains("HEAD is on 'master'"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trunk that has fallen behind its remote publishes a branch of old
+    /// content and passes every check on the way, which is how thirty-eight
+    /// commits went missing under a round-10 branch. The three silences matter
+    /// more than the count: a purely local trunk is ordinary, a trunk level with
+    /// its remote has nothing to report, and a trunk *ahead* of its remote is
+    /// the normal state of anybody who has just published.
+    #[test]
+    fn a_base_branch_behind_its_remote_says_so_and_says_nothing_otherwise() {
+        let (dir, repo) = scratch("base-behind");
+        let first = commit_on(&repo, "main", None, "first", "one\n");
+
+        // No remote-tracking ref yet: a trunk nobody has ever pushed.
+        assert_eq!(base_behind_warning(&repo, "origin", "main"), None);
+
+        // Level with the remote.
+        repo.reference("refs/remotes/origin/main", first.id(), true, "test")
+            .unwrap();
+        assert_eq!(base_behind_warning(&repo, "origin", "main"), None);
+
+        // The remote moves on, twice, and the local branch stays put.
+        let second = commit_on(&repo, "upstream", Some(&first), "second", "two\n");
+        let third = commit_on(&repo, "upstream", Some(&second), "third", "three\n");
+        repo.reference("refs/remotes/origin/main", third.id(), true, "test")
+            .unwrap();
+        let warning = base_behind_warning(&repo, "origin", "main").expect("no warning");
+        assert!(
+            warning.contains("2 commit(s) behind origin/main"),
+            "{warning}"
+        );
+        assert!(warning.contains("git fetch origin main:main"), "{warning}");
+
+        // Ahead of the remote, which is every session that has just published.
+        // Reading `graph_ahead_behind` the other way round would warn here.
+        commit_on(&repo, "main", Some(&third), "fourth", "four\n");
+        assert_eq!(base_behind_warning(&repo, "origin", "main"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The push remote is not the question. This is the fork workflow the check
+    /// was written in: `ortak.remote` names the fork, whose copy of the trunk is
+    /// level or unrelated, while the trunk everybody merges into has run ahead.
+    /// Asking the push remote, as the obvious reading would, says nothing at all
+    /// in the one workspace where the bug had already happened.
+    #[test]
+    fn the_branch_upstream_beats_the_push_remote() {
+        let (dir, repo) = scratch("base-upstream");
+        let first = commit_on(&repo, "main", None, "first", "one\n");
+        let second = commit_on(&repo, "trunk", Some(&first), "second", "two\n");
+        repo.remote("origin", "https://example.invalid/trunk.git")
+            .unwrap();
+        repo.remote("fork", "https://example.invalid/fork.git")
+            .unwrap();
+        repo.reference("refs/remotes/fork/main", first.id(), true, "test")
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", second.id(), true, "test")
+            .unwrap();
+        repo.find_branch("main", BranchType::Local)
+            .unwrap()
+            .set_upstream(Some("origin/main"))
+            .unwrap();
+
+        let warning =
+            base_behind_warning(&repo, "fork", "main").expect("the fork's copy silenced it");
+        assert!(
+            warning.contains("1 commit(s) behind origin/main"),
+            "{warning}"
+        );
+        assert!(warning.contains("git fetch origin main:main"), "{warning}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A commit on a branch, moving the branch to it. `msg` is what tells a
