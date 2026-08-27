@@ -1364,10 +1364,9 @@ pub(crate) fn base_commit_for<'r>(repo: &'r Repository, base: &str) -> Result<Co
     }
     // A repository with no commits has no branch to name either, so the advice
     // below sends the reader to ortak.toml to try other names when nothing they
-    // could write there would work. It stays behind the fallback rather than
-    // ahead of it, because `unborn` asks whether HEAD points at a branch that
-    // exists, not whether the repository has commits: a checkout whose HEAD is
-    // unborn beside branches that do have commits would be told it has none.
+    // could write there would work. Behind the fallback rather than ahead of it,
+    // which costs nothing: a repository with no commits has nothing for revparse
+    // to resolve either, so the fallback misses first whatever the order.
     if unborn(repo) {
         bail!(
             "this repository has no commits yet, so there is nothing for a branch to build on. Make the first commit, then publish"
@@ -1417,12 +1416,24 @@ pub(crate) fn repository_above(root: &Path) -> Option<std::path::PathBuf> {
     (!same).then_some(work)
 }
 
-/// A repository with no commits: HEAD names a branch nothing has been written
-/// to yet. `is_empty` is not the question, because it answers false once HEAD
-/// names a branch other than libgit2's own default, and an unborn HEAD is what
-/// "no commits" actually looks like.
+/// A repository with no commits.
+///
+/// An unborn HEAD is necessary and it is not sufficient, which is what this used
+/// to get wrong: `git checkout --orphan` leaves HEAD unborn beside branches that
+/// carry commits, and so does a `git symbolic-ref HEAD` at a name nobody has
+/// written to. Both callers then tell somebody looking at their own history that
+/// there is none of it, and `doctor` skips the base-branch check on top of that.
+///
+/// `is_empty` is not the question either: it answers false once HEAD names a
+/// branch other than libgit2's own default, which any `git init -b` does.
+///
+/// ponytail: branches, not objects. A commit no reference can reach is nothing
+/// a branch could be built on, so it is the same answer for this purpose.
 pub(crate) fn unborn(repo: &Repository) -> bool {
     matches!(repo.head(), Err(e) if e.code() == git2::ErrorCode::UnbornBranch)
+        && repo
+            .branches(None)
+            .map_or(true, |mut branches| branches.next().is_none())
 }
 
 /// How many commits the workspace's own checkout is missing from the branch a
@@ -2752,9 +2763,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ortak-unborn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let repo = Repository::init(&dir).unwrap();
+        assert!(unborn(&repo));
         let err = base_commit_for(&repo, "main").unwrap_err().to_string();
         assert!(err.contains("no commits yet"), "{err}");
         assert!(!err.contains("ortak.toml"), "{err}");
+
+        // A commit and a branch, and HEAD left pointing at a name nothing has
+        // been written to, which is what `git checkout --orphan` leaves behind.
+        // The history is right there, so saying it has none is a lie that also
+        // stops `doctor` checking the base branch.
+        commit_on(&repo, "main", None, "base\n", "base\n");
+        repo.set_head("refs/heads/nothing-here").unwrap();
+        assert!(
+            !unborn(&repo),
+            "an unborn HEAD beside branches that have commits is not an empty repository"
+        );
+        let err = base_commit_for(&repo, "no-such-branch")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not name a branch"), "{err}");
+        assert!(base_commit_for(&repo, "main").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
