@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::db::{self, Attribution, Db};
 use crate::shadow::{self, Change};
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, ORTAK_DIR};
 use anyhow::{bail, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -49,12 +49,16 @@ fn still_ours(pidfile: &Path) -> bool {
     read_pid(pidfile) == Some(std::process::id())
 }
 
-pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
+pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
     let pidfile = ws.ortak_dir.join(PIDFILE);
     claim(&pidfile, process_alive)?;
     let _pidfile_guard = PidfileGuard(pidfile.clone());
     let db = Db::open(&ws.db_path)?;
     let repo = shadow::open(ws)?;
+    // ortak's own list, read once here rather than off disk on every path: the
+    // repository that owns a path has never heard of `.ortak`, so it has to be
+    // told, and in this tree there may be sixty of them to tell.
+    let excludes = shadow::exclude_rules(ws, cfg);
     let human_id = db.ensure_human()?;
 
     let (tx, rx) = mpsc::channel::<PathBuf>();
@@ -84,7 +88,7 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
         .last_heartbeat()?
         .filter(|t| back - t > db::HEARTBEAT_ALIVE_SECS);
     db.heartbeat()?;
-    let journaled = startup_scan(&db, &repo, ws, human_id);
+    let journaled = startup_scan(&db, &repo, ws, &excludes, human_id);
     if let Some(start) = stopped_at {
         let outage = db::Outage {
             start,
@@ -138,7 +142,7 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
         // per snapshot, so two sessions writing one file inside one window stay
         // separate.
         for rel in db.snapshot_files()? {
-            match process_snapshots(&db, &repo, &rel) {
+            match process_snapshots(&db, &repo, ws, &excludes, &rel) {
                 Ok(_) => {
                     if let Err(e) = db.clear_journal_failure(&rel) {
                         log(&format!("ERROR clearing health record for {}: {}", rel, e));
@@ -160,7 +164,7 @@ pub fn run(ws: &Workspace, _cfg: &Config) -> Result<()> {
             .collect();
         for rel in quiet {
             pending.remove(&rel);
-            journal(&db, &repo, ws, human_id, &rel);
+            journal(&db, &repo, ws, &excludes, human_id, &rel);
         }
     }
 }
@@ -320,10 +324,16 @@ fn process_alive(pid: u32) -> bool {
 
 /// Cheap pre-filter before ignore rules: workspace-relative path, skipping
 /// the metadata directories that would otherwise feed back into the watcher.
+///
+/// At any depth, not just the first component. A repository does not ignore its
+/// own `.git`, and it never needed to, because git does not walk in there. So
+/// once the repository that owns a path is the one deciding whether ortak
+/// journals it, every nested `.git/index` becomes a journalable path, and a
+/// tree of sixty repositories rewrites sixty of them on every `git status`
+/// anybody runs.
 fn filter(ws: &Workspace, abs: &Path) -> Option<String> {
     let rel = ws.relativize(abs)?;
-    let first = rel.split('/').next().unwrap_or("");
-    if first == ".ortak" || first == ".git" {
+    if rel.split('/').any(|c| c == ORTAK_DIR || c == ".git") {
         return None;
     }
     Some(rel)
@@ -336,8 +346,15 @@ fn filter(ws: &Workspace, abs: &Path) -> Option<String> {
 /// reach, so a journaling failure used to be invisible to everything except the
 /// person watching that window. A session whose edits are not landing has to be
 /// able to find that out from `ortak status`.
-fn journal(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64, rel: &str) -> bool {
-    match process(db, repo, ws, human_id, rel) {
+fn journal(
+    db: &Db,
+    repo: &git2::Repository,
+    ws: &Workspace,
+    excludes: &str,
+    human_id: i64,
+    rel: &str,
+) -> bool {
+    match process(db, repo, ws, excludes, human_id, rel) {
         Ok(recorded) => {
             if let Err(e) = db.clear_journal_failure(rel) {
                 log(&format!("ERROR clearing health record for {}: {}", rel, e));
@@ -359,17 +376,18 @@ fn process(
     db: &Db,
     repo: &git2::Repository,
     ws: &Workspace,
+    excludes: &str,
     human_id: i64,
     rel: &str,
 ) -> Result<bool> {
-    if repo.is_path_ignored(rel).unwrap_or(false) {
+    if shadow::ignored(ws, repo, excludes, rel) {
         return Ok(false);
     }
     let abs = ws.root.join(rel);
     if abs.is_dir() {
         return Ok(false);
     }
-    let recorded = process_snapshots(db, repo, rel)?;
+    let recorded = process_snapshots(db, repo, ws, excludes, rel)?;
 
     // Whatever is left is what no hook claimed: a Bash write, or the human.
     let change = shadow::classify(repo, &ws.root, rel)?;
@@ -427,9 +445,15 @@ fn process(
 /// Journal every snapshot a hook recorded for this path, oldest first. Each one
 /// holds one session's file as that session left it, so two sessions writing the
 /// same file inside one debounce window still get one commit each.
-fn process_snapshots(db: &Db, repo: &git2::Repository, rel: &str) -> Result<bool> {
+fn process_snapshots(
+    db: &Db,
+    repo: &git2::Repository,
+    ws: &Workspace,
+    excludes: &str,
+    rel: &str,
+) -> Result<bool> {
     let snapshots = db.peek_snapshots(rel)?;
-    if repo.is_path_ignored(rel).unwrap_or(false) {
+    if shadow::ignored(ws, repo, excludes, rel) {
         for (rowid, _, _) in snapshots {
             db.drop_snapshot(rowid)?;
         }
@@ -489,7 +513,21 @@ fn process_snapshots(db: &Db, repo: &git2::Repository, rel: &str) -> Result<bool
 
 /// Catch up on changes made while the daemon was down. Attribution hints are
 /// long stale by now, so everything found here lands on the human session.
-fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64) -> u32 {
+///
+/// ponytail: this is the shadow repository's status walk, so it sees a file
+/// inside a nested repository only once the baseline has tracked it, and a
+/// tracked file is never ignored. A file *created* in one of those
+/// repositories while the daemon was stopped is untracked and behind the root's
+/// `.gitignore`, so this does not find it; the next write to it does. Fixing
+/// that means asking each repository about itself, which is a walk per
+/// repository at every daemon start.
+fn startup_scan(
+    db: &Db,
+    repo: &git2::Repository,
+    ws: &Workspace,
+    excludes: &str,
+    human_id: i64,
+) -> u32 {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = match repo.statuses(Some(&mut opts)) {
@@ -502,7 +540,7 @@ fn startup_scan(db: &Db, repo: &git2::Repository, ws: &Workspace, human_id: i64)
     let mut journaled = 0u32;
     for entry in statuses.iter() {
         let Some(rel) = entry.path() else { continue };
-        if journal(db, repo, ws, human_id, rel) {
+        if journal(db, repo, ws, excludes, human_id, rel) {
             journaled += 1;
         }
     }

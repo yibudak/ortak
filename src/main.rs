@@ -446,6 +446,22 @@ fn init() -> Result<()> {
     }
     if existed {
         println!("already initialized: {}", ws.ortak_dir.display());
+        // A workspace whose baseline never landed looks exactly like a healthy
+        // one from out here and behaves nothing like it: with no shadow HEAD
+        // the first touch of any file classifies as a create and claims the
+        // file's whole length, so one edited line locks everybody out of a
+        // 4000-line model. `ortak init` said `already initialized` and exited
+        // 0, and nothing ever mentioned it again. Capturing it now is what
+        // should have happened the first time, and there is nothing to undo:
+        // an empty shadow history is what makes this reachable.
+        if let Ok(repo) = shadow::open(&ws) {
+            if repo.head().is_err() {
+                let cfg = Config::load(&ws.config_path)?;
+                print!("the baseline here was never captured; capturing it now... ");
+                let oid = shadow::baseline(&repo, &ws, &cfg)?;
+                println!("done ({})", &oid.to_string()[..8]);
+            }
+        }
         return Ok(());
     }
     if !ws.config_path.exists() {
@@ -459,7 +475,7 @@ fn init() -> Result<()> {
     db.ensure_human()?;
     let repo = shadow::init(&ws, &cfg)?;
     print!("capturing baseline... ");
-    let oid = shadow::baseline(&repo)?;
+    let oid = shadow::baseline(&repo, &ws, &cfg)?;
     println!("done ({})", &oid.to_string()[..8]);
     warn_about_ignored_repos(&repo, &ws.root);
     name_the_push_remote(&root, &cfg);
