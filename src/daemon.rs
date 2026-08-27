@@ -59,6 +59,9 @@ pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
     // repository that owns a path has never heard of `.ortak`, so it has to be
     // told, and in this tree there may be sixty of them to tell.
     let excludes = shadow::exclude_rules(ws, cfg);
+    // The gate's own window, handed to the attribution ladder so both answer
+    // "is that session still working in this file" with the same number.
+    let presence_secs = cfg.gate.presence_minutes * 60;
     let human_id = db.ensure_human()?;
 
     let (tx, rx) = mpsc::channel::<PathBuf>();
@@ -88,7 +91,7 @@ pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
         .last_heartbeat()?
         .filter(|t| back - t > db::HEARTBEAT_ALIVE_SECS);
     db.heartbeat()?;
-    let journaled = startup_scan(&db, &repo, ws, &excludes, human_id);
+    let journaled = startup_scan(&db, &repo, ws, &excludes, presence_secs, human_id);
     if let Some(start) = stopped_at {
         let outage = db::Outage {
             start,
@@ -164,7 +167,7 @@ pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
             .collect();
         for rel in quiet {
             pending.remove(&rel);
-            journal(&db, &repo, ws, &excludes, human_id, &rel);
+            journal(&db, &repo, ws, &excludes, presence_secs, human_id, &rel);
         }
     }
 }
@@ -351,10 +354,11 @@ fn journal(
     repo: &git2::Repository,
     ws: &Workspace,
     excludes: &str,
+    presence_secs: i64,
     human_id: i64,
     rel: &str,
 ) -> bool {
-    match process(db, repo, ws, excludes, human_id, rel) {
+    match process(db, repo, ws, excludes, presence_secs, human_id, rel) {
         Ok(recorded) => {
             if let Err(e) = db.clear_journal_failure(rel) {
                 log(&format!("ERROR clearing health record for {}: {}", rel, e));
@@ -377,6 +381,7 @@ fn process(
     repo: &git2::Repository,
     ws: &Workspace,
     excludes: &str,
+    presence_secs: i64,
     human_id: i64,
     rel: &str,
 ) -> Result<bool> {
@@ -406,7 +411,7 @@ fn process(
     // Keep how the owner was found alongside the row. Nothing else in the
     // journal separates a session naming its own file from the daemon guessing
     // off a running command, and the two are worth different amounts of trust.
-    let (session_id, attributed_by) = match db.peek_hint(rel)? {
+    let (session_id, attributed_by) = match db.peek_hint(rel, presence_secs)? {
         Some((id, how)) => (id, Some(how)),
         None => (human_id, None),
     };
@@ -526,6 +531,7 @@ fn startup_scan(
     repo: &git2::Repository,
     ws: &Workspace,
     excludes: &str,
+    presence_secs: i64,
     human_id: i64,
 ) -> u32 {
     let mut opts = git2::StatusOptions::new();
@@ -540,7 +546,7 @@ fn startup_scan(
     let mut journaled = 0u32;
     for entry in statuses.iter() {
         let Some(rel) = entry.path() else { continue };
-        if journal(db, repo, ws, excludes, human_id, rel) {
+        if journal(db, repo, ws, excludes, presence_secs, human_id, rel) {
             journaled += 1;
         }
     }
