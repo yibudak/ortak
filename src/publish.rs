@@ -25,6 +25,9 @@ pub struct PublishOpts<'a> {
     pub branch: Option<&'a str>,
     pub base: Option<&'a str>,
     pub exclude: &'a [String],
+    /// Workspace-relative directory whose files this branch is limited to, for
+    /// a session that has edited more than one repository in the tree.
+    pub repo: Option<&'a str>,
     pub scope: Scope,
     pub push: bool,
     /// Subject line for this branch's commit, in place of the session intent.
@@ -46,38 +49,27 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         branch: branch_override,
         base: base_override,
         exclude,
+        repo: repo_only,
         scope,
         push,
         message: subject,
         dry_run,
         squash,
     } = opts;
-    let base = base_branch(cfg, base_override);
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
-    let repo = Repository::open(&ws.root).with_context(|| {
-        format!(
-            "publishing requires {} to be a git repository with a configured remote",
-            ws.root.display()
-        )
-    })?;
     // One session runs several tasks, so shipping everything it ever touched
     // puts the finished work back into every later branch. Default to what came
     // after the last publish; --all rebuilds a branch holding all of it.
     let history = db.publishes(session.id)?;
     let previous = history.first().cloned();
     // An amend goes back further, to where the branch it is landing on began.
-    // The journal knows that only for branches this session published, so the
-    // repository is read here rather than after the file list: what a branch
-    // already carries is the other half of the answer.
-    let amending = match scope {
-        Scope::Amend => Some(amend_target(&repo, &history, branch_override, &session)?),
-        _ => None,
-    };
-    let after = match amending {
-        Some(a) => a.after,
-        None if scope == Scope::All => 0,
-        None => previous.as_ref().map_or(0, |p| p.last_edit_id),
+    // The journal answers that much on its own; the half that reads git waits
+    // until the file list has named the repository the branch lives in.
+    let after = match scope {
+        Scope::Amend => amend_reach(&history, branch_override)?.1,
+        Scope::All => 0,
+        Scope::New => previous.as_ref().map_or(0, |p| p.last_edit_id),
     };
     // Read the high-water mark before the file list, never after: an edit that
     // lands in between is then republished rather than silently dropped.
@@ -104,12 +96,49 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             pattern, session.id
         );
     }
+    // --repo is --exclude read the other way round, and it belongs here for the
+    // same reason: `held_back` further down reads what left this list, and the
+    // mark stops short of the first of them. Get that wrong and a session that
+    // publishes one repository drops the other repository's edits out of every
+    // publish after it.
+    // `starts_with` is component-wise, so `--repo repos/alt` does not take
+    // `repos/altinkaya`, and the `./` shell completion adds is trimmed the way
+    // `--exclude` trims it.
+    if let Some(dir) = repo_only.map(|d| d.trim_start_matches("./")) {
+        files.retain(|(f, _)| Path::new(f).starts_with(dir));
+        if files.is_empty() {
+            bail!(
+                "ortak-{} changed nothing under {}; `ortak publish ortak-{} --dry-run` lists what it did change",
+                session.id,
+                dir,
+                session.id
+            );
+        }
+    }
     if files.is_empty() {
         bail!(
             "every file ortak-{} changed was excluded; nothing left to publish",
             session.id
         );
     }
+    // Every path the journal holds is workspace-relative, and one workspace can
+    // hold sixty repositories. The branch belongs in the one its files live in,
+    // and from here on `prefix` is the distance between the two: empty wherever
+    // the workspace root is the repository, which is every workspace ortak had
+    // before this one.
+    let (prefix, repo) = owning_repo(ws, &files)?;
+    let amending = match scope {
+        Scope::Amend => Some(amend_target(&repo, &history, branch_override, &session)?),
+        _ => None,
+    };
+    // An amend rebuilds on its own branch's parent and never reads the trunk,
+    // so it keeps the configured name for its messages rather than resolving a
+    // branch it is not going to build on.
+    let chose_base = match amending {
+        Some(_) => base_branch(cfg, base_override).to_string(),
+        None => base_here(&repo, cfg, base_override, &prefix)?,
+    };
+    let base = chose_base.as_str();
     // Settled before the branch is built, not after. Nothing is lost by
     // stopping here: the branch is a function of the journal, so the same one
     // comes back once the remote is named. Stopping after the build would leave
@@ -159,7 +188,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // file anyway, at whatever version it had when the rule landed. A secret,
     // a build artifact or a model file goes out stale, which is the worst of
     // both.
-    let ignored = ignored_now(&repo, &base_tree, &files);
+    let ignored = ignored_now(&repo, &base_tree, &files, &prefix);
     for file in &ignored {
         println!(
             "warning: {file} is ignored by this project now, so it is not going into the branch; \
@@ -179,7 +208,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     // disk can hold another session's work. Rebuild this session's own content
     // from its shadow history instead of reading the workspace.
     let shadow = crate::shadow::open(ws)?;
-    let seed = base_seed(&shadow, &repo, &base_tree, &files)?;
+    let seed = base_seed(&shadow, &repo, &base_tree, &files, &prefix)?;
     // An excluded file leaves the replay too, not just the branch. Its commits
     // can still fail to apply, and a file nobody asked to publish has no
     // business failing the publish.
@@ -205,7 +234,14 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             .filter(|(_, f)| !squashed.contains(f))
             .map(|(c, _)| c.clone())
             .collect();
-        let replay = match session_only_tree(&shadow, &seed, &base_tree, &commits, &still_theirs) {
+        let replay = match session_only_tree(
+            &shadow,
+            &seed,
+            &base_tree,
+            &commits,
+            &still_theirs,
+            &prefix,
+        ) {
             Ok(replayed) => replayed,
             // The replay merges this session's edits into the base branch's content,
             // so a checkout that never caught up with the base fails it on every
@@ -280,8 +316,11 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
     index.read_tree(&base_tree)?;
     let mut stale: Vec<String> = Vec::new();
     for (file, kind) in &files {
+        // The index being built is the repository's, so every path that reaches
+        // it drops the prefix; the shadow tree beside it keeps the workspace's.
+        let here = in_repo(&prefix, file);
         if kind == "delete" {
-            let _ = index.remove_path(Path::new(file));
+            let _ = index.remove_path(here);
             continue;
         }
         let tracked = session_tree
@@ -289,7 +328,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
             .with_context(|| format!("{} is missing from this session's replayed history", file))?;
         let data = shadow.find_blob(tracked.id())?.content().to_vec();
         let on_base = base_tree
-            .get_path(Path::new(file))
+            .get_path(here)
             .ok()
             .and_then(|e| repo.find_blob(e.id()).ok())
             .map(|b| b.content().to_vec());
@@ -316,10 +355,15 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // there, so the branch shipped the old directory and none of the change
         // that replaced it. Nothing can live under a path that is about to be a
         // file, so this only ever removes what the file replaces.
-        let _ = index.remove_dir(Path::new(file), 0);
+        let _ = index.remove_dir(here, 0);
         // The blob lives in the shadow object database; copy it into the project repo.
         let blob_id = repo.blob(&data)?;
-        index.add(&entry_for(file, blob_id, mode, data.len()))?;
+        index.add(&entry_for(
+            &here.to_string_lossy(),
+            blob_id,
+            mode,
+            data.len(),
+        ))?;
     }
     let tree_oid = index.write_tree_to(&repo)?;
     let tree = repo.find_tree(tree_oid)?;
@@ -388,6 +432,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // Only now: a failed publish must not move the session's high-water
         // mark. Rewriting this session's own commit moves that branch's mark;
         // adopting another branch records the first publish on it.
+        //
+        // ponytail: the row records a branch name and no repository. Two
+        // repositories in one tree can hold a branch of the same name, and this
+        // journal cannot tell them apart, so `--amend` and "already carries that
+        // work" answer for whichever row matched the name first. A repository
+        // column is the fix and it is a schema change; parked as an idea rather
+        // than grown onto this branch.
         if rewrites {
             db.amend_publish(session.id, &branch_name, mark)?;
         } else {
@@ -495,6 +546,11 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
 
     if push {
         let remote = remote_for(&repo, cfg);
+        // Every git command below runs in the repository the branch was built
+        // in, which is not the workspace root once the workspace holds more than
+        // one. Run from the root, `git push <remote> <branch>` resolves the
+        // remote name and the branch in a repository that has neither.
+        let at = repo.workdir().unwrap_or(&ws.root).to_path_buf();
         // A stacked branch is unusable on the forge until its base is there too:
         // GitHub and Forgejo both refuse a pull request whose base branch they
         // cannot find, so --base builds the stack locally and then strands it.
@@ -504,18 +560,18 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         // would put a branch called `origin/main` on the fork.
         if let Some(stack) = base_override
             .filter(|b| repo.find_branch(b, BranchType::Remote).is_err())
-            .filter(|b| !on_remote(ws, &remote, b))
+            .filter(|b| !on_remote(&at, &remote, b))
         {
             let status = std::process::Command::new("git")
                 .arg("-C")
-                .arg(&ws.root)
+                .arg(&at)
                 .args(["push", "-u", &remote, stack])
                 .status()?;
             if !status.success() {
                 bail!(
                     "git push of the base branch {} failed: {}",
                     stack,
-                    push_advice(&repo, &remote, stack)
+                    push_advice(&repo, &remote, stack, &run_it_from(&prefix))
                 );
             }
             println!(
@@ -536,13 +592,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         }
         let status = std::process::Command::new("git")
             .arg("-C")
-            .arg(&ws.root)
+            .arg(&at)
             .args(&args)
             .status()?;
         if !status.success() {
             bail!(
                 "git push failed: {}",
-                push_advice(&repo, &remote, &branch_name)
+                push_advice(&repo, &remote, &branch_name, &run_it_from(&prefix))
             );
         }
         if !amend {
@@ -555,7 +611,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 .and_then(|r| r.url().map(|u| u.contains("github.com")))
                 .unwrap_or(false);
             let tool = if github { "gh" } else { "tea" };
-            println!("\ncreate the PR with:");
+            println!("\ncreate the PR with{}:", run_it_from(&prefix));
             println!(
                 "  {} pr create --base {} --head {} --title \"{}\"",
                 tool,
@@ -566,13 +622,17 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         }
     } else if amend {
         let remote = remote_for(&repo, cfg);
+        let from = run_it_from(&prefix);
         if rewrites {
             println!(
-                "\n{} moved, so it is no longer a fast-forward. Push it with:\n  git push --force-with-lease {} {}",
-                branch_name, remote, branch_name
+                "\n{} moved, so it is no longer a fast-forward. Push it with{}:\n  git push --force-with-lease {} {}",
+                branch_name, from, remote, branch_name
             );
         } else {
-            println!("\nnot pushed; run: git push {} {}", remote, branch_name);
+            println!(
+                "\nnot pushed; run{}: git push {} {}",
+                from, remote, branch_name
+            );
         }
     } else {
         println!("\nnot pushed; run: ortak publish {} --push", session_ref);
@@ -638,10 +698,14 @@ fn base_seed<'r>(
     repo: &Repository,
     base_tree: &Tree,
     files: &[(String, String)],
+    prefix: &str,
 ) -> Result<Commit<'r>> {
     let mut index = git2::Index::new()?;
     for (file, _) in files {
-        let Ok(entry) = base_tree.get_path(Path::new(file)) else {
+        // Read from the repository under its own path, written into the shadow
+        // under the workspace's: the seed has to line up with the shadow
+        // micro-commits that are about to be replayed onto it.
+        let Ok(entry) = base_tree.get_path(in_repo(prefix, file)) else {
             continue; // the session created it; nothing to seed
         };
         // The base branch can hold a directory where this session now has a
@@ -716,6 +780,7 @@ fn session_only_tree<'r>(
     base_tree: &Tree,
     commits: &[String],
     still_theirs: &dyn Fn(&str) -> bool,
+    prefix: &str,
 ) -> Result<Replay<'r>> {
     let mut head = seed.clone();
     let mut unreplayable: Vec<String> = Vec::new();
@@ -739,7 +804,7 @@ fn session_only_tree<'r>(
             // file and nothing else; `run` reports what was left out.
             let unshipped: Vec<String> = paths
                 .iter()
-                .filter(|p| base_tree.get_path(Path::new(p)).is_err())
+                .filter(|p| base_tree.get_path(in_repo(prefix, p)).is_err())
                 .cloned()
                 .collect();
             if !unshipped.is_empty() && unshipped.len() == paths.len() {
@@ -1003,18 +1068,131 @@ fn blob_at(shadow: &Repository, commit: &str, file: &str) -> Option<Vec<u8>> {
     Some(shadow.find_blob(entry.id()).ok()?.content().to_vec())
 }
 
+/// The journal speaks workspace-relative paths and a repository speaks its own.
+/// They are the same string wherever the workspace root is the repository,
+/// which is every workspace ortak had before a tree of them, so an empty prefix
+/// hands the path straight back and nothing that calls this changes there.
+fn in_repo<'p>(prefix: &str, path: &'p str) -> &'p Path {
+    let rel = match prefix.is_empty() {
+        true => path,
+        false => path
+            .strip_prefix(prefix)
+            .map_or(path, |r| r.trim_start_matches('/')),
+    };
+    Path::new(rel)
+}
+
+/// The repository this branch belongs in, and how far its files sit below the
+/// workspace root. One workspace can hold sixty repositories and a branch
+/// belongs to one of them.
+///
+/// `repo_of` answers `Some("")` for the workspace root, so a single-repository
+/// workspace comes out of here with an empty prefix and the same repository
+/// publish has always opened.
+fn owning_repo(ws: &Workspace, files: &[(String, String)]) -> Result<(String, Repository)> {
+    let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut outside: Vec<&str> = Vec::new();
+    for (f, _) in files {
+        match ws.repo_of(f) {
+            Some(dir) => *tally.entry(dir).or_default() += 1,
+            None => outside.push(f),
+        }
+    }
+    let counted: Vec<(String, usize)> = tally.into_iter().collect();
+    let named = |dir: &str| match dir.is_empty() {
+        true => "the workspace root".to_string(),
+        false => dir.to_string(),
+    };
+    // Dropping it quietly is the one thing that must not happen: the journal
+    // holds the edit, so it would leave every later publish carrying a file that
+    // has never had a branch to go to.
+    if !outside.is_empty() {
+        bail!(
+            "nothing at or above {} inside {} is a git repository, so there is no branch to build for it. Run `git init` where it belongs, or `--exclude` it out of this publish",
+            outside.join(", "),
+            ws.root.display()
+        );
+    }
+    let [(dir, _)] = counted.as_slice() else {
+        let each: Vec<String> = counted
+            .iter()
+            .map(|(d, n)| format!("{} ({n} file(s))", named(d)))
+            .collect();
+        bail!(
+            "ortak's branch belongs to one repository and this session has edited {}: {}. Publish them one at a time with `--repo <dir>`",
+            counted.len(),
+            each.join(", ")
+        );
+    };
+    let at = ws.root.join(dir);
+    let repo = Repository::open(&at).with_context(|| {
+        format!(
+            "publishing requires {} to be a git repository",
+            at.display()
+        )
+    })?;
+    Ok((dir.clone(), repo))
+}
+
+/// The branch this publish builds on, in the repository it is building in.
+///
+/// `[publish] base_branch` is one value for a whole workspace, and a tree of
+/// repositories does not agree on a trunk: the tree this was written for has
+/// `16.0`, `main` and `master` in it. So a nested repository that does not have
+/// the configured branch falls back to its own trunk and says which one it
+/// took. `--base` still wins and takes a remote ref, which is the way to say
+/// something other than a trunk.
+///
+/// The fallback is `main` then `master` and then nothing. Never HEAD: HEAD in a
+/// checked-out repository is whichever branch somebody left checked out, and a
+/// silent fallback across sixty repositories would eventually build a branch on
+/// somebody's half-finished feature.
+///
+/// ponytail: two names, not a lookup. `refs/remotes/<remote>/HEAD` is the
+/// authoritative answer where a clone recorded one; add it if a repository with
+/// neither `main` nor `master` turns out to be common.
+fn base_here(
+    repo: &Repository,
+    cfg: &Config,
+    base_override: Option<&str>,
+    prefix: &str,
+) -> Result<String> {
+    let configured = base_branch(cfg, base_override);
+    let known = |name: &str| repo.find_branch(name, BranchType::Local).is_ok();
+    if base_override.is_some() || prefix.is_empty() || known(configured) {
+        return Ok(configured.to_string());
+    }
+    match ["main", "master"].into_iter().find(|n| known(n)) {
+        Some(trunk) => {
+            println!(
+                "{prefix} has no branch called {configured}, so this branch is built on {trunk}, which is its trunk; `--base` says otherwise"
+            );
+            Ok(trunk.to_string())
+        }
+        None => bail!(
+            "{prefix} has no branch called {configured}, and no main or master either, so there is nothing to build this branch on. Name one with `--base <branch>`; since #102 it takes a remote-tracking ref, so `--base origin/<trunk>` works without moving anything"
+        ),
+    }
+}
+
 /// The session's files this project's ignore rules now cover, which the branch
 /// must not carry whatever the journal remembers.
 ///
 /// Only files the base branch does not already have: a tracked file is not
 /// ignored by git however well it matches a pattern, and dropping one would
 /// strip a real change out of a branch without anybody asking.
-fn ignored_now(repo: &Repository, base_tree: &Tree, files: &[(String, String)]) -> Vec<String> {
+fn ignored_now(
+    repo: &Repository,
+    base_tree: &Tree,
+    files: &[(String, String)],
+    prefix: &str,
+) -> Vec<String> {
     files
         .iter()
         .map(|(f, _)| f.clone())
         .filter(|f| {
-            repo.is_path_ignored(f).unwrap_or(false) && base_tree.get_path(Path::new(f)).is_err()
+            let rel = in_repo(prefix, f);
+            repo.is_path_ignored(rel).unwrap_or(false) && base_tree.get_path(rel).is_err()
         })
         .collect()
 }
@@ -1125,7 +1303,7 @@ fn unsettled_remote(repo: &Repository, cfg: &Config) -> Option<String> {
 /// Git's answer is a permission error with nothing about ortak in it, and
 /// re-running the publish after fixing the remote hits "changed nothing since
 /// its last publish": the branch and its high-water mark are already recorded.
-fn push_advice(repo: &Repository, remote: &str, branch: &str) -> String {
+fn push_advice(repo: &Repository, remote: &str, branch: &str, from: &str) -> String {
     let url = repo
         .find_remote(remote)
         .ok()
@@ -1134,10 +1312,21 @@ fn push_advice(repo: &Repository, remote: &str, branch: &str) -> String {
     format!(
         "it went to {remote} ({url}).\n\
          The branch {branch} is built and still here, so point ortak at the remote you can\n\
-         write to and push it yourself:\n  \
+         write to and push it yourself{from}:\n  \
          git config ortak.remote <name>\n  \
          git push <name> {branch}"
     )
+}
+
+/// Where a printed git command has to be run, said only when that is somewhere
+/// other than where the reader is standing. Both `git config ortak.remote` and
+/// `git push` answer to the repository they run in, and in a tree that is a
+/// directory below the workspace root rather than the root itself.
+fn run_it_from(prefix: &str) -> String {
+    match prefix.is_empty() {
+        true => String::new(),
+        false => format!(", from {prefix}"),
+    }
 }
 
 /// Generated branch name. A session that never ran `ortak intent` has no words
@@ -1313,10 +1502,10 @@ fn base_behind_warning(repo: &Repository, remote: &str, base: &str) -> Option<St
 /// Whether the remote already carries this branch. Local refs go stale, and a
 /// wrong answer here either strands a stack or pushes a branch nobody asked for,
 /// so ask the remote.
-fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
+fn on_remote(at: &Path, remote: &str, branch: &str) -> bool {
     std::process::Command::new("git")
         .arg("-C")
-        .arg(&ws.root)
+        .arg(at)
         .args(["ls-remote", "--exit-code", "--heads", remote, branch])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1330,10 +1519,35 @@ fn on_remote(ws: &Workspace, remote: &str, branch: &str) -> bool {
 /// not this session's.
 #[derive(Clone, Copy, Debug)]
 struct Amend<'a> {
-    after: i64,
     branch: &'a str,
     base: Oid,
     rewrites: bool,
+}
+
+/// The half of an amend the journal can answer on its own: which branch, how
+/// far back to read, and where that branch sits in this session's publish
+/// history.
+///
+/// It is split from the rest because of the order the two need. The repository
+/// an amend rebuilds in is the one holding the files, the files are whatever
+/// came after this mark, and reading git for the branch tip before any of that
+/// is known would mean opening a repository chosen by nothing.
+fn amend_reach<'a>(
+    history: &[PublishRow],
+    branch: Option<&'a str>,
+) -> Result<(&'a str, i64, Option<usize>)> {
+    let Some(branch) = branch else {
+        bail!("--amend rewrites one branch; name it with --branch <branch>");
+    };
+    let at = history.iter().position(|p| p.branch == branch);
+    let after = match at {
+        // Its own publish is the newest, so the mark before it is the floor.
+        Some(0) => history.get(1).map_or(0, |p| p.last_edit_id),
+        // A branch this session did not publish keeps everything on it and takes
+        // this session's work since its own last publish on top.
+        _ => history.first().map_or(0, |p| p.last_edit_id),
+    };
+    Ok((branch, after, at))
 }
 
 /// Where an amend starts reading the journal, and what it may do to the branch.
@@ -1357,11 +1571,9 @@ fn amend_target<'a>(
     branch: Option<&'a str>,
     session: &Session,
 ) -> Result<Amend<'a>> {
-    let Some(branch) = branch else {
-        bail!("--amend rewrites one branch; name it with --branch <branch>");
-    };
+    let (branch, _, at) = amend_reach(history, branch)?;
     let tip = branch_tip(repo, branch)?;
-    match history.iter().position(|p| p.branch == branch) {
+    match at {
         Some(0) => {
             // The journal says this session published the branch; git says what
             // stands on it now. Anything that is not this session's own publish
@@ -1385,7 +1597,6 @@ fn amend_target<'a>(
                 .parent(0)
                 .with_context(|| format!("{branch} has no parent commit to rebuild it on"))?;
             Ok(Amend {
-                after: history.get(1).map_or(0, |p| p.last_edit_id),
                 branch,
                 base: parent.id(),
                 rewrites: true,
@@ -1401,7 +1612,6 @@ fn amend_target<'a>(
         // Nothing on it is this session's to rewrite, so the tip itself is the
         // floor and the new commit becomes its child.
         None => Ok(Amend {
-            after: history.first().map_or(0, |p| p.last_edit_id),
             branch,
             base: tip.id(),
             rewrites: false,
@@ -1479,7 +1689,7 @@ mod tests {
         base_tree: &Tree,
         commits: &[String],
     ) -> Result<(Tree<'r>, Vec<String>)> {
-        match super::session_only_tree(shadow, seed, base_tree, commits, &shared_none)? {
+        match super::session_only_tree(shadow, seed, base_tree, commits, &shared_none, "")? {
             Replay::Tree(tree, skipped) => Ok((tree, skipped)),
             Replay::Blocked(paths) => panic!("the replay was blocked on {}", paths.join(", ")),
         }
@@ -1676,7 +1886,7 @@ mod tests {
             ("src/main.rs".to_string(), "modify".to_string()),
         ];
 
-        assert_eq!(ignored_now(&repo, &base, &files), vec!["secret.env"]);
+        assert_eq!(ignored_now(&repo, &base, &files, ""), vec!["secret.env"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1702,7 +1912,7 @@ mod tests {
         let flat = commit_file(&repo, Some(&before), "thing", "pub fn walk() {}\n");
 
         let files = vec![("thing".to_string(), "modify".to_string())];
-        let seed = base_seed(&repo, &repo, &base, &files).unwrap();
+        let seed = base_seed(&repo, &repo, &base, &files, "").unwrap();
         let (tree, skipped) = session_only_tree(&repo, &seed, &base, &[flat.to_string()]).unwrap();
 
         assert!(skipped.is_empty(), "left out: {skipped:?}");
@@ -1797,13 +2007,19 @@ mod tests {
         let picks = vec![mine1.to_string(), mine2.to_string()];
 
         // Still theirs: the old answer, and the right one while it is true.
-        let skipped =
-            match super::session_only_tree(&repo, &seed, &base, &picks, &|f: &str| f == "mine.py")
-                .unwrap()
-            {
-                Replay::Tree(_, skipped) => skipped,
-                Replay::Blocked(p) => panic!("blocked on {}", p.join(", ")),
-            };
+        let skipped = match super::session_only_tree(
+            &repo,
+            &seed,
+            &base,
+            &picks,
+            &|f: &str| f == "mine.py",
+            "",
+        )
+        .unwrap()
+        {
+            Replay::Tree(_, skipped) => skipped,
+            Replay::Blocked(p) => panic!("blocked on {}", p.join(", ")),
+        };
         assert_eq!(skipped, vec!["mine.py".to_string()]);
 
         // Released: the file is the author's own history with a hole in it.
@@ -1841,7 +2057,8 @@ mod tests {
         let picks = vec![touched.to_string(), own.to_string()];
         let theirs_still = |f: &str| f == "dep.py";
         let (tree, skipped) =
-            match super::session_only_tree(&repo, &seed, &base, &picks, &theirs_still).unwrap() {
+            match super::session_only_tree(&repo, &seed, &base, &picks, &theirs_still, "").unwrap()
+            {
                 Replay::Tree(tree, skipped) => (tree, skipped),
                 Replay::Blocked(p) => panic!("blocked on {}", p.join(", ")),
             };
@@ -1867,7 +2084,7 @@ mod tests {
         // The base branch has its own line 3, so the pick has nowhere to land.
         let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
         let seed = parentless(&repo, &base);
-        match super::session_only_tree(&repo, &seed, &base, &[mine.to_string()], &shared_none)
+        match super::session_only_tree(&repo, &seed, &base, &[mine.to_string()], &shared_none, "")
             .unwrap()
         {
             Replay::Blocked(paths) => assert_eq!(paths, vec!["app.py".to_string()]),
@@ -1893,7 +2110,7 @@ mod tests {
         let base = tree_with(&repo, Some(&lines(&[(3, "ALREADY-SHIPPED")])));
         let seed = parentless(&repo, &base);
         let commits = vec![edit.to_string(), rewrite.to_string()];
-        match super::session_only_tree(&repo, &seed, &base, &commits, &shared_none).unwrap() {
+        match super::session_only_tree(&repo, &seed, &base, &commits, &shared_none, "").unwrap() {
             Replay::Blocked(paths) => assert_eq!(paths, vec!["app.py".to_string()]),
             Replay::Tree(..) => panic!("the discarded line-3 edit replayed as if it were clean"),
         }
@@ -2582,8 +2799,13 @@ mod tests {
         db.insert_edit(s, "one.rs", "modify", None, &[], None)
             .unwrap();
         let a = amend_target(&repo, &db.publishes(s).unwrap(), Some("task/one"), &session).unwrap();
-        assert_eq!((a.after, a.branch, a.rewrites), (0, "task/one", true));
-        assert_eq!(files(a.after), vec!["one.rs"]);
+        // How far back it reaches comes from the journal half, which runs before
+        // the repository is known; the rest of the answer is this one.
+        let reach = amend_reach(&db.publishes(s).unwrap(), Some("task/one"))
+            .unwrap()
+            .1;
+        assert_eq!((reach, a.branch, a.rewrites), (0, "task/one", true));
+        assert_eq!(files(reach), vec!["one.rs"]);
         db.amend_publish(s, "task/one", head()).unwrap();
         assert_eq!(
             db.publishes(s).unwrap().len(),
@@ -2608,12 +2830,9 @@ mod tests {
             amend_target(&repo, &history, Some("never/published"), &session).is_err(),
             "a branch that is not in the repository is a typo, not one to create"
         );
+        assert!(amend_target(&repo, &history, Some("task/two"), &session).is_ok());
         assert_eq!(
-            files(
-                amend_target(&repo, &history, Some("task/two"), &session)
-                    .unwrap()
-                    .after
-            ),
+            files(amend_reach(&history, Some("task/two")).unwrap().1),
             vec!["two.rs"]
         );
 
@@ -2635,8 +2854,9 @@ mod tests {
             !adopted.rewrites,
             "a commit this session did not publish must not be rewritten"
         );
-        assert_eq!(adopted.after, history[0].last_edit_id);
-        assert_eq!(files(adopted.after), vec!["three.rs"]);
+        let adopted_reach = amend_reach(&history, Some("feat/theirs")).unwrap().1;
+        assert_eq!(adopted_reach, history[0].last_edit_id);
+        assert_eq!(files(adopted_reach), vec!["three.rs"]);
 
         // And the branch it did publish, once somebody else has put a commit on
         // top: rebuilding it from the tip's parent would drop that commit.
@@ -2708,9 +2928,8 @@ mod tests {
         git(&work, &["remote", "add", "up", bare.to_str().unwrap()]);
         git(&work, &["push", "-q", "up", "main"]);
 
-        let ws = Workspace::at(&work);
-        assert!(on_remote(&ws, "up", "main"));
-        assert!(!on_remote(&ws, "up", "feat/never-pushed"));
+        assert!(on_remote(&work, "up", "main"));
+        assert!(!on_remote(&work, "up", "feat/never-pushed"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2823,11 +3042,20 @@ mod tests {
         repo.remote("origin", "https://example.com/upstream.git")
             .unwrap();
 
-        let advice = push_advice(&repo, "origin", "task/ortak-2-login");
+        let advice = push_advice(&repo, "origin", "task/ortak-2-login", "");
         assert!(
             advice.contains("origin (https://example.com/upstream.git)"),
             "{advice}"
         );
+        // In a tree the two commands answer to the repository they run in, so
+        // the advice has to say which one that is.
+        let nested = push_advice(
+            &repo,
+            "origin",
+            "task/ortak-2-login",
+            &run_it_from("repos/x"),
+        );
+        assert!(nested.contains("from repos/x"), "{nested}");
         assert!(
             advice.contains("git config ortak.remote <name>"),
             "{advice}"
@@ -2839,7 +3067,7 @@ mod tests {
         // The other half of the same mistake: ortak.remote naming a remote the
         // clone does not have. The push fails the same way and the advice still
         // has to say something true.
-        let advice = push_advice(&repo, "kaan", "task/ortak-2-login");
+        let advice = push_advice(&repo, "kaan", "task/ortak-2-login", "");
         assert!(advice.contains("no remote by that name"), "{advice}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2900,6 +3128,7 @@ mod tests {
             branch: Some("task/rehearsal"),
             base: None,
             exclude: &[],
+            repo: None,
             scope: Scope::New,
             push: false,
             message: None,
@@ -2934,5 +3163,236 @@ mod tests {
         assert_eq!(db.publishes(me).unwrap().len(), 1);
         assert!(db.session_regions(me).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn commit_everything(repo: &Repository) {
+        let sig = Signature::now("t", "t@t").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+    }
+
+    /// A workspace shaped like the tree this round is for: a root repository on
+    /// `16.0` whose `.gitignore` hides `repos/`, and a repository inside it with
+    /// a trunk of its own.
+    fn nested_workspace(name: &str) -> (std::path::PathBuf, Repository, Repository) {
+        let root = std::env::temp_dir().join(format!("ortak-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repos/inner/models")).unwrap();
+        let mut opts = git2::RepositoryInitOptions::new();
+        let outer = Repository::init_opts(&root, opts.initial_head("16.0")).unwrap();
+        std::fs::write(root.join(".gitignore"), "repos/\n").unwrap();
+        std::fs::write(root.join("README.md"), "root\n").unwrap();
+        commit_everything(&outer);
+        let inner =
+            Repository::init_opts(root.join("repos/inner"), opts.initial_head("main")).unwrap();
+        std::fs::write(root.join("repos/inner/models/sale.py"), "PRICE = 1\n").unwrap();
+        commit_everything(&inner);
+        (root, outer, inner)
+    }
+
+    /// One edit as the daemon records one: a shadow micro-commit and the
+    /// journal row that points at it.
+    fn journal_edit(shadow: &Repository, db: &Db, session: i64, rel: &str) {
+        let commit = crate::shadow::commit_edit(
+            shadow,
+            rel,
+            crate::shadow::Change::Modify,
+            "b",
+            "ext",
+            None,
+        )
+        .unwrap();
+        let hunk = crate::regions::Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+        };
+        db.insert_edit(session, rel, "modify", Some(&commit), &[hunk], None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_branch_is_built_in_the_repository_its_files_live_in() {
+        let (root, outer, inner) = nested_workspace("nested");
+        let ws = Workspace::at(&root);
+        let cfg = Config::default();
+        std::fs::create_dir_all(&ws.ortak_dir).unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
+        let db = Db::open(&ws.db_path).unwrap();
+        let me = db
+            .upsert_session("ext", "b", "llm", Some("edit the nested repo"))
+            .unwrap();
+
+        std::fs::write(root.join("repos/inner/models/sale.py"), "PRICE = 2\n").unwrap();
+        journal_edit(&shadow, &db, me, "repos/inner/models/sale.py");
+
+        run(
+            &ws,
+            &cfg,
+            &format!("ortak-{me}"),
+            PublishOpts {
+                branch: Some("task/nested"),
+                base: None,
+                exclude: &[],
+                repo: None,
+                scope: Scope::New,
+                push: false,
+                message: None,
+                dry_run: false,
+                squash: false,
+            },
+        )
+        .unwrap();
+
+        // In the repository that holds the file, not the one at the top of the
+        // workspace, and carrying the path that repository knows it by.
+        let built = inner
+            .find_branch("task/nested", BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap();
+        let tree = built.tree().unwrap();
+        assert_eq!(
+            named_file_in(&tree, &inner, "models/sale.py"),
+            "PRICE = 2\n"
+        );
+        assert!(
+            tree.get_path(Path::new("repos/inner/models/sale.py"))
+                .is_err(),
+            "the journal's path reached the branch"
+        );
+        assert!(
+            outer.find_branch("task/nested", BranchType::Local).is_err(),
+            "the branch was built in the workspace root instead"
+        );
+        // Its own trunk, and its own `.gitignore` decision: the root hides
+        // `repos/`, which says nothing about what the repository inside it
+        // tracks.
+        let trunk = inner
+            .find_branch("main", BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(built.parent(0).unwrap().id(), trunk);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_session_across_two_repositories_is_refused_and_repo_takes_one() {
+        let (root, _outer, inner) = nested_workspace("spanning");
+        let ws = Workspace::at(&root);
+        let cfg = Config::default();
+        std::fs::create_dir_all(&ws.ortak_dir).unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
+        let db = Db::open(&ws.db_path).unwrap();
+        let me = db.upsert_session("ext", "b", "llm", Some("both")).unwrap();
+
+        // The root repository's file is journaled first, so its edit id is the
+        // lower one and the mark below has something to stop short of.
+        std::fs::write(root.join("README.md"), "root two\n").unwrap();
+        journal_edit(&shadow, &db, me, "README.md");
+        std::fs::write(root.join("repos/inner/models/sale.py"), "PRICE = 2\n").unwrap();
+        journal_edit(&shadow, &db, me, "repos/inner/models/sale.py");
+
+        let opts = |repo| PublishOpts {
+            branch: Some("task/both"),
+            base: None,
+            exclude: &[],
+            repo,
+            scope: Scope::New,
+            push: false,
+            message: None,
+            dry_run: false,
+            squash: false,
+        };
+        let session = format!("ortak-{me}");
+        let refused = run(&ws, &cfg, &session, opts(None))
+            .unwrap_err()
+            .to_string();
+        for expected in ["repos/inner", "the workspace root", "--repo"] {
+            assert!(refused.contains(expected), "{expected} missing: {refused}");
+        }
+
+        run(&ws, &cfg, &session, opts(Some("repos/inner"))).unwrap();
+        assert!(inner.find_branch("task/both", BranchType::Local).is_ok());
+        // The mark stops short of the edit this branch did not carry, so the
+        // other repository's work is still waiting for its own publish rather
+        // than gone.
+        let mark = db.publishes(me).unwrap()[0].last_edit_id;
+        let waiting: Vec<String> = db
+            .session_files(me, mark)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            waiting.contains(&"README.md".to_string()),
+            "the root repository's edit left the journal: {waiting:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_file_no_repository_holds_is_named_rather_than_dropped() {
+        let root = std::env::temp_dir().join(format!("ortak-homeless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::at(&root);
+        let files = vec![("notes.txt".to_string(), "modify".to_string())];
+        let refused = match owning_repo(&ws, &files) {
+            Err(e) => e.to_string(),
+            Ok((dir, _)) => panic!("a directory with no git in it published as {dir:?}"),
+        };
+        assert!(refused.contains("notes.txt"), "{refused}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_nested_repository_without_the_configured_trunk_uses_its_own() {
+        let dir = std::env::temp_dir().join(format!("ortak-trunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut opts = git2::RepositoryInitOptions::new();
+        let repo = Repository::init_opts(&dir, opts.initial_head("master")).unwrap();
+        commit_everything(&repo);
+        let mut cfg = Config::default();
+        cfg.publish.base_branch = "16.0".into();
+
+        assert_eq!(base_here(&repo, &cfg, None, "repos/x").unwrap(), "master");
+        assert_eq!(
+            base_here(&repo, &cfg, Some("origin/16.0"), "repos/x").unwrap(),
+            "origin/16.0",
+            "--base still wins"
+        );
+        // At the workspace root nothing falls back: that is the single
+        // repository publish has always had, and its missing branch reaches the
+        // error it has always reached.
+        assert_eq!(base_here(&repo, &cfg, None, "").unwrap(), "16.0");
+
+        // Neither name is there to fall back to, and HEAD is not an answer.
+        let other = std::env::temp_dir().join(format!("ortak-trunk2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        let repo = Repository::init_opts(&other, opts.initial_head("feature/x")).unwrap();
+        commit_everything(&repo);
+        let refused = base_here(&repo, &cfg, None, "repos/x")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("--base"), "{refused}");
+        assert!(
+            !refused.contains("feature/x"),
+            "HEAD became the base: {refused}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

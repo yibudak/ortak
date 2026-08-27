@@ -149,6 +149,13 @@ enum Command {
         /// Workspace-relative file or directory to keep out of the branch (repeatable)
         #[arg(long)]
         exclude: Vec<String>,
+        /// Publish only the files under this workspace-relative directory
+        ///
+        /// A workspace can hold more than one git repository, and a branch
+        /// belongs to one of them. Everything held back keeps its place in the
+        /// journal and goes out in its own publish.
+        #[arg(long)]
+        repo: Option<String>,
         /// Branch to build on, for this run only (default: [publish] base_branch)
         #[arg(long)]
         base: Option<String>,
@@ -368,6 +375,7 @@ fn run(cli: Cli) -> Result<()> {
             session,
             branch,
             exclude,
+            repo,
             base,
             message,
             all,
@@ -393,6 +401,7 @@ fn run(cli: Cli) -> Result<()> {
                     branch: branch.as_deref(),
                     base: base.as_deref(),
                     exclude: &exclude,
+                    repo: repo.as_deref(),
                     scope,
                     push,
                     message: message.as_deref(),
