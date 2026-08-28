@@ -20,7 +20,7 @@ mod workspace;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
-use db::{Db, HEARTBEAT_ALIVE_SECS};
+use db::{ago, intent_line, Db, HEARTBEAT_ALIVE_SECS};
 use workspace::Workspace;
 
 #[derive(Parser)]
@@ -899,9 +899,9 @@ fn blame(target: &str) -> Result<()> {
                 owner_note(o)
             );
             println!(
-                "    owns {}, intent: {}",
+                "    owns {}, {}",
                 range(o),
-                o.intent.as_deref().unwrap_or("(not reported)")
+                intent_line(o.intent.as_deref(), o.intent_at)
             );
         }
         if let Some(note) = holders_note(&at) {
@@ -928,8 +928,8 @@ fn blame(target: &str) -> Result<()> {
             owner_note(o)
         );
         println!(
-            "                intent: {}",
-            o.intent.as_deref().unwrap_or("(not reported)")
+            "                {}",
+            intent_line(o.intent.as_deref(), o.intent_at)
         );
     }
     Ok(())
@@ -970,16 +970,6 @@ fn split_target(target: &str) -> Result<(&str, Option<i64>)> {
             Err(_) => Ok((target, None)),
         },
         None => Ok((target, None)),
-    }
-}
-
-/// Rough age for someone reading a list: whichever unit keeps it short.
-fn ago(secs: i64) -> String {
-    match secs.max(0) {
-        s if s < 90 => format!("{}s ago", s),
-        s if s < 5400 => format!("{} min ago", s / 60),
-        s if s < 172_800 => format!("{} h ago", s / 3600),
-        s => format!("{} d ago", s / 86400),
     }
 }
 
@@ -1031,13 +1021,13 @@ fn print_sessions(db: &Db) -> Result<()> {
             .map(|ts| format!(" - last seen {}", ago(now - ts)))
             .unwrap_or_default();
         println!(
-            "ortak-{} [{}] {} - {} edits{} - intent: {}",
+            "ortak-{} [{}] {} - {} edits{} - {}",
             s.id,
             s.status,
             s.agent_name,
             edits,
             seen,
-            s.task_intent.as_deref().unwrap_or("(not reported)")
+            intent_line(s.task_intent.as_deref(), s.intent_at)
         );
         // Nothing at all for a session that has published nothing, which is
         // every session in a fresh workspace: a row of empty labels reads as
@@ -1183,10 +1173,7 @@ fn whoami(session_id: Option<&str>) -> Result<()> {
     })?;
     println!("ortak-{} {} [{}]", s.id, s.agent_name, s.status);
     println!("  harness id: {}", s.external_id);
-    println!(
-        "  intent: {}",
-        s.task_intent.as_deref().unwrap_or("(not reported)")
-    );
+    println!("  {}", intent_line(s.task_intent.as_deref(), s.intent_at));
     Ok(())
 }
 
@@ -1368,6 +1355,7 @@ mod tests {
             session_id,
             agent_name: "claude-x".into(),
             intent: None,
+            intent_at: None,
             start: 1,
             end: 9,
             last_ts: 0,
