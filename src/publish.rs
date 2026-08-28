@@ -1329,14 +1329,26 @@ fn drop_excluded(files: &mut Vec<(String, String)>, exclude: &[String]) -> Vec<S
 }
 
 /// The remote somebody actually chose: `ortak.remote` in git config, then
-/// ortak.toml. `repo.config()` reads the global and system files too, so
-/// `git config --global ortak.remote fork` answers for every clone at once,
-/// which is the right scope for somebody who forks everything.
+/// ortak.toml, then git's own `remote.pushDefault`. `repo.config()` reads the
+/// global and system files too, so `git config --global ortak.remote fork`
+/// answers for every clone at once, which is the right scope for somebody who
+/// forks everything.
+///
+/// ortak's own keys come first, being statements about ortak. The last is a
+/// statement about git that ortak reads rather than asks to have repeated: a
+/// clone that already says where its branches go has answered this question,
+/// and being refused for not having said it in ortak's spelling as well is the
+/// bug.
+///
+/// ponytail: that key and not `branch.<name>.pushRemote`. Every branch ortak
+/// pushes is one it built a second ago, so nothing was ever configured for it,
+/// and reading another branch's key would be ortak deciding the two belong
+/// together.
 fn chosen_remote(repo: &Repository, cfg: &Config) -> Option<String> {
-    repo.config()
-        .and_then(|c| c.get_string("ortak.remote"))
-        .ok()
+    let git = |key: &str| repo.config().and_then(|c| c.get_string(key)).ok();
+    git("ortak.remote")
         .or_else(|| cfg.publish.remote.clone())
+        .or_else(|| git("remote.pushDefault"))
 }
 
 fn remote_names(repo: &Repository) -> Vec<String> {
@@ -2679,6 +2691,14 @@ mod tests {
         // Nothing configured anywhere.
         assert_eq!(remote_for(&repo, &cfg), "origin");
 
+        // What git was already told. A clone that pushes to a fork says so once
+        // in this key, and ortak used to reach past it to origin.
+        repo.config()
+            .unwrap()
+            .set_str("remote.pushDefault", "mine")
+            .unwrap();
+        assert_eq!(remote_for(&repo, &cfg), "mine");
+
         // ortak.toml alone still works, for anyone already relying on it.
         cfg.publish.remote = Some("upstream".into());
         assert_eq!(remote_for(&repo, &cfg), "upstream");
@@ -2728,6 +2748,15 @@ mod tests {
         cfg.publish.remote = Some("fork".into());
         assert!(unsettled_remote(&repo, &cfg).is_none());
         cfg.publish.remote = None;
+
+        // And so is git's own answer to the same question. This clone pushes to
+        // the fork every day; being refused for not having said it in ortak's
+        // spelling as well was the whole of the bug.
+        let mut config = repo.config().unwrap();
+        config.set_str("remote.pushDefault", "fork").unwrap();
+        assert!(unsettled_remote(&repo, &cfg).is_none());
+        assert_eq!(remote_for(&repo, &cfg), "fork");
+        config.remove("remote.pushDefault").unwrap();
 
         // A chosen remote that is not in this clone is still chosen: that push
         // reaches git and push_advice names what it looked for, which is a
