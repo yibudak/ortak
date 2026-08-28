@@ -24,9 +24,9 @@ version.
 | `ortak status --json` | Emit machine-readable status. |
 | `ortak sessions` | List sessions, intents, edit counts, and published branches. |
 | `ortak whoami [session-id]` | Resolve a harness session ID to its current `ortak-N`. |
-| `ortak log` | Show the 20 most recent journal entries. |
-| `ortak log --session ortak-2 --limit 50` | Filter and extend the journal view. |
-| `ortak log --json` | Emit machine-readable journal rows. |
+| `ortak log` | Show the 20 most recent journal entries, including any arbiter rulings. |
+| `ortak log --session ortak-2 --limit 50` | Filter and extend the journal view. A ruling matches on either side of it. |
+| `ortak log --json` | Emit machine-readable journal rows. Edits only. |
 | `ortak blame <file>[:line]` | Show current and historical ownership for a file or line. |
 | `ortak impact ortak-2` | Find active files that reference names changed by a session. |
 

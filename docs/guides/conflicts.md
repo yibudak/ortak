@@ -73,5 +73,19 @@ active owners with their regions and intents. It returns an `allow` or `deny`
 decision. Spawn failures, timeouts, invalid JSON, and unclear output fall back
 to the deterministic denial.
 
+Every call is recorded, whether or not it produced a decision, and the rows
+appear in `ortak log` beside the journal:
+
+```
+[03-11 14:22:07] arbiter conflict on src/db.rs: allow for ortak-4 claude-be11 over ortak-3, haiku 8812ms - the owner has moved on to the README
+[03-11 14:31:55] arbiter conflict on src/db.rs: no ruling for ortak-4 claude-be11 over ortak-3, haiku 20041ms (the arbiter ran out of time)
+```
+
+An allow leaves no other trace: the hook prints nothing and the edit proceeds
+exactly as an uncontested one would. The second line is the case worth reading
+for, because a fallback denies the edit with the same wording as a denial the
+arbiter reasoned about. `ortak log --session ortak-3` shows both sides of a
+ruling, so the owner whose region was defended can see that it was.
+
 See [Configuration](../reference/configuration.md#orchestrator) for global and
 workspace precedence.

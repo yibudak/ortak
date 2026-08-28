@@ -1198,18 +1198,36 @@ fn log(session: Option<&str>, limit: u32, as_json: bool) -> Result<()> {
         None => None,
     };
     if as_json {
+        // ponytail: the human log carries rulings, `--json` does not. That
+        // shape is a declared contract, an array of edit objects, and putting
+        // a second kind of object in it breaks every reader that parses it.
+        // Give rulings their own key when something needs to read them.
         return json::print(&json::edits(db.recent_edits(session_id, limit)?));
     }
+    // Two sources, one feed, newest first, and the limit applies to what the
+    // reader sees rather than to each source: a busy morning of edits should
+    // not push out the ruling that let one of them happen.
+    let mut feed: Vec<(i64, String)> = Vec::new();
     for e in db.recent_edits(session_id, limit)? {
         let t = db::fmt_local(e.ts, "%m-%d %H:%M:%S");
         let how = match db::attribution_note(e.attributed_by.as_deref()) {
             "" => String::new(),
             note => format!(", {}", note),
         };
-        println!(
-            "[{}] {:6} {} - {} (ortak-{}{})",
-            t, e.change_kind, e.file, e.agent_name, e.session_id, how
-        );
+        feed.push((
+            e.ts,
+            format!(
+                "[{}] {:6} {} - {} (ortak-{}{})",
+                t, e.change_kind, e.file, e.agent_name, e.session_id, how
+            ),
+        ));
+    }
+    for r in db.recent_rulings(session_id, limit)? {
+        feed.push((r.ts, orchestrator::log_line(&r)));
+    }
+    feed.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    for (_, line) in feed.iter().take(limit as usize) {
+        println!("{}", line);
     }
     Ok(())
 }

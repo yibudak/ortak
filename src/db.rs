@@ -340,6 +340,34 @@ impl Outage {
     }
 }
 
+/// One question put to the arbiter, on its way into the record. Written for
+/// every call, ruling or not: a fallback and a considered denial read the same
+/// from outside, and `outcome` is the only place the difference exists.
+#[derive(Debug, Clone)]
+pub struct Ruling {
+    pub kind: String,
+    /// The file under dispute. None for a blame ruling, which is about an error
+    /// rather than a place.
+    pub file: Option<String>,
+    /// The session the question was asked for: the one wanting in at the gate,
+    /// the one that reported the error at blame.
+    pub session_id: i64,
+    pub others: String,
+    pub decision: Option<String>,
+    pub message: Option<String>,
+    pub latency_ms: i64,
+    pub model: String,
+    pub outcome: String,
+}
+
+/// A recorded ruling on the way back out, with the two things the table does
+/// not hold itself.
+pub struct RulingRow {
+    pub ts: i64,
+    pub agent_name: String,
+    pub ruling: Ruling,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -463,6 +491,26 @@ CREATE TABLE IF NOT EXISTS journal_failures (
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+-- Every question put to the LLM arbiter and what came back, including the calls
+-- that came back with nothing. An allow leaves no other trace at all: the hook
+-- prints nothing and the edit proceeds exactly as an uncontested one would, so
+-- without this table the only evidence that a model was asked is nine seconds
+-- nobody was timing.
+-- ponytail: no retention. One row per conflicted edit and per tied blame, which
+-- is a handful a day; add a sweep if a workspace ever finds that expensive.
+CREATE TABLE IF NOT EXISTS rulings (
+  id         INTEGER PRIMARY KEY,
+  ts         INTEGER NOT NULL,
+  kind       TEXT NOT NULL,     -- 'conflict' | 'blame'
+  file       TEXT,              -- the file under dispute; NULL for a blame ruling
+  session_id INTEGER NOT NULL REFERENCES sessions(id),  -- who the question was asked for
+  others     TEXT NOT NULL,     -- the sessions on the other side, 'ortak-3,ortak-5'
+  decision   TEXT,              -- 'allow' | 'deny' | 'ortak-N'; NULL when nothing was decided
+  message    TEXT,              -- the sentence the arbiter wrote for the session
+  latency_ms INTEGER NOT NULL,
+  model      TEXT NOT NULL,
+  outcome    TEXT NOT NULL      -- 'ruled', or which silence this was
 );
 "#;
 
@@ -1948,6 +1996,62 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    // ---- arbiter rulings ------------------------------------------------
+
+    pub fn record_ruling(&self, r: &Ruling) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rulings
+                 (ts, kind, file, session_id, others, decision, message, latency_ms, model, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                now_ts(),
+                r.kind,
+                r.file,
+                r.session_id,
+                r.others,
+                r.decision,
+                r.message,
+                r.latency_ms,
+                r.model,
+                r.outcome
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Rulings newest first. `--session ortak-N` matches both sides of one,
+    /// because the session whose region was defended has more reason to read
+    /// the ruling than the one that asked: the wrapped-in-commas `LIKE` is
+    /// there so ortak-3 does not also answer for ortak-30.
+    pub fn recent_rulings(&self, session_id: Option<i64>, limit: u32) -> Result<Vec<RulingRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.ts, s.agent_name, r.kind, r.file, r.session_id, r.others, r.decision,
+                    r.message, r.latency_ms, r.model, r.outcome
+             FROM rulings r JOIN sessions s ON s.id = r.session_id
+             WHERE ?1 IS NULL OR r.session_id = ?1
+                OR (',' || r.others || ',') LIKE '%,ortak-' || ?1 || ',%'
+             ORDER BY r.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |r| {
+            Ok(RulingRow {
+                ts: r.get(0)?,
+                agent_name: r.get(1)?,
+                ruling: Ruling {
+                    kind: r.get(2)?,
+                    file: r.get(3)?,
+                    session_id: r.get(4)?,
+                    others: r.get(5)?,
+                    decision: r.get(6)?,
+                    message: r.get(7)?,
+                    latency_ms: r.get(8)?,
+                    model: r.get(9)?,
+                    outcome: r.get(10)?,
+                },
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
 
