@@ -146,10 +146,14 @@ pub struct Session {
 pub enum Attribution {
     Hook,
     Claim,
-    /// Two sessions had commands open, so the daemon declined to choose and the
-    /// edit went to the human. Its own value rather than a NULL: an unclaimed
-    /// write and a refused guess both land on the human session and read the
-    /// same in the journal, and only one of them is worth a reader's attention.
+    /// More than one session could have written it, so the daemon declined to
+    /// choose and the edit went to the human. Two shapes reach this, and since
+    /// #112 only one of them involves two commands: several claimants none of
+    /// whom has written the file, and a single claimant on a file another
+    /// active session has been writing. Its own value rather than a NULL: an
+    /// unclaimed write and a refused guess both land on the human session and
+    /// read the same in the journal, and only one of them is worth a reader's
+    /// attention.
     Contested,
     Claimed,
     /// Nothing named this write and nothing claimed it, but the session that
@@ -178,7 +182,9 @@ impl Attribution {
 pub fn attribution_note(attributed_by: Option<&str>) -> &'static str {
     match attributed_by {
         Some(s) if s == Attribution::Claim.as_str() => "inferred from a running command",
-        Some(s) if s == Attribution::Contested.as_str() => "two sessions had commands open",
+        Some(s) if s == Attribution::Contested.as_str() => {
+            "more than one session could have written it"
+        }
         Some(s) if s == Attribution::Claimed.as_str() => "claimed after the fact",
         Some(s) if s == Attribution::Settled.as_str() => {
             "rewritten right after that session wrote it"
@@ -2307,6 +2313,12 @@ mod tests {
             db.peek_hint("tests/end_to_end.rs", PRESENCE).unwrap(),
             Some((db.ensure_human().unwrap(), Attribution::Contested))
         );
+        // One command was open here, and for a while the marker on this row
+        // told its reader there had been two.
+        assert_eq!(
+            attribution_note(Some(Attribution::Contested.as_str())),
+            "more than one session could have written it"
+        );
     }
 
     /// Two commands open at once is the resting state of a two-agent
@@ -2404,8 +2416,11 @@ mod tests {
         // inference. The agent column already says so; do not mark it twice.
         assert_eq!(note("orphan.rs"), "");
         // This one also went to the human, but because the daemon refused to
-        // pick between two claims. That is a decision, and it shows.
-        assert_eq!(note("contested.rs"), "two sessions had commands open");
+        // pick an owner. That is a decision, and it shows.
+        assert_eq!(
+            note("contested.rs"),
+            "more than one session could have written it"
+        );
     }
 
     /// Backdate a session's stamp. The alternative is a test that waits half an
@@ -3240,7 +3255,10 @@ mod tests {
             attribution_note(o.attributed_by.as_deref())
         };
         assert_eq!(note_for(agent), "", "a hook reported this one");
-        assert_eq!(note_for(human), "two sessions had commands open");
+        assert_eq!(
+            note_for(human),
+            "more than one session could have written it"
+        );
     }
 
     /// The owner of a stopped line hears about it once. Once, because the gate
@@ -3376,13 +3394,13 @@ mod tests {
         wrote(1, 10, Some(Attribution::Hook));
         wrote(40, 2, Some(Attribution::Contested));
         assert_eq!(marker_at(5), "", "an ordinary line of the same file");
-        assert_eq!(marker_at(40), "two sessions had commands open");
+        assert_eq!(marker_at(40), "more than one session could have written it");
 
         // A contested write inside lines the session already owned takes them
         // off the older claim. Left there, the one line that really was
         // contested would be the one line reading as ordinary.
         wrote(5, 1, Some(Attribution::Contested));
-        assert_eq!(marker_at(5), "two sessions had commands open");
+        assert_eq!(marker_at(5), "more than one session could have written it");
         assert_eq!(marker_at(4), "");
         assert_eq!(marker_at(6), "");
     }
