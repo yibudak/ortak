@@ -110,6 +110,23 @@ fn suspects(excerpt: &str, reporter: i64, recent: &[(i64, String, String, i64)])
     per_session
 }
 
+/// Whether there is anything for the arbiter to arbitrate.
+///
+/// A tie is a hunt that found too much, and weighing two candidates against the
+/// error text is the job the model is good at. A zero score is a hunt that found
+/// nothing at all: no session's recent files appear in the output. There is no
+/// evidence to weigh there, and asked anyway the model does not decline, it
+/// reasons. Given ninety seconds and an `ImportError` naming a vendored file
+/// nobody had touched, it stopped the line on an innocent session and wrote a
+/// fix brief inventing a causal story about that session's own file. Stopping
+/// the line holds every other session in the workspace until the named owner
+/// runs `ortak resolved`, so it is the most expensive thing this tool can get
+/// wrong, and the deterministic answer for a hunt that found nothing was already
+/// right: the reporter keeps what it reported.
+fn worth_asking(enabled: bool, leaders: usize, best_score: u32) -> bool {
+    enabled && leaders != 1 && best_score > 0
+}
+
 /// An agent hit an error it believes is not its own: stop the line, hunt the
 /// culprit (file correlation, arbiter LLM, then the reporter), and
 /// record the obligation.
@@ -172,7 +189,7 @@ pub fn report(
     let (culprit, brief, how) = if leaders.len() == 1 {
         let l = leaders[0];
         (l.id, None, format!("file match: {}", l.matched.join(", ")))
-    } else if cfg.orchestrator.enabled {
+    } else if worth_asking(cfg.orchestrator.enabled, leaders.len(), best_score) {
         let candidates: Vec<(i64, String, Vec<String>)> = per_session
             .iter()
             .map(|s| (s.id, s.agent.clone(), s.files.clone()))
@@ -334,6 +351,24 @@ pub fn assign(ws: &Workspace, error_id: i64, session_ref: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arbiter settles a tie. It was also being asked when the hunt found
+    /// nothing to go on, which is not a tie between two candidates but a search
+    /// with no evidence in it, and the model answers that question too.
+    #[test]
+    fn a_hunt_that_found_nothing_is_not_a_question_for_the_arbiter() {
+        assert!(!worth_asking(true, 0, 0), "nobody implicated");
+        assert!(
+            !worth_asking(true, 3, 0),
+            "nobody implicated, several sessions"
+        );
+        assert!(worth_asking(true, 2, 4), "a real tie");
+        assert!(!worth_asking(false, 2, 4), "a real tie, arbiter off");
+        assert!(
+            !worth_asking(true, 1, 4),
+            "one leader needs nobody's opinion"
+        );
+    }
 
     fn score_of(found: &[Suspect], session: i64) -> u32 {
         found
