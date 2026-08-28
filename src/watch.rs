@@ -89,6 +89,18 @@ impl Seen {
 
     pub fn events(&mut self, t: &Tick, all: bool) -> Vec<Event> {
         let mut out = Vec::new();
+        // A journal that has been replaced starts its ids again, and this watch
+        // follows ids. Without this it would hold a high-water mark nothing can
+        // reach, go quiet, and look exactly like a workspace where nothing is
+        // happening. This project resets the journal between rounds.
+        if t.edits.last().is_some_and(|e| e.id < self.last_edit) {
+            *self = Seen::default();
+            out.push(Event::at(
+                t.now,
+                "watch",
+                "the journal was replaced under this watch, so it is starting again".to_string(),
+            ));
+        }
         let after = self.last_edit;
         for e in t.edits.iter().filter(|e| e.id > after) {
             out.extend(self.judge(e, t, all));
@@ -482,6 +494,30 @@ mod tests {
         );
         assert_eq!(tags(&seen.events(&tick(Vec::new()), false)), ["daemon"]);
         assert!(seen.events(&tick(Vec::new()), false).is_empty());
+    }
+
+    /// The failure a monitor cannot afford, because it looks like the good
+    /// case: the journal is reset, ids start again below the mark this watch is
+    /// holding, and every row after that is older than something that no longer
+    /// exists.
+    #[test]
+    fn a_journal_that_was_replaced_does_not_leave_the_watch_silent() {
+        let mut seen = Seen::default();
+        seen.prime(&tick(vec![edit(
+            900,
+            3,
+            "claude-a",
+            "src/db.rs",
+            Some(Attribution::Hook),
+        )]));
+        let fresh = seen.events(
+            &tick(vec![
+                edit(1, 3, "claude-a", "src/db.rs", Some(Attribution::Hook)),
+                edit(2, 1, "human", "src/db.rs", None),
+            ]),
+            false,
+        );
+        assert_eq!(tags(&fresh), vec!["watch", "person"]);
     }
 
     /// `--all` is the way to check what the filter is hiding, which is the one
