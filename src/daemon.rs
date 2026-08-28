@@ -95,6 +95,72 @@ fn stamp(path: &Path) -> (i64, u64) {
     (mtime, meta.len())
 }
 
+/// How many watches one user may hold, where the platform rations them.
+///
+/// Linux is the one that does. `notify` uses inotify there, which needs a watch
+/// descriptor per directory against `fs.inotify.max_user_watches`, commonly
+/// 8192; a tree of sixty repositories is well past that and the kernel answers
+/// by watching fewer directories rather than by failing, so changes under
+/// whatever it stopped at never reach the journal and nothing says a word.
+/// macOS takes one FSEvents stream for a whole tree and the size of it is free,
+/// which is why this has gone unnoticed: nobody has run ortak's daemon over a
+/// tree on Linux.
+///
+/// The limit is per user and shared with every other program watching files, so
+/// sitting under it is not a promise. Being over it is a certainty, and that is
+/// the half worth saying.
+///
+/// The file is the platform test, rather than `cfg(target_os)`: a branch
+/// compiled only for the platform nobody here can build for is a branch nobody
+/// here can check, and reading a path that does not exist answers the same
+/// question at the cost of one failed open per daemon start.
+fn watch_limit() -> Option<usize> {
+    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Directories at or under `root`, stopping once `cap` is reached. Capped
+/// because the answer this feeds is "more than the limit", and walking a tree
+/// of sixty repositories to find out how far past it is spends startup on a
+/// number nobody acts on differently.
+fn count_dirs(root: &Path, cap: usize) -> usize {
+    let mut seen = 1;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type` on a directory entry does not follow symlinks, so a
+            // link back up the tree does not turn this into a walk in circles.
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                seen += 1;
+                if seen >= cap {
+                    return seen;
+                }
+                stack.push(entry.path());
+            }
+        }
+    }
+    seen
+}
+
+fn over_budget(dirs: usize, limit: usize) -> Option<String> {
+    if dirs <= limit {
+        return None;
+    }
+    Some(format!(
+        "this workspace holds more directories than the {limit} watches this user may open \
+         (fs.inotify.max_user_watches), and the watch answers that by covering less of the tree \
+         rather than by failing: changes under whatever it stopped at will not reach the journal. \
+         Raise the limit with `sysctl fs.inotify.max_user_watches`, or run one daemon per \
+         repository instead of one over the tree"
+    ))
+}
+
 /// What the daemon recorded about itself, and whether the file it started from
 /// is still that file. `None` when nothing was recorded, or when the record
 /// cannot be read: a row written by another build must not be able to take
@@ -140,6 +206,13 @@ pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
         "foreground"
     };
     log(&format!("daemon started ({}): {}", how, ws.root.display()));
+    // One recursive watch is free on some platforms and rationed on others,
+    // and the rationed one does not refuse: it watches less.
+    if let Some(limit) = watch_limit() {
+        if let Some(problem) = over_budget(count_dirs(&ws.root, limit + 1), limit) {
+            log(&problem);
+        }
+    }
     // A heartbeat older than the alive threshold means nobody was watching, and
     // both ends of the gap are known: that last beat, and now. Read it before
     // this run's first heartbeat overwrites the only record of it.
@@ -648,6 +721,28 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         Db::open(&p).unwrap()
+    }
+
+    /// The count and the comparison run on every platform even though only one
+    /// rations watches, so the part that decides is exercised here rather than
+    /// only on the machine nobody has tried this on.
+    #[test]
+    fn a_tree_bigger_than_the_watch_budget_is_said_out_loud() {
+        let root = std::env::temp_dir().join(format!("ortak-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repos/a/models")).unwrap();
+        std::fs::create_dir_all(root.join("repos/b/models")).unwrap();
+        // root, repos, a, models, b, models.
+        assert_eq!(count_dirs(&root, 100), 6);
+        assert_eq!(count_dirs(&root, 3), 3, "the walk stops at the cap");
+
+        assert!(over_budget(6, 8192).is_none(), "an ordinary checkout");
+        let over = over_budget(count_dirs(&root, 4), 3).expect("past the limit");
+        assert!(
+            over.contains("fs.inotify.max_user_watches") && over.contains("not reach the journal"),
+            "the warning says neither what to raise nor what it costs: {over}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The whole bug: an update replaces the binary under a running daemon and
