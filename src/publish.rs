@@ -473,7 +473,7 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
         &commit_oid.to_string()[..8]
     );
     for (f, k) in &files {
-        println!("  {} {}", k, f);
+        println!("  {} {}", net_kind(&base_tree, &prefix, f, k), f);
     }
     if cooled > 0 {
         println!(
@@ -1123,6 +1123,17 @@ fn in_repo<'p>(prefix: &str, path: &'p str) -> &'p Path {
             .map_or(path, |r| r.trim_start_matches('/')),
     };
     Path::new(rel)
+}
+
+/// What the branch does to a file, which is not always what the journal's last
+/// row about it says. A file created and then edited leaves `modify` there, and
+/// a branch built on a base that has never held it is adding it. The base tree
+/// is the only thing that can answer, and it is already open.
+fn net_kind<'k>(base: &Tree, prefix: &str, file: &str, kind: &'k str) -> &'k str {
+    match kind == "delete" || base.get_path(in_repo(prefix, file)).is_ok() {
+        true => kind,
+        false => "create",
+    }
 }
 
 /// The repository this branch belongs in, and how far its files sit below the
@@ -3314,6 +3325,55 @@ mod tests {
         assert_eq!(db.publishes(me).unwrap().len(), 1);
         assert!(db.session_regions(me).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The summary a reviewer reads, against the branch's own base. A file the
+    /// session created and then edited leaves `modify` as the journal's last
+    /// word on it, and saying that about a file the branch is adding is the
+    /// summary describing somebody else's change.
+    #[test]
+    fn a_file_the_branch_adds_is_not_summarised_as_a_modification() {
+        let root = std::env::temp_dir().join(format!("ortak-netkind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repos/inner")).unwrap();
+        let repo = Repository::init(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "repos/\n").unwrap();
+        std::fs::write(root.join("there.rs"), "old\n").unwrap();
+        commit_everything(&repo);
+        let base = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+
+        assert_eq!(net_kind(&base, "", "there.rs", "modify"), "modify");
+        assert_eq!(net_kind(&base, "", "new.rs", "modify"), "create");
+        assert_eq!(
+            net_kind(&base, "", "gone.rs", "delete"),
+            "delete",
+            "a file the base never had cannot be deleted into existence"
+        );
+
+        // A nested repository's own base holds its own paths, so the prefix has
+        // to come off first or every file it publishes reads as new.
+        let inner = Repository::init(root.join("repos/inner")).unwrap();
+        std::fs::write(root.join("repos/inner/there.rs"), "old\n").unwrap();
+        commit_everything(&inner);
+        let nested = inner
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(nested.get_path(Path::new("repos/inner/there.rs")).is_err());
+        assert_eq!(
+            net_kind(&nested, "repos/inner", "repos/inner/there.rs", "modify"),
+            "modify"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn commit_everything(repo: &Repository) {
