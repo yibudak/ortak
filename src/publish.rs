@@ -3434,7 +3434,13 @@ mod tests {
     /// `16.0` whose `.gitignore` hides `repos/`, and a repository inside it with
     /// a trunk of its own.
     fn nested_workspace(name: &str) -> (std::path::PathBuf, Repository, Repository) {
-        let root = std::env::temp_dir().join(format!("ortak-{name}-{}", std::process::id()));
+        // Named for this module as well as the case. Every test in the binary
+        // shares one pid and one temp directory, they run in parallel, and each
+        // of these starts by deleting its root, so a name another module also
+        // reaches for is a test that wipes another test's tree mid-run. That is
+        // what "nested" did to `the_baseline_covers_a_repository_the_root_ignores`.
+        let root =
+            std::env::temp_dir().join(format!("ortak-publish-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("repos/inner/models")).unwrap();
         let mut opts = git2::RepositoryInitOptions::new();
