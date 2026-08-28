@@ -1903,6 +1903,30 @@ impl Db {
             .optional()?;
         Ok(v.and_then(|s| serde_json::from_str(&s).ok()))
     }
+
+    /// What the daemon watching this workspace is running, as the daemon
+    /// wrote it. Opaque here on purpose, unlike the outage above: db.rs
+    /// stores the record and `daemon` is the only place that knows its
+    /// shape, so a change to what a build is made of never reaches this file.
+    pub fn record_daemon_build(&self, build: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('daemon_build', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![build],
+        )?;
+        Ok(())
+    }
+
+    pub fn daemon_build(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'daemon_build'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
 }
 
 fn row_to_error(r: &rusqlite::Row<'_>) -> rusqlite::Result<ErrorRow> {

@@ -670,12 +670,31 @@ fn status(as_json: bool) -> Result<()> {
             behind_base,
         )?);
     }
-    match db.heartbeat_age()? {
+    let age = db.heartbeat_age()?;
+    match age {
         Some(age) if age <= HEARTBEAT_ALIVE_SECS => {
             println!("daemon: running (last heartbeat {}s ago)", age)
         }
         Some(age) => println!("daemon: NOT RUNNING (last heartbeat {}s ago)", age),
         None => println!("daemon: never started"),
+    }
+    // A daemon holds the binary it was started from for as long as it runs,
+    // while the hooks resolve ortak from PATH afresh on every call, so an
+    // update mid-session leaves two programs writing one journal. Only worth
+    // saying while a daemon is alive: once it stops, the record it left is
+    // about a process that is gone too.
+    if age.is_some_and(|a| a <= HEARTBEAT_ALIVE_SECS) {
+        if let Some((build, false)) = daemon::running_build(&db) {
+            println!(
+                "daemon build: it started from {} (ortak {}), and that is not the file \
+                 there now; the hooks read ortak from PATH on every call, so two builds \
+                 are writing this journal",
+                build.path, build.version
+            );
+            println!(
+                "  restart it to catch up: `ortak daemon --stop`, then `ortak daemon --detach`"
+            );
+        }
     }
     // Working out what a stopped daemon cost used to be a manual job: read the
     // heartbeat, work out the window, warn the other session in prose. Every

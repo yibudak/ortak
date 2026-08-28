@@ -40,6 +40,22 @@ pub struct Daemon {
     pub running: bool,
     /// Seconds since the last heartbeat, null if the daemon never started.
     pub heartbeat_age_secs: Option<i64>,
+    /// The binary the daemon is running. Null when no daemon has recorded
+    /// one here, which is a workspace last watched by a build older than
+    /// this field.
+    pub build: Option<Build>,
+}
+
+/// What the daemon was started from. `current: false` and `running: true`
+/// together are a workspace whose daemon and whose hooks are different
+/// programs writing one journal.
+#[derive(Serialize)]
+pub struct Build {
+    pub version: String,
+    pub path: String,
+    /// False once the file at `path` is no longer the one the daemon is
+    /// running, because somebody replaced or removed it while it stayed up.
+    pub current: bool,
 }
 
 /// Whether the daemon is managing to record what it sees. A healthy heartbeat
@@ -210,6 +226,11 @@ pub fn status(db: &Db, presence_secs: i64, behind_base: Option<(String, i64)>) -
         daemon: Daemon {
             running: age.is_some_and(|a| a <= crate::db::HEARTBEAT_ALIVE_SECS),
             heartbeat_age_secs: age,
+            build: crate::daemon::running_build(db).map(|(b, current)| Build {
+                version: b.version,
+                path: b.path,
+                current,
+            }),
         },
         journal: Journal {
             failing_files: failing.len(),
@@ -267,6 +288,11 @@ mod tests {
             daemon: Daemon {
                 running: true,
                 heartbeat_age_secs: Some(3),
+                build: Some(Build {
+                    version: "0.3.0".into(),
+                    path: "/home/x/.local/bin/ortak".into(),
+                    current: false,
+                }),
             },
             journal: Journal {
                 failing_files: 1,
@@ -314,7 +340,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&payload).unwrap(),
-            r#"{"daemon":{"running":true,"heartbeat_age_secs":3},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"workspace":{"base_branch":"main","commits_behind":83},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","last_seen":1700000000,"edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"waiting_messages":[{"session":"ortak-3","agent":"claude-75c6","stopped":false,"count":2,"oldest_ts":1700000000}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
+            r#"{"daemon":{"running":true,"heartbeat_age_secs":3,"build":{"version":"0.3.0","path":"/home/x/.local/bin/ortak","current":false}},"journal":{"failing_files":1,"newest_failure":{"file":"src/db.rs","reason":"the index is locked","streak":4,"ts":1700000000}},"workspace":{"base_branch":"main","commits_behind":83},"sessions":[{"session":"ortak-2","agent":"claude-be11","harness":"claude-code","intent":"wire up the gate","status":"active","last_seen":1700000000,"edits":7,"branches":[{"branch":"feat/the-gate","published_at":1700000000,"edits_since":2}]}],"waiting_messages":[{"session":"ortak-3","agent":"claude-75c6","stopped":false,"count":2,"oldest_ts":1700000000}],"regions":[{"file":"src/db.rs","start":12,"end":40,"whole_file":false,"owner":"ortak-2","agent":"claude-be11","age_secs":90}]}"#
         );
     }
 

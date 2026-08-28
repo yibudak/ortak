@@ -14,10 +14,46 @@ const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/yibudak/ortak/rel
 pub fn run() -> Result<()> {
     let executable =
         std::env::current_exe().context("could not locate the current ortak binary")?;
-    run_with(&mut System, &executable)
+    // The daemon is the half of ortak that does not pick the new binary up:
+    // it holds the one it started with, and the hooks resolve ortak from PATH
+    // on every call, so from here the two are different programs.
+    if run_with(&mut System, &executable)? {
+        println!("{}", daemon_note(live_daemon_here().as_deref()));
+    }
+    Ok(())
 }
 
-fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
+/// Nothing on disk lists ortak workspaces, so the only daemon this command can
+/// name is one in the directory it was run from. `ortak status` is what catches
+/// the rest, and it now says when a daemon is running a build that has moved.
+fn daemon_note(here: Option<&str>) -> String {
+    let restart = "`ortak daemon --stop`, then `ortak daemon --detach`";
+    match here {
+        Some(root) => format!(
+            "The daemon on {root} is still running the build it started with. Restart it: \
+             {restart}. No file lists the other workspaces, so `ortak status` in each is \
+             what catches theirs."
+        ),
+        None => format!(
+            "A running daemon keeps the build it started with, so restart the daemon in any \
+             workspace that has one: {restart}. `ortak status` there says when one is behind."
+        ),
+    }
+}
+
+/// The workspace root this command was run in, when a daemon is alive in it.
+fn live_daemon_here() -> Option<String> {
+    let ws = crate::workspace::Workspace::discover_from_cwd().ok()?;
+    let db = crate::db::Db::open(&ws.db_path).ok()?;
+    db.heartbeat_age()
+        .ok()?
+        .filter(|age| *age <= crate::db::HEARTBEAT_ALIVE_SECS)?;
+    Some(ws.root.display().to_string())
+}
+
+/// Whether anything was replaced, so the caller knows whether a restart is
+/// worth mentioning.
+fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<bool> {
     let latest = latest_version(runtime)?;
     let mut failures = Vec::new();
     let mut updated = false;
@@ -46,7 +82,7 @@ fn run_with(runtime: &mut impl Runtime, executable: &Path) -> Result<()> {
     } else {
         println!("\nortak is already up to date.");
     }
-    Ok(())
+    Ok(updated)
 }
 
 fn latest_version(runtime: &mut impl Runtime) -> Result<String> {
