@@ -73,7 +73,7 @@ const LIVE_CLAIMANTS: &str =
 /// copy, because a query that selects them in another order fills the fields
 /// with each other's values and nothing complains.
 const SESSION_COLS: &str =
-    "id, external_id, agent_name, kind, harness, task_intent, status, started_at, last_seen";
+    "id, external_id, agent_name, kind, harness, task_intent, status, started_at, last_seen, intent_at";
 /// Daemon heartbeat is considered alive if newer than this (seconds).
 pub const HEARTBEAT_ALIVE_SECS: i64 = 15;
 /// How long an outage is still worth reporting in `status` (seconds). The
@@ -108,6 +108,38 @@ pub fn fmt_local(ts: i64, fmt: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Rough age for someone reading a list: whichever unit keeps it short.
+///
+/// Lives here rather than in `main` because the gate and the arbiter prompt
+/// need the same words for it: a staleness printed three ways is three things
+/// a reader has to convert before they can compare them.
+pub fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 90 => format!("{}s ago", s),
+        s if s < 5400 => format!("{} min ago", s / 60),
+        s if s < 172_800 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86400),
+    }
+}
+
+/// An intent, with how long ago the session said it.
+///
+/// The age is the point. A session that wrote "rewriting the header" four hours
+/// and three tasks ago argued exactly as well as one that wrote it a minute
+/// ago, to a person reading `ortak status` and to the arbiter, whose whole case
+/// for overruling the gate is what these sentences say.
+///
+/// A session that recorded one before this column existed keeps its sentence
+/// and is said to have no time on it. Backfilling a plausible one would put the
+/// tool's own guess where its evidence goes.
+pub fn intent_line(intent: Option<&str>, intent_at: Option<i64>) -> String {
+    match (intent, intent_at) {
+        (None, _) => "intent: (not reported)".to_string(),
+        (Some(text), Some(ts)) => format!("intent (recorded {}): {text}", ago(now_ts() - ts)),
+        (Some(text), None) => format!("intent (recorded before ortak stamped intents): {text}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: i64,
@@ -130,6 +162,10 @@ pub struct Session {
     /// exception is the Bash claim, which nobody is there to weigh: see
     /// `CLAIM_STALE_SECS`.
     pub last_seen: Option<i64>,
+    /// When `task_intent` was last recorded. Null on a session that has never
+    /// reported one, and on a row written before the stamp existed: see
+    /// `intent_line`, which is where the difference is said out loud.
+    pub intent_at: Option<i64>,
 }
 
 /// How the daemon worked out who owns an edit. An edit hook naming the file is
@@ -275,6 +311,12 @@ pub struct Conflict {
     pub session_id: i64,
     pub agent_name: String,
     pub intent: Option<String>,
+    /// When the owner recorded that intent. The gate and the arbiter both weigh
+    /// the sentence, and until this was here neither could ask its age. The
+    /// allow goes when the gate denial and the arbiter prompt start reading it:
+    /// both live in `hooks` and `orchestrator`, and both are one line.
+    #[allow(dead_code)]
+    pub intent_at: Option<i64>,
     pub start: i64,
     pub end: i64,
     pub last_ts: i64,
@@ -286,6 +328,7 @@ pub struct Owner {
     pub session_id: i64,
     pub agent_name: String,
     pub intent: Option<String>,
+    pub intent_at: Option<i64>,
     pub start: i64,
     pub end: i64,
     pub last_ts: i64,
@@ -352,6 +395,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   kind         TEXT NOT NULL,             -- 'llm' | 'human'
   harness      TEXT,
   task_intent  TEXT,
+  intent_at    INTEGER,                   -- when task_intent was recorded
   status       TEXT NOT NULL DEFAULT 'active', -- 'active' | 'done'
   started_at   INTEGER NOT NULL,
   ended_at     INTEGER,
@@ -489,6 +533,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE regions ADD COLUMN attributed_by TEXT", []);
         let _ = conn.execute("ALTER TABLE hints ADD COLUMN closed_at INTEGER", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen INTEGER", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN intent_at INTEGER", []);
         Ok(Db { conn })
     }
 
@@ -567,10 +612,14 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Record a session's intent, and when it said so. The two are written
+    /// together because a sentence and its age are one piece of evidence: an
+    /// intent updated without moving the stamp would read as fresh forever,
+    /// which is the failure this column was added to stop.
     pub fn set_intent(&self, session_id: i64, intent: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET task_intent = ?2 WHERE id = ?1",
-            params![session_id, intent],
+            "UPDATE sessions SET task_intent = ?2, intent_at = ?3 WHERE id = ?1",
+            params![session_id, intent, now_ts()],
         )?;
         Ok(())
     }
@@ -1373,7 +1422,8 @@ impl Db {
     ) -> Result<Vec<Conflict>> {
         let cutoff = now_ts() - presence_secs;
         let mut stmt = self.conn.prepare(
-            "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
+            "SELECT r.session_id, s.agent_name, s.task_intent, s.intent_at,
+                    r.start_line, r.end_line,
                     (SELECT MAX(e.ts) FROM edits e
                       WHERE e.session_id = r.session_id AND e.file = r.file) AS last_ts
              FROM regions r JOIN sessions s ON s.id = r.session_id
@@ -1399,9 +1449,10 @@ impl Db {
                             session_id: r.get(0)?,
                             agent_name: r.get(1)?,
                             intent: r.get(2)?,
-                            start: r.get(3)?,
-                            end: r.get(4)?,
-                            last_ts: r.get(5)?,
+                            intent_at: r.get(3)?,
+                            start: r.get(4)?,
+                            end: r.get(5)?,
+                            last_ts: r.get(6)?,
                         })
                     },
                 )?
@@ -1425,7 +1476,8 @@ impl Db {
     /// unwriting it.
     pub fn file_regions(&self, file: &str) -> Result<Vec<Owner>> {
         let mut stmt = self.conn.prepare(
-            "SELECT r.session_id, s.agent_name, s.task_intent, r.start_line, r.end_line,
+            "SELECT r.session_id, s.agent_name, s.task_intent, s.intent_at,
+                    r.start_line, r.end_line,
                     COALESCE((SELECT MAX(e.ts) FROM edits e
                                WHERE e.session_id = r.session_id AND e.file = r.file), 0),
                     r.attributed_by
@@ -1438,14 +1490,15 @@ impl Db {
                 session_id: r.get(0)?,
                 agent_name: r.get(1)?,
                 intent: r.get(2)?,
-                start: r.get(3)?,
-                end: r.get(4)?,
-                last_ts: r.get(5)?,
+                intent_at: r.get(3)?,
+                start: r.get(4)?,
+                end: r.get(5)?,
+                last_ts: r.get(6)?,
                 // From the region, so it speaks for these lines and no others.
                 // Read off the session's newest edit on the file, it marked
                 // every line the session owned there, including the ones a
                 // hook had named perfectly well.
-                attributed_by: r.get(6)?,
+                attributed_by: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1989,6 +2042,7 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status: r.get(6)?,
         started_at: r.get(7)?,
         last_seen: r.get(8)?,
+        intent_at: r.get(9)?,
     })
 }
 
@@ -3443,5 +3497,74 @@ mod tests {
         assert_eq!(marker_at(5), "more than one session could have written it");
         assert_eq!(marker_at(4), "");
         assert_eq!(marker_at(6), "");
+    }
+
+    /// The gate and the arbiter read an owner's intent to decide whether to let
+    /// somebody else in, so the age has to survive the trip out of the journal
+    /// and a row that predates the stamp has to say so rather than read as new.
+    #[test]
+    fn an_intent_says_how_old_it_is() {
+        let db = db();
+        let owner = session(&db, "claude-a");
+        let onlooker = session(&db, "claude-b");
+        db.set_intent(owner, "rewriting the header").unwrap();
+        owns(&db, owner, "src/app.rs", 10, 5);
+        let held = || {
+            db.conflicts(
+                "src/app.rs",
+                &[Region { start: 12, end: 12 }],
+                onlooker,
+                3,
+                1800,
+            )
+            .unwrap()
+            .pop()
+            .expect("the owner holds these lines")
+        };
+        let said = |c: &Conflict| intent_line(c.intent.as_deref(), c.intent_at);
+
+        let backdate = |secs: i64| {
+            db.conn
+                .execute(
+                    "UPDATE sessions SET intent_at = ?2 WHERE id = ?1",
+                    params![owner, now_ts() - secs],
+                )
+                .unwrap();
+        };
+        backdate(4 * 3600);
+        assert_eq!(
+            said(&held()),
+            "intent (recorded 4 h ago): rewriting the header"
+        );
+
+        // The whole point of the column: saying something new moves the stamp.
+        // An intent that kept the time of the first one it replaced would argue
+        // its case as a fresh sentence for the rest of the session.
+        db.set_intent(owner, "on to the README now").unwrap();
+        assert_eq!(
+            said(&held()),
+            "intent (recorded 0s ago): on to the README now"
+        );
+
+        // A journal from before this column. The sentence is real and its age
+        // is not knowable, and inventing one would put a guess where the
+        // arbiter's evidence goes.
+        db.conn
+            .execute(
+                "UPDATE sessions SET intent_at = NULL WHERE id = ?1",
+                params![owner],
+            )
+            .unwrap();
+        assert_eq!(
+            said(&held()),
+            "intent (recorded before ortak stamped intents): on to the README now"
+        );
+
+        // And a session that never reported one reads exactly as it always did.
+        let quiet = db.get_session(onlooker).unwrap();
+        assert_eq!(
+            intent_line(quiet.task_intent.as_deref(), quiet.intent_at),
+            "intent: (not reported)"
+        );
     }
 }
