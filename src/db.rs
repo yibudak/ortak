@@ -311,11 +311,9 @@ pub struct Conflict {
     pub session_id: i64,
     pub agent_name: String,
     pub intent: Option<String>,
-    /// When the owner recorded that intent. The gate and the arbiter both weigh
-    /// the sentence, and until this was here neither could ask its age. The
-    /// allow goes when the gate denial and the arbiter prompt start reading it:
-    /// both live in `hooks` and `orchestrator`, and both are one line.
-    #[allow(dead_code)]
+    /// When the owner recorded that intent. The gate denial and the arbiter
+    /// prompt both weigh the sentence, and until this was here neither could
+    /// ask its age.
     pub intent_at: Option<i64>,
     pub start: i64,
     pub end: i64,
