@@ -85,6 +85,7 @@ session. `ortak publish` replays one session's journal onto a clean branch.
 | --- | --- |
 | Show the current session | `ortak whoami` |
 | Check daemon and sessions | `ortak status` |
+| Leave a window watching the workspace | `ortak watch` |
 | Update Ortak and agent plugins | `ortak update` |
 | Read one session's journal | `ortak log --session ortak-2` |
 | Find who owns a line | `ortak blame src/publish.rs:120` |

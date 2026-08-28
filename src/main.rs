@@ -14,6 +14,7 @@ mod regions;
 mod shadow;
 mod uninstall;
 mod update;
+mod watch;
 mod workspace;
 
 use anyhow::Result;
@@ -68,6 +69,20 @@ enum Command {
         /// Emit JSON for another program to read
         #[arg(long)]
         json: bool,
+    },
+    /// Watch the workspace and print a line when something is worth one
+    ///
+    /// Silence is the normal output: a write that crosses sessions, one that
+    /// lands on the person while agents are working, a contested write, the
+    /// daemon stopping or running a build that is no longer on disk, and the
+    /// line stopping or opening again.
+    Watch {
+        /// Seconds between reads
+        #[arg(long, default_value_t = 45)]
+        interval: u64,
+        /// Print every journal row, including the ones the filter holds back
+        #[arg(long)]
+        all: bool,
     },
     /// Show recent journal entries
     Log {
@@ -352,6 +367,9 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Status { json } => status(json),
+        Command::Watch { interval, all } => {
+            watch::run(&Workspace::discover_from_cwd()?, interval, all)
+        }
         Command::Log {
             session,
             limit,
