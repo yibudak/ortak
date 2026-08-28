@@ -22,7 +22,7 @@ Use the global file for settings shared by several checkouts:
 enabled = true
 command = "claude"
 model = "haiku"
-timeout_secs = 20
+timeout_secs = 45
 ```
 
 Override one field in a workspace:
@@ -132,7 +132,7 @@ mid_write_seconds = 90
 enabled = false
 command = "claude"
 model = "haiku"
-timeout_secs = 20
+timeout_secs = 45
 ```
 
 | Field | Default | Meaning |
@@ -140,7 +140,7 @@ timeout_secs = 20
 | `enabled` | `false` | Ask the LLM arbiter about conflicts and ambiguous error ownership. |
 | `command` | `claude` | Executable launched for each ruling. |
 | `model` | `haiku` | Value passed to the executable's `--model` option. |
-| `timeout_secs` | `20` | Wall-clock limit for one arbiter subprocess. |
+| `timeout_secs` | `45` | Wall-clock limit for one arbiter subprocess. |
 
 ortak launches the command in this fixed form:
 
@@ -154,4 +154,14 @@ subprocess inherits its environment and authentication, runs from the system
 temporary directory, and receives no stdin.
 
 Any spawn error, non-zero exit, timeout, invalid JSON, or invalid session ID
-returns control to the deterministic fallback.
+returns control to the deterministic fallback, which says which of them happened:
+the gate denial names it, the stop-the-line report names it, and `ortak log`
+records every call with its latency.
+
+Set `timeout_secs` above the latency you actually see, not below it. A ruling
+that arrives late is discarded, at the gate a discarded ruling denies the edit,
+and the session is then refused by a rule rather than by a decision. Most of the
+wall clock is process startup rather than the model, so a first call is slower
+than the ones after it, and measured calls have run past 25 seconds. The ceiling
+is the harness: an agent that kills its own pre-edit hook leaves nothing deciding
+the edit at all.

@@ -160,16 +160,20 @@ fn conflict_prompt(file: &str, my: &Session, conflicts: &[Conflict]) -> String {
 }
 
 /// Conflict ruling: may the second toucher proceed right now?
-/// Returns (allow, message) or None for deterministic fallback. Either way a
-/// row lands in `rulings`, because an allow is otherwise indistinguishable
-/// from there having been no conflict at all.
+///
+/// `Ok((allow, message))` is a decision. `Err` is the deterministic fallback,
+/// carrying the outcome tag so the caller can say which silence this was: a
+/// gate that denies because nobody answered should not word itself like a gate
+/// that denies because somebody did. Either way a row lands in `rulings`,
+/// because an allow is otherwise indistinguishable from there having been no
+/// conflict at all.
 pub fn conflict_verdict(
     db: &Db,
     cfg: &OrchestratorCfg,
     file: &str,
     my: &Session,
     conflicts: &[Conflict],
-) -> Option<(bool, String)> {
+) -> Result<(bool, String), &'static str> {
     let prompt = conflict_prompt(file, my, conflicts);
     let started = Instant::now();
     let verdict = run_model(cfg, &prompt).and_then(|out| read_conflict(&out).ok_or(UNREADABLE));
@@ -198,7 +202,7 @@ pub fn conflict_verdict(
         model: cfg.model.clone(),
         outcome: outcome.to_string(),
     });
-    verdict.ok()
+    verdict
 }
 
 fn read_conflict(out: &str) -> Option<(bool, String)> {
@@ -214,7 +218,8 @@ fn read_conflict(out: &str) -> Option<(bool, String)> {
 
 /// Blame ruling for an ambiguous error: which session must fix it?
 /// `candidates` are (label, files) pairs, e.g. ("ortak-3 claude-ab12", [...]).
-/// Returns (session_id, fix_brief) or None for deterministic fallback.
+/// `Ok((session_id, fix_brief))`, or the outcome tag for the deterministic
+/// fallback, which hands the error back to the reporter and should say why.
 pub fn blame_verdict(
     db: &Db,
     cfg: &OrchestratorCfg,
@@ -222,7 +227,7 @@ pub fn blame_verdict(
     reporter: i64,
     reporter_label: &str,
     candidates: &[(i64, String, Vec<String>)],
-) -> Option<(i64, String)> {
+) -> Result<(i64, String), &'static str> {
     let mut list = String::new();
     for (id, label, files) in candidates.iter().take(10) {
         list.push_str(&format!("- ortak-{} {}: {}\n", id, label, files.join(", ")));
@@ -265,7 +270,7 @@ pub fn blame_verdict(
         model: cfg.model.clone(),
         outcome: outcome.to_string(),
     });
-    verdict.ok()
+    verdict
 }
 
 fn read_blame(out: &str) -> Option<(i64, String)> {

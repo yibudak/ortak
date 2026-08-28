@@ -64,8 +64,22 @@ fn default_orc_command() -> String {
 fn default_orc_model() -> String {
     "haiku".into()
 }
+/// Over the tail of a real ruling, and under the harness's own patience.
+///
+/// 20 was under it. A conflicted edit measured on this project took 26.6s with
+/// haiku and 21.9s with sonnet on the case that ends in an allow, and a blame
+/// call was killed at 20.5s, so the shipped default was throwing away rulings
+/// at a rate nobody could see: at the gate silence means deny, and the denial
+/// that comes back reads exactly like one the model reasoned about. The floor
+/// under all of it is four to six seconds of CLI startup before any model
+/// thinks, and a first call in a session is slower still.
+///
+/// The ceiling is the other side. A Claude Code `PreToolUse` hook is killed at
+/// 60s by default, and a gate the harness kills is worse than one that gives up
+/// on its own, because nothing then decides the edit at all. 45 sits above
+/// every latency measured here and leaves the harness room.
 fn default_orc_timeout() -> u64 {
-    20
+    45
 }
 
 impl Default for OrchestratorCfg {
@@ -211,7 +225,7 @@ mid_write_seconds = 90
 # enabled = true
 # command = "claude"
 # model = "haiku"
-# timeout_secs = 20
+# timeout_secs = 45
 "#
         )
     }

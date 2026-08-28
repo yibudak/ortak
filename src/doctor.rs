@@ -577,7 +577,10 @@ mod tests {
         let found = arbiter_check(&cfg);
         assert_eq!(found.state, State::Ok);
         assert!(
-            found.detail.contains(&cfg.orchestrator.model) && found.detail.contains("20s"),
+            found.detail.contains(&cfg.orchestrator.model)
+                && found
+                    .detail
+                    .contains(&format!("{}s", cfg.orchestrator.timeout_secs)),
             "the report cannot tell haiku from sonnet: {}",
             found.detail
         );

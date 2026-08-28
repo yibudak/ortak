@@ -203,11 +203,17 @@ pub fn report(
             &reporter_label,
             &candidates,
         ) {
-            Some((id, brief)) => (id, Some(brief), "arbiter verdict".to_string()),
-            None => (
+            Ok((id, brief)) => (id, Some(brief), "arbiter verdict".to_string()),
+            // Which silence it was. The reporter keeps the error either way,
+            // but a model that considered the case and a model that never ran
+            // are different reasons to be holding it.
+            Err(why) => (
                 reporter.id,
                 None,
-                "arbiter returned no answer; reporter owns the error by default".to_string(),
+                format!(
+                    "no arbiter ruling, {}; reporter owns the error by default",
+                    orchestrator::outcome_note(why)
+                ),
             ),
         }
     } else {
