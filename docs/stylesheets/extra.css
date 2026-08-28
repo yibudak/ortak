@@ -23,6 +23,12 @@
   --md-primary-fg-color--dark: #04132d;
   --md-accent-fg-color: #c87b00;
   --md-code-bg-color: #eef3f8;
+  /* The plate behind the copy button. Material derives these two from its own
+     code background, so a custom scheme that names only the base colour keeps
+     a near-white wash here. Invisible on a light block, a pale box on a dark
+     one. */
+  --md-code-bg-color--light: rgba(19, 42, 72, 0.09);
+  --md-code-bg-color--lighter: rgba(19, 42, 72, 0.035);
   --md-code-fg-color: #132a48;
   --md-code-hl-color: #315fa8;
   --md-code-hl-color--light: #315fa81a;
@@ -66,6 +72,9 @@
   --md-primary-fg-color--dark: #040d1c;
   --md-accent-fg-color: #ffb454;
   --md-code-bg-color: #101c31;
+  /* See the light scheme: without these the plate is #f5f5f5 at 30 per cent. */
+  --md-code-bg-color--light: rgba(151, 180, 218, 0.15);
+  --md-code-bg-color--lighter: rgba(151, 180, 218, 0.05);
   --md-code-fg-color: #e8eef7;
   --md-code-hl-color: #8fb4ff;
   --md-code-hl-color--light: #8fb4ff1a;
@@ -158,18 +167,25 @@ pre {
   border-radius: 0.75rem;
 }
 
-/* The copy button sits inside the code block's own rounded border, and at rest
-   Material draws it bright enough to read as a second outline rather than as a
-   control. Recede until the block is hovered or the button is tabbed to. */
-.md-typeset .md-clipboard {
-  top: 0.6rem;
-  right: 0.6rem;
+/* Material positions the code buttons in a `nav` of their own, tight to the
+   corner and squarer than the block they sit in. Pull the plate clear of the
+   rounded border and follow its radius. */
+.md-typeset .md-code__nav {
+  top: 0.5rem;
+  right: 0.5rem;
+  border-radius: 0.4rem;
+}
+
+/* At rest the button inherits a foreground light enough to read as a second
+   outline rather than as a control. Recede until the block is hovered or the
+   button is tabbed to. */
+.md-typeset .md-code__button {
   color: var(--ortak-code-line);
   transition: color 125ms;
 }
 
-.md-typeset .highlight:hover .md-clipboard,
-.md-typeset .md-clipboard:focus-visible {
+.md-typeset .highlight:hover .md-code__button,
+.md-typeset .md-code__button:focus-visible {
   color: var(--md-accent-fg-color);
 }
 
