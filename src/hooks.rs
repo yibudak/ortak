@@ -527,15 +527,9 @@ fn verdict(
     // the deterministic first-toucher denial. Referee silence means deny.
     if cfg.orchestrator.enabled {
         let my = db.get_session(me)?;
-        if let Some((allow, message)) = crate::orchestrator::conflict_verdict(
-            &db,
-            &cfg.orchestrator,
-            &rel,
-            me,
-            &my.agent_name,
-            my.task_intent.as_deref().unwrap_or("(not reported)"),
-            &conflicts,
-        ) {
+        if let Some((allow, message)) =
+            crate::orchestrator::conflict_verdict(&db, &cfg.orchestrator, &rel, &my, &conflicts)
+        {
             if allow {
                 return Ok(None);
             }
@@ -554,13 +548,13 @@ fn verdict(
     for c in conflicts.iter().take(3) {
         let mins = ((crate::db::now_ts() - c.last_ts) / 60).max(0);
         reason.push_str(&format!(
-            "- ortak-{} {} (lines {}-{}, last edit {} min ago), intent: {}\n",
+            "- ortak-{} {} (lines {}-{}, last edit {} min ago), {}\n",
             c.session_id,
             c.agent_name,
             c.start,
             c.end,
             mins,
-            c.intent.as_deref().unwrap_or("(not reported)")
+            crate::db::intent_line(c.intent.as_deref(), c.intent_at)
         ));
     }
     reason.push_str(&format!(
