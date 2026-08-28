@@ -60,6 +60,11 @@ struct Check {
 
 #[derive(Serialize)]
 struct Report {
+    /// Nothing failed. A skipped check is not a quiet failure: the three that
+    /// are skipped for a workspace whose root holds no repository are skipped
+    /// because each repository under it answers them for itself, and requiring
+    /// every check to be `Ok` reported that such a workspace could not publish
+    /// while the report beside it said how to.
     can_publish: bool,
     checks: Vec<Check>,
 }
@@ -97,7 +102,7 @@ fn skipped(check: &'static str, detail: impl Into<String>) -> Check {
 /// check is non-zero.
 pub fn run(ws: &Workspace, cfg: &Config, as_json: bool) -> Result<bool> {
     let checks = run_checks(ws, cfg);
-    let can_publish = checks.iter().all(|c| c.state == State::Ok);
+    let can_publish = verdict(&checks);
     if as_json {
         crate::json::print(&Report {
             can_publish,
@@ -126,6 +131,14 @@ pub fn run(ws: &Workspace, cfg: &Config, as_json: bool) -> Result<bool> {
     }
     println!("\nno check here touched the network");
     Ok(can_publish)
+}
+
+/// Whether the report is a pass: nothing failed, rather than everything was
+/// asked. A check that could not be asked is not evidence against publishing,
+/// and anything genuinely broken fails a check of its own, so the two rules
+/// only ever differ where something was skipped.
+fn verdict(checks: &[Check]) -> bool {
+    !checks.iter().any(|c| c.state == State::Failed)
 }
 
 /// The checks a publish needs, in the order it needs them. A list, not a
@@ -163,13 +176,18 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
                 format!("{} is not a git repository", ws.root.display()),
                 "`git init` here, or run ortak in the checkout you meant to work in",
             ),
-            (n, _) => failed(
+            // Not a failure since #105. A branch is built in the repository
+            // its files live in, so a tree whose root holds no repository of
+            // its own publishes perfectly well, and this used to report that
+            // it could not while the same line explained how.
+            (n, _) => ok(
                 "git_repository",
                 format!(
-                    "{} holds no repository of its own, and {n} under it that this workspace journals",
+                    "{} holds no repository of its own, and {n} under it that this workspace journals; \
+                     a branch is built in the one its files live in, so publish with `--repo <directory>` \
+                     and run `ortak doctor` inside a repository to check that one",
                     ws.root.display()
                 ),
-                "publish the repository the files live in: `ortak publish <session> --repo <directory>`",
             ),
         });
         // None of the three below can be asked at all without a repository, and
@@ -410,35 +428,52 @@ mod tests {
     }
 
     /// A directory that is not a repository and holds three, which is the
-    /// workspace this round is for. Before this, doctor failed the first check
-    /// with "is not a git repository" and told the reader to `git init` here,
-    /// which at the root of a tree of repositories is about the worst thing it
-    /// could say.
+    /// workspace round 12 was for. Doctor used to fail the first check with "is
+    /// not a git repository" and send the reader to `git init` here, which at
+    /// the root of a tree of repositories is about the worst thing it could
+    /// say. Since #105 it is not a failure at all: that workspace publishes,
+    /// from inside whichever repository the files live in, and the report
+    /// opened with "cannot publish yet" and then explained on the next line
+    /// how to.
     #[test]
-    fn a_tree_of_repositories_is_not_told_to_git_init_over_itself() {
+    fn a_tree_of_repositories_publishes_and_is_told_so() {
         let ws = workspace("tree");
+        let cfg = Config::default();
         for sub in ["odoo-server", "repos/altinkaya", "repos/other"] {
             std::fs::create_dir_all(ws.root.join(sub)).unwrap();
             git2::Repository::init(ws.root.join(sub)).unwrap();
         }
-        let checks = run_checks(&ws, &Config::default());
+        // The two checks that are about this workspace rather than about git.
+        Db::open(&ws.db_path).unwrap().heartbeat().unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
+
+        let checks = run_checks(&ws, &cfg);
         let repo_check = checks.iter().find(|c| c.check == "git_repository").unwrap();
-        assert_eq!(repo_check.state, State::Failed);
+        assert_eq!(repo_check.state, State::Ok);
         assert!(
             repo_check.detail.contains("3 under it"),
             "doctor does not say what the workspace covers: {}",
             repo_check.detail
         );
-        let fix = repo_check.fix.as_deref().unwrap_or("");
         assert!(
-            !fix.contains("git init"),
-            "still sending them to git init: {fix}"
+            !repo_check.detail.contains("git init") && repo_check.detail.contains("--repo"),
+            "no way out of it either: {}",
+            repo_check.detail
         );
-        assert!(fix.contains("--repo"), "no way out of it either: {fix}");
         // The three below still cannot be asked here, and now say why.
         for check in ["commits", "base_branch", "push_remote"] {
             assert_eq!(state_of(&checks, check), State::Skipped);
         }
+        assert!(
+            verdict(&checks),
+            "told it cannot publish over: {:?}",
+            checks
+                .iter()
+                .filter(|c| c.state == State::Failed)
+                .map(|c| (c.check, &c.detail))
+                .collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&ws.root);
     }
 
