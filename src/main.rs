@@ -521,10 +521,36 @@ fn init() -> Result<()> {
 /// `ortak init` is usually run from the task branch somebody is already on.
 /// Where neither name exists, HEAD is the only thing that knows, and git sets it
 /// before the first commit.
+/// The branch this checkout treats as its trunk, for the `base_branch` that
+/// `init` writes.
+///
+/// git wrote the answer down at clone time. `refs/remotes/origin/HEAD` is a
+/// symbolic ref at the branch the server advertised as its default, and `git
+/// remote set-head` refreshes it. Reading it beats guessing at a name, and the
+/// guessing was wrong two ways in a clone whose trunk is `16.0`: run in a
+/// checkout with no local `main` or `master`, `init` recorded whatever branch
+/// happened to be checked out, so running it on a feature branch made that
+/// feature branch the trunk; and a stray local `main` beat the real trunk,
+/// because a name that exists locally was preferred to a fact.
+///
+/// ponytail: `origin` only. A clone whose remote is called something else falls
+/// through to the guesses, which is where it already was, and a per-repository
+/// answer for a tree of sixty is a bigger question than one config line.
 fn trunk_branch(root: &std::path::Path) -> String {
     let Ok(repo) = git2::Repository::open(root) else {
         return "main".to_string();
     };
+    if let Some(name) = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|head| {
+            head.symbolic_target()
+                .and_then(|target| target.strip_prefix("refs/remotes/origin/"))
+                .map(str::to_string)
+        })
+    {
+        return name;
+    }
     for name in ["main", "master"] {
         if repo.find_branch(name, git2::BranchType::Local).is_ok() {
             return name.to_string();
@@ -1414,6 +1440,57 @@ fn inbox(session_ref: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    /// The shape is a clone of a repository whose trunk is `16.0`, which is the
+    /// shape of every Odoo checkout this tool runs in.
+    #[test]
+    fn the_trunk_is_the_one_the_clone_recorded() {
+        let dir = std::env::temp_dir().join(format!("ortak-trunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = git2::Repository::init(&dir).unwrap();
+        let sig = git2::Signature::now("ortak", "test@ortak.local").unwrap();
+        let tree = {
+            let oid = repo.index().unwrap().write_tree().unwrap();
+            repo.find_tree(oid).unwrap()
+        };
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+            .unwrap();
+        repo.reference("refs/remotes/origin/16.0", first, true, "")
+            .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/16.0",
+            true,
+            "",
+        )
+        .unwrap();
+        // The stray local branch that used to win.
+        repo.branch("main", &repo.find_commit(first).unwrap(), true)
+            .unwrap();
+
+        assert_eq!(
+            trunk_branch(&dir),
+            "16.0",
+            "git recorded this at clone time"
+        );
+
+        repo.find_reference("refs/remotes/origin/HEAD")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert_eq!(
+            trunk_branch(&dir),
+            "main",
+            "a clone with nothing recorded is where it always was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
