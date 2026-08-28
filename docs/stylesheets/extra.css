@@ -40,6 +40,18 @@
   --md-code-hl-variable-color: #2b405d;
   --md-typeset-color: #132a48;
   --md-typeset-a-color: #1459ad;
+  /* Material only defines these under its own `default` and `slate` schemes, so
+     a custom scheme name inherits the light defaults for everything it does not
+     name. On the dark scheme that left admonitions cream on a navy page. */
+  --md-admonition-fg-color: #132a48;
+  --md-admonition-bg-color: #f7f9fc;
+  --md-typeset-kbd-color: #ffffff;
+  --md-typeset-kbd-accent-color: #ffffff;
+  --md-typeset-kbd-border-color: #b6c1d1;
+  --md-typeset-mark-color: rgba(255, 171, 0, 0.32);
+  --md-typeset-table-color: rgba(7, 31, 69, 0.14);
+  --md-footer-bg-color: var(--ortak-navy);
+  --md-footer-bg-color--dark: #04132d;
 }
 
 [data-md-color-scheme="ortak-dark"] {
@@ -73,6 +85,16 @@
   --md-typeset-a-color: #74aef0;
   --ortak-line: rgba(151, 180, 218, 0.18);
   --ortak-code-line: #5c7292;
+  /* The same list, and the reason this file needs it: see the light scheme. */
+  --md-admonition-fg-color: #e8eef7;
+  --md-admonition-bg-color: #0d1a2e;
+  --md-typeset-kbd-color: #16243c;
+  --md-typeset-kbd-accent-color: #24354f;
+  --md-typeset-kbd-border-color: #0a1424;
+  --md-typeset-mark-color: rgba(255, 180, 84, 0.28);
+  --md-typeset-table-color: rgba(151, 180, 218, 0.18);
+  --md-footer-bg-color: #050f1e;
+  --md-footer-bg-color--dark: #030a15;
 }
 
 [data-md-color-scheme="ortak-dark"] .md-typeset,
@@ -134,6 +156,21 @@ pre {
 .md-typeset pre > code {
   border: 1px solid var(--ortak-code-line);
   border-radius: 0.75rem;
+}
+
+/* The copy button sits inside the code block's own rounded border, and at rest
+   Material draws it bright enough to read as a second outline rather than as a
+   control. Recede until the block is hovered or the button is tabbed to. */
+.md-typeset .md-clipboard {
+  top: 0.6rem;
+  right: 0.6rem;
+  color: var(--ortak-code-line);
+  transition: color 125ms;
+}
+
+.md-typeset .highlight:hover .md-clipboard,
+.md-typeset .md-clipboard:focus-visible {
+  color: var(--md-accent-fg-color);
 }
 
 .md-typeset table:not([class]) {
