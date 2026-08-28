@@ -655,13 +655,8 @@ fn process_snapshots(
 /// Catch up on changes made while the daemon was down. Attribution hints are
 /// long stale by now, so everything found here lands on the human session.
 ///
-/// ponytail: this is the shadow repository's status walk, so it sees a file
-/// inside a nested repository only once the baseline has tracked it, and a
-/// tracked file is never ignored. A file *created* in one of those
-/// repositories while the daemon was stopped is untracked and behind the root's
-/// `.gitignore`, so this does not find it; the next write to it does. Fixing
-/// that means asking each repository about itself, which is a walk per
-/// repository at every daemon start.
+/// Two walks, because one cannot see the whole workspace: the shadow
+/// repository's status, and then each nested repository asked about itself.
 fn startup_scan(
     db: &Db,
     repo: &git2::Repository,
@@ -686,6 +681,7 @@ fn startup_scan(
             journaled += 1;
         }
     }
+    journaled += scan_nested(db, repo, ws, excludes, presence_secs, human_id);
     if journaled > 0 {
         // Not "(human)": journal() takes a live hint like any other pass, so a
         // file written seconds before the daemon came back lands on the session
@@ -695,6 +691,56 @@ fn startup_scan(
             "startup scan journaled {} changes made while the daemon was stopped",
             journaled
         ));
+    }
+    journaled
+}
+
+/// The files the walk above cannot see, which are the ones it most needs to.
+///
+/// That walk is the shadow repository's status, and the shadow's worktree is
+/// the workspace root, so it reads the root's `.gitignore`. A file inside a
+/// nested repository reaches it only once the baseline has tracked it, because
+/// a tracked file is never ignored. A file *created* in one of those
+/// repositories while the daemon was stopped is untracked and behind `repos/`,
+/// so the scan whose whole job is catching up on what happened in the dark
+/// walked straight past it, and the next write to that file was what recorded
+/// it instead.
+///
+/// So each repository is asked about itself, under its own ignore rules, and
+/// answers in its own paths, which are joined back onto its directory to make
+/// the workspace-relative path everything else here speaks. `journal` decides
+/// what to keep exactly as it does for the other walk, and a file the shadow
+/// already holds classifies as no change and is not counted twice.
+///
+/// ponytail: a status walk per repository at every daemon start, which in a
+/// tree of sixty is sixty of them. An ordinary workspace is one repository and
+/// has none of these, so it pays nothing; a tree pays once, at startup, and the
+/// alternative is a scan that lies about having caught up.
+fn scan_nested(
+    db: &Db,
+    shadow: &git2::Repository,
+    ws: &Workspace,
+    excludes: &str,
+    presence_secs: i64,
+    human_id: i64,
+) -> u32 {
+    let mut journaled = 0u32;
+    for dir in ws.repositories().into_iter().filter(|d| !d.is_empty()) {
+        let Ok(owner) = git2::Repository::open(ws.root.join(&dir)) else {
+            continue;
+        };
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let Ok(statuses) = owner.statuses(Some(&mut opts)) else {
+            continue;
+        };
+        for entry in statuses.iter() {
+            let Some(rel) = entry.path() else { continue };
+            let path = format!("{dir}/{rel}");
+            if journal(db, shadow, ws, excludes, presence_secs, human_id, &path) {
+                journaled += 1;
+            }
+        }
     }
     journaled
 }
@@ -721,6 +767,66 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         Db::open(&p).unwrap()
+    }
+
+    /// The one thing the startup scan exists for, in the one workspace shape it
+    /// could not see: a file created inside a nested repository while the daemon
+    /// was down. The shadow's status reads the root's `.gitignore`, `repos/` is
+    /// in it, and an untracked file behind an ignore rule is invisible, so the
+    /// scan reported that it had caught up and had not.
+    #[test]
+    fn a_file_made_in_a_nested_repository_while_the_daemon_was_down_is_found() {
+        let root = std::env::temp_dir().join(format!("ortak-darkscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repos/inner/models")).unwrap();
+        let outer = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "repos/\n").unwrap();
+        std::fs::write(root.join("README.md"), "root\n").unwrap();
+        commit_all(&outer);
+        let inner = git2::Repository::init(root.join("repos/inner")).unwrap();
+        std::fs::write(root.join("repos/inner/models/sale.py"), "PRICE = 1\n").unwrap();
+        commit_all(&inner);
+
+        let ws = Workspace::at(&root);
+        let cfg = Config::default();
+        std::fs::create_dir_all(&ws.ortak_dir).unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
+        let db = Db::open(&ws.db_path).unwrap();
+        let human = db.ensure_human().unwrap();
+        let excludes = crate::shadow::exclude_rules(&ws, &cfg);
+
+        // The dark: two files appear with nothing watching. One is inside the
+        // nested repository, and one is a plain edit the old walk did find.
+        std::fs::write(root.join("repos/inner/models/stock.py"), "QTY = 1\n").unwrap();
+        std::fs::write(root.join("README.md"), "root, changed\n").unwrap();
+
+        let journaled = startup_scan(&db, &shadow, &ws, &excludes, 600, human);
+        let found: Vec<String> = db
+            .recent_edits(None, 20)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.file)
+            .collect();
+        assert!(
+            found.contains(&"repos/inner/models/stock.py".to_string()),
+            "the file made in the dark is still missing: {found:?}"
+        );
+        assert!(found.contains(&"README.md".to_string()), "{found:?}");
+        assert_eq!(journaled, 2, "and each of them counted once: {found:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn commit_all(repo: &git2::Repository) {
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
     }
 
     /// The count and the comparison run on every platform even though only one
