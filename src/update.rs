@@ -432,7 +432,7 @@ impl Runtime for System {
 }
 
 #[cfg(unix)]
-fn executable_file(path: &Path) -> bool {
+pub(crate) fn executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -440,7 +440,7 @@ fn executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn executable_file(path: &Path) -> bool {
+pub(crate) fn executable_file(path: &Path) -> bool {
     path.is_file()
 }
 

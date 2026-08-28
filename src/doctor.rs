@@ -20,6 +20,7 @@ use crate::db::{Db, HEARTBEAT_ALIVE_SECS};
 use crate::workspace::Workspace;
 use anyhow::Result;
 use serde::Serialize;
+use std::path::PathBuf;
 
 /// How one check came out. `Skipped` is not a quiet pass: a repository with no
 /// commits cannot be asked which branch it publishes onto, and answering "ok"
@@ -202,6 +203,7 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
         }
         checks.push(daemon_check(ws));
         checks.push(baseline_check(ws));
+        checks.push(arbiter_check(cfg));
         return checks;
     };
     checks.push(ok(
@@ -262,6 +264,7 @@ fn run_checks(ws: &Workspace, cfg: &Config) -> Vec<Check> {
 
     checks.push(daemon_check(ws));
     checks.push(baseline_check(ws));
+    checks.push(arbiter_check(cfg));
     checks
 }
 
@@ -337,6 +340,70 @@ fn daemon_check(ws: &Workspace) -> Check {
             "check that .ortak is readable, or run `ortak init` in the workspace root",
         ),
     }
+}
+
+/// Whether the arbiter this workspace has asked for can run at all.
+///
+/// Every failure path in `orchestrator` is deliberately quiet: a command that
+/// will not spawn, a non-zero exit, a timeout and unparseable output all fall
+/// back to the deterministic rule, which at the gate is a denial. That is the
+/// right behaviour and it means a typo in `ortak.toml` buys the deterministic
+/// gate for the rest of the project, with a config file that says the arbiter
+/// is on and nothing anywhere saying otherwise.
+///
+/// A broken arbiter fails rather than warns, and that is deliberate: this
+/// feature's whole failure mode is silence, so the one command whose job is to
+/// break silence must not answer `ok` and exit 0 on it.
+///
+/// ponytail: resolved, never run. A live probe costs nine seconds and a model
+/// call on every `ortak doctor`, and it would break the promise this command
+/// closes with. Whether the model answers well is not a question a health check
+/// can ask. Whether the binary is there is.
+fn arbiter_check(cfg: &Config) -> Check {
+    let orc = &cfg.orchestrator;
+    if !orc.enabled {
+        return skipped(
+            "arbiter",
+            "[orchestrator] enabled = false; the gate and stop-the-line blame stand on their deterministic rules",
+        );
+    }
+    match resolve_command(&orc.command) {
+        Some(path) => ok(
+            "arbiter",
+            format!(
+                "{} ({}), model {}, {}s timeout; not asked anything, that costs a ruling",
+                orc.command,
+                path.display(),
+                orc.model,
+                orc.timeout_secs
+            ),
+        ),
+        None => failed(
+            "arbiter",
+            format!(
+                "[orchestrator] enabled = true and `{}` is not on this PATH, so every ruling falls back to the deterministic rule and nothing says it happened",
+                orc.command
+            ),
+            "install it, give [orchestrator] command an absolute path, or set enabled = false; this stops every ruling, not a publish",
+        ),
+    }
+}
+
+/// Where this process would find the arbiter command, or nothing.
+///
+/// ponytail: a PATH lookup and an absolute path, which is what a config holds.
+/// Two ceilings. A relative command is resolved from here while `orchestrator`
+/// spawns it from the temp directory, a case Rust calls unspecified anyway. And
+/// this reads the PATH of whoever ran `doctor` rather than the hook process's,
+/// which is the same environment in the ordinary case and not guaranteed to be.
+fn resolve_command(command: &str) -> Option<PathBuf> {
+    if command.contains('/') {
+        let named = PathBuf::from(command);
+        return crate::update::executable_file(&named).then_some(named);
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(command))
+        .find(|p| crate::update::executable_file(p))
 }
 
 /// Whether the shadow repository has a baseline commit.
@@ -492,5 +559,35 @@ mod tests {
         assert_eq!(state_of(&checks, "base_branch"), State::Skipped);
         assert_eq!(state_of(&checks, "push_remote"), State::Failed);
         let _ = std::fs::remove_dir_all(&ws.root);
+    }
+
+    /// The three states of a workspace's arbiter, none of which costs a ruling
+    /// to find out. Off is a legitimate state and says so; a command that
+    /// resolves is named along with the model and the timeout, because
+    /// otherwise haiku and sonnet are the same report; and a command that does
+    /// not resolve fails, since the config asked the machine for something it
+    /// cannot do and the failure is otherwise perfectly silent.
+    #[test]
+    fn the_arbiter_is_checked_by_looking_for_it_and_not_by_asking_it() {
+        let mut cfg = Config::default();
+        assert_eq!(arbiter_check(&cfg).state, State::Skipped);
+
+        cfg.orchestrator.enabled = true;
+        cfg.orchestrator.command = "sh".into();
+        let found = arbiter_check(&cfg);
+        assert_eq!(found.state, State::Ok);
+        assert!(
+            found.detail.contains(&cfg.orchestrator.model) && found.detail.contains("20s"),
+            "the report cannot tell haiku from sonnet: {}",
+            found.detail
+        );
+
+        cfg.orchestrator.command = "definitely-not-a-real-binary".into();
+        let missing = arbiter_check(&cfg);
+        assert_eq!(missing.state, State::Failed);
+        // The decision this check makes about publishing: a workspace running
+        // with an arbiter that can never answer is not a workspace to start
+        // work in, and doctor's exit code is the only place it can say so.
+        assert!(!verdict(&[missing]));
     }
 }
