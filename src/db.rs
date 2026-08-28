@@ -1655,6 +1655,22 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Stamp everything still waiting for a session as delivered, and say how
+    /// many there were.
+    ///
+    /// The by-hand twin of the stamp inside `take_messages`. That one runs from
+    /// a hook, which is delivery by definition; this one runs from `ortak
+    /// inbox`, where whether it counts as delivery depends on who is reading.
+    /// `print_inbox` holds that rule, because it knows the reader and this does
+    /// not.
+    pub fn mark_delivered(&self, session_id: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET delivered_at = ?2
+             WHERE to_session = ?1 AND delivered_at IS NULL",
+            params![session_id, now_ts()],
+        )?)
+    }
+
     /// Everything a session has been sent, oldest first, for a person looking.
     pub fn inbox(&self, session_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(

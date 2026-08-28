@@ -338,6 +338,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    notify_the_person(&cli.command);
     match cli.command {
         Command::Update => update::run(),
         Command::Uninstall => uninstall::run(),
@@ -1033,6 +1034,54 @@ fn print_sessions(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// One line for a person who has unread mail, or nothing.
+///
+/// Every door a message arrives through is a hook, and the human session has
+/// none: mail addressed to a person sits in the table until somebody thinks to
+/// look. This is the looking, done for them.
+///
+/// It repeats until they read it rather than clearing itself once shown, which
+/// is the difference between a notice and a warning people learn to scroll
+/// past: a warning describes a condition nobody chose, and this is a message
+/// somebody deliberately sent to this person. One line, it names the command
+/// that ends it, and reading the mail is what makes it stop.
+fn unread_notice(waiting: &[db::Waiting], human: i64) -> Option<String> {
+    let w = waiting.iter().find(|w| w.session_id == human)?;
+    Some(match w.count {
+        1 => format!("1 message is waiting for you; `ortak inbox ortak-{human}` reads it"),
+        n => format!("{n} messages are waiting for you; `ortak inbox ortak-{human}` reads them"),
+    })
+}
+
+/// Put `unread_notice` in front of the person before their command runs.
+///
+/// On stderr, because `--json` output is read by other programs and a notice
+/// belongs to whoever is watching the terminal.
+fn notify_the_person(command: &Command) {
+    // An agent carries a harness id and has hooks that deliver its mail; a
+    // person has neither, and is the only reader this is for.
+    if harness_session_id().is_some() {
+        return;
+    }
+    // `daemon` is a process, not somebody reading, and `inbox` is about to
+    // print the messages themselves.
+    if matches!(command, Command::Daemon { .. } | Command::Inbox { .. }) {
+        return;
+    }
+    // ponytail: every step of the lookup may fail and none of them is worth
+    // failing somebody's command over. No workspace, no database and no human
+    // row are all normal states here, `ortak init` being the obvious one.
+    let lookup = || -> Result<Option<String>> {
+        let ws = Workspace::discover_from_cwd()?;
+        let db = Db::open(&ws.db_path)?;
+        let human = db.resolve_session("human")?;
+        Ok(unread_notice(&db.waiting_messages()?, human.id))
+    };
+    if let Ok(Some(line)) = lookup() {
+        eprintln!("{line}\n");
+    }
+}
+
 /// The harness session id this process was started under, if any. Claude Code
 /// exports it; a person at a terminal has no such thing.
 fn harness_session_id() -> Option<String> {
@@ -1393,6 +1442,30 @@ fn inbox(session_ref: &str) -> Result<()> {
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
     let session = db.resolve_session(session_ref)?;
+    let reader = calling_session(&db, None, harness_session_id().as_deref())?;
+    print_inbox(&db, &session, reader)
+}
+
+/// Print a session's mail, and mark it delivered when the session doing the
+/// reading is the one it was addressed to.
+///
+/// The rule, which had to be settled before either half of this could be
+/// written: a message is delivered when it has been put in front of the session
+/// it was addressed to. `inbox` used to read without stamping, so `messages
+/// waiting` never went down and the prompt hook handed the same message over
+/// again at the next turn.
+///
+/// Reading somebody else's inbox is not them reading it. `ortak inbox ortak-4`
+/// run by ortak-3 is one session looking at another's mail, and stamping it
+/// there would drop it from under the hook that was going to deliver it
+/// properly. Until #113 nothing could tell those two readers apart, which is
+/// why the sender question and this one are the same lane in this order.
+///
+/// The human's mail drains here and nowhere else. No hook runs for a person, so
+/// the one moment ortak knows a person has seen a message is the moment a
+/// person runs the command that prints it; `unread_notice` is what gets them to
+/// run it.
+fn print_inbox(db: &Db, session: &db::Session, reader: i64) -> Result<()> {
     let messages = db.inbox(session.id)?;
     if messages.is_empty() {
         println!("ortak-{} has no messages.", session.id);
@@ -1412,6 +1485,17 @@ fn inbox(session_ref: &str) -> Result<()> {
             "[{}] ortak-{} {}: {}",
             t, m.from_session, m.from_name, m.text
         );
+    }
+    if reader != session.id {
+        return Ok(());
+    }
+    // Say it, because reading an inbox now changes something, and a session
+    // that expects its mail again at the next prompt should hear that it will
+    // not come.
+    match db.mark_delivered(session.id)? {
+        0 => {}
+        1 => println!("(1 of those was unread; it will not be delivered again)"),
+        n => println!("({n} of those were unread; they will not be delivered again)"),
     }
     Ok(())
 }
@@ -1463,6 +1547,86 @@ mod sender_tests {
             "a named sender that resolves to nothing is a typo, not the human"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod mail_tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> Db {
+        let path = std::env::temp_dir().join(format!("ortak-{name}-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Db::open(&path).unwrap()
+    }
+
+    #[test]
+    fn reading_your_own_mail_delivers_it_and_reading_somebody_elses_does_not() {
+        let db = temp_db("mail-read");
+        let a = db
+            .upsert_session("sess-a", "claude-aaaa", "llm", Some("claude-code"))
+            .unwrap();
+        let b = db
+            .upsert_session("sess-b", "claude-bbbb", "llm", Some("claude-code"))
+            .unwrap();
+        db.send_message(a, b, "for b").unwrap();
+        let theirs = db.get_session(b).unwrap();
+
+        print_inbox(&db, &theirs, a).unwrap();
+        assert_eq!(
+            db.waiting_messages().unwrap().len(),
+            1,
+            "a session looking at another's mail has not delivered it"
+        );
+
+        print_inbox(&db, &theirs, b).unwrap();
+        assert!(
+            db.waiting_messages().unwrap().is_empty(),
+            "the session it was addressed to has now seen it"
+        );
+        assert_eq!(
+            db.inbox(b).unwrap().len(),
+            1,
+            "delivered is not deleted; the inbox is still the record"
+        );
+        assert!(
+            db.take_messages(b).unwrap().is_empty(),
+            "and the next prompt does not hand it over again"
+        );
+    }
+
+    #[test]
+    fn a_person_is_told_they_have_mail_until_they_read_it() {
+        let db = temp_db("mail-person");
+        // `init` registers the person before any agent starts, which is why the
+        // human is ortak-1 in a real workspace.
+        let human = db.ensure_human().unwrap();
+        let agent = db
+            .upsert_session("sess-a", "claude-aaaa", "llm", Some("claude-code"))
+            .unwrap();
+        let notice = || unread_notice(&db.waiting_messages().unwrap(), human);
+        assert_eq!(notice(), None, "nothing to say to a person with no mail");
+
+        db.send_message(agent, human, "a question for you").unwrap();
+        assert_eq!(
+            notice().as_deref(),
+            Some("1 message is waiting for you; `ortak inbox ortak-1` reads it")
+        );
+
+        // Somebody else's mail is not the person's business, and the count is
+        // theirs alone.
+        let other = db
+            .upsert_session("sess-b", "claude-bbbb", "llm", Some("claude-code"))
+            .unwrap();
+        db.send_message(agent, other, "for b").unwrap();
+        db.send_message(agent, human, "and another").unwrap();
+        assert_eq!(
+            notice().as_deref(),
+            Some("2 messages are waiting for you; `ortak inbox ortak-1` reads them")
+        );
+
+        print_inbox(&db, &db.get_session(human).unwrap(), human).unwrap();
+        assert_eq!(notice(), None, "read is read");
     }
 }
 
