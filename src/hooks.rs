@@ -528,8 +528,10 @@ fn verdict(
     if cfg.orchestrator.enabled {
         let my = db.get_session(me)?;
         if let Some((allow, message)) = crate::orchestrator::conflict_verdict(
+            &db,
             &cfg.orchestrator,
             &rel,
+            me,
             &my.agent_name,
             my.task_intent.as_deref().unwrap_or("(not reported)"),
             &conflicts,

@@ -178,8 +178,14 @@ pub fn report(
             .map(|s| (s.id, s.agent.clone(), s.files.clone()))
             .collect();
         let reporter_label = format!("ortak-{} {}", reporter.id, reporter.agent_name);
-        match orchestrator::blame_verdict(&cfg.orchestrator, &excerpt, &reporter_label, &candidates)
-        {
+        match orchestrator::blame_verdict(
+            &db,
+            &cfg.orchestrator,
+            &excerpt,
+            reporter.id,
+            &reporter_label,
+            &candidates,
+        ) {
             Some((id, brief)) => (id, Some(brief), "arbiter verdict".to_string()),
             None => (
                 reporter.id,
