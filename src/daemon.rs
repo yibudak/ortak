@@ -49,6 +49,63 @@ fn still_ours(pidfile: &Path) -> bool {
     read_pid(pidfile) == Some(std::process::id())
 }
 
+/// The binary a daemon is running, written to `meta` when it starts.
+///
+/// The version is the part a person reads. The part that answers the question
+/// is the file's modification time and size: a version string does not move
+/// between releases, and the daemon in this workspace spent all of round 12
+/// running a build ten pull requests behind the hooks while both of them
+/// called themselves 0.3.0.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Build {
+    pub version: String,
+    /// Where this process was loaded from, per `current_exe`.
+    pub path: String,
+    mtime: i64,
+    size: u64,
+}
+
+impl Build {
+    /// What this process is running, and `None` when it cannot find its own
+    /// binary, which is the one case with nothing true to say.
+    fn current() -> Option<Build> {
+        let path = std::env::current_exe().ok()?;
+        let (mtime, size) = stamp(&path);
+        Some(Build {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            path: path.display().to_string(),
+            mtime,
+            size,
+        })
+    }
+}
+
+/// A file's modification time and size, and `(0, 0)` for a path the filesystem
+/// will not answer for. A binary that has been deleted therefore reads as
+/// different from every real build rather than as agreement.
+fn stamp(path: &Path) -> (i64, u64) {
+    let Ok(meta) = path.metadata() else {
+        return (0, 0);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64);
+    (mtime, meta.len())
+}
+
+/// What the daemon recorded about itself, and whether the file it started from
+/// is still that file. `None` when nothing was recorded, or when the record
+/// cannot be read: a row written by another build must not be able to take
+/// down the command that reports it.
+pub fn running_build(db: &Db) -> Option<(Build, bool)> {
+    let raw = db.daemon_build().ok().flatten()?;
+    let was: Build = serde_json::from_str(&raw).ok()?;
+    let current = stamp(Path::new(&was.path)) == (was.mtime, was.size);
+    Some((was, current))
+}
+
 pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
     let pidfile = ws.ortak_dir.join(PIDFILE);
     claim(&pidfile, process_alive)?;
@@ -91,6 +148,12 @@ pub fn run(ws: &Workspace, cfg: &Config) -> Result<()> {
         .last_heartbeat()?
         .filter(|t| back - t > db::HEARTBEAT_ALIVE_SECS);
     db.heartbeat()?;
+    // Once, not on the heartbeat's timer: a running process cannot change the
+    // file it was loaded from. What moves is the file, and `status` reads that
+    // side when somebody asks.
+    if let Some(build) = Build::current() {
+        db.record_daemon_build(&serde_json::to_string(&build)?)?;
+    }
     let journaled = startup_scan(&db, &repo, ws, &excludes, presence_secs, human_id);
     if let Some(start) = stopped_at {
         let outage = db::Outage {
@@ -575,6 +638,62 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ortak-{}-{}.pid", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    fn tempdb(name: &str) -> Db {
+        let p = std::env::temp_dir().join(format!(
+            "ortak-daemon-{}-{}.sqlite",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&p);
+        Db::open(&p).unwrap()
+    }
+
+    /// The whole bug: an update replaces the binary under a running daemon and
+    /// nothing notices, because both builds call themselves the same version.
+    /// What is recorded is the file, so the version string is free to sit still.
+    #[test]
+    fn a_replaced_binary_is_not_the_build_the_daemon_is_running() {
+        let db = tempdb("build");
+        let exe = std::env::temp_dir().join(format!("ortak-fake-{}", std::process::id()));
+        std::fs::write(&exe, b"the build it started with").unwrap();
+        let (mtime, size) = stamp(&exe);
+        let started = Build {
+            version: "0.3.0".to_string(),
+            path: exe.display().to_string(),
+            mtime,
+            size,
+        };
+        db.record_daemon_build(&serde_json::to_string(&started).unwrap())
+            .unwrap();
+
+        let (read, current) = running_build(&db).expect("a record");
+        assert_eq!(read, started, "what it wrote is what it reads back");
+        assert!(current, "nothing has touched the file");
+
+        std::fs::write(&exe, b"a later build, of a different size").unwrap();
+        let (_, current) = running_build(&db).expect("a record");
+        assert!(!current, "the file it started from has been replaced");
+
+        std::fs::remove_file(&exe).unwrap();
+        let (_, current) = running_build(&db).expect("a record");
+        assert!(
+            !current,
+            "a binary that is gone is not the one it is running"
+        );
+    }
+
+    /// A record written by another build must not be able to take down the
+    /// command that reports it: a version check that breaks `status` is worse
+    /// than no version check.
+    #[test]
+    fn a_record_this_build_cannot_read_says_nothing() {
+        let db = tempdb("junk");
+        assert!(running_build(&db).is_none(), "nothing has recorded a build");
+        db.record_daemon_build(r#"{"built":"by something later"}"#)
+            .unwrap();
+        assert!(running_build(&db).is_none());
     }
 
     #[test]
