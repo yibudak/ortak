@@ -65,13 +65,20 @@ overlap alone cannot:
 enabled = true
 command = "claude"
 model = "haiku"
-timeout_secs = 20
+timeout_secs = 45
 ```
 
 For a conflict, the arbiter receives the file, requester intent, and up to five
 active owners with their regions and intents. It returns an `allow` or `deny`
 decision. Spawn failures, timeouts, invalid JSON, and unclear output fall back
-to the deterministic denial.
+to the deterministic denial, which names the failure rather than reading like a
+decision:
+
+```
+The ortak gate denied this edit. Your target lines in src/db.rs overlap another session's active region.
+- ortak-3 claude-75c6 (lines 40-70, last edit 2 min ago), intent (recorded 4 min ago): rewriting the middle block
+No arbiter ruling was made: the arbiter ran out of time. This is the deterministic rule, not a decision about your case; `ortak log` records the attempt and what it cost.
+```
 
 Every call is recorded, whether or not it produced a decision, and the rows
 appear in `ortak log` beside the journal:
@@ -82,10 +89,8 @@ appear in `ortak log` beside the journal:
 ```
 
 An allow leaves no other trace: the hook prints nothing and the edit proceeds
-exactly as an uncontested one would. The second line is the case worth reading
-for, because a fallback denies the edit with the same wording as a denial the
-arbiter reasoned about. `ortak log --session ortak-3` shows both sides of a
-ruling, so the owner whose region was defended can see that it was.
+exactly as an uncontested one would. `ortak log --session ortak-3` shows both
+sides of a ruling, so the owner whose region was defended can see that it was.
 
 See [Configuration](../reference/configuration.md#orchestrator) for global and
 workspace precedence.

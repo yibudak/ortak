@@ -135,7 +135,7 @@ LLM arbiter for all workspaces with:
 enabled = true
 command = "claude"
 model = "haiku"
-timeout_secs = 20
+timeout_secs = 45
 ```
 
 To use different settings or disable the arbiter in one workspace, add only the

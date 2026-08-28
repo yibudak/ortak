@@ -525,19 +525,22 @@ fn verdict(
 
     // Layer 3: with the referee enabled, an intent-aware ruling can overrule
     // the deterministic first-toucher denial. Referee silence means deny.
+    let mut abandoned = None;
     if cfg.orchestrator.enabled {
         let my = db.get_session(me)?;
-        if let Some((allow, message)) =
-            crate::orchestrator::conflict_verdict(&db, &cfg.orchestrator, &rel, &my, &conflicts)
-        {
-            if allow {
-                return Ok(None);
+        match crate::orchestrator::conflict_verdict(&db, &cfg.orchestrator, &rel, &my, &conflicts) {
+            Ok((true, _)) => return Ok(None),
+            Ok((false, message)) => {
+                let reason = format!(
+                    "The ortak arbiter denied this edit in {}: {} Do not bypass the denial by writing through Bash. Status: ortak log --session ortak-{}",
+                    rel, message, conflicts[0].session_id
+                );
+                return Ok(Some(reason));
             }
-            let reason = format!(
-                "The ortak arbiter denied this edit in {}: {} Do not bypass the denial by writing through Bash. Status: ortak log --session ortak-{}",
-                rel, message, conflicts[0].session_id
-            );
-            return Ok(Some(reason));
+            // The session waited for a ruling and did not get one. Falling
+            // through here is right, and denying without saying so is what made
+            // a timeout, a missing binary and a considered no the same message.
+            Err(why) => abandoned = Some(why),
         }
     }
 
@@ -557,12 +560,30 @@ fn verdict(
             crate::db::intent_line(c.intent.as_deref(), c.intent_at)
         ));
     }
+    // After the owners, because it is about this denial rather than about them.
+    reason.push_str(&abandoned_note(abandoned));
     reason.push_str(&format!(
         "Do not edit this region or bypass the denial through Bash. Continue with non-conflicting work. The region becomes available after its owner has not touched the file for {} min. Inspect the owner's work with: ortak log --session ortak-{}",
         cfg.gate.presence_minutes,
         conflicts[0].session_id
     ));
     Ok(Some(reason))
+}
+
+/// What the deterministic denial adds when the arbiter was asked and answered
+/// nothing. Empty when it was never asked, which is the ordinary case.
+///
+/// Without it a session that waited half a minute and was refused reads a
+/// message about first-toucher-wins and has no way to know a model was ever
+/// involved, let alone that its ruling arrived late and was thrown away.
+fn abandoned_note(why: Option<&str>) -> String {
+    match why {
+        None => String::new(),
+        Some(w) => format!(
+            "No arbiter ruling was made: {}. This is the deterministic rule, not a decision about your case; `ortak log` records the attempt and what it cost.\n",
+            crate::orchestrator::outcome_note(w)
+        ),
+    }
 }
 
 /// Every file path a tool call names, as written in the tool input. An empty
@@ -1137,6 +1158,23 @@ mod tests {
         let a = agent_name_for("63a2d8fa-3038-4728-874c-be1a21b07aab", "claude-code");
         let b = agent_name_for("63a2d8fb-1111-4728-874c-be1a21b07aab", "claude-code");
         assert_ne!(a, b);
+    }
+
+    /// Three denials that used to be one sentence: the arbiter said no, the
+    /// arbiter could not be started, and the arbiter answered a second late.
+    /// Only the first is a decision, and the session cannot act on the other
+    /// two without being told which it got.
+    #[test]
+    fn a_denial_nobody_ruled_on_says_which_silence_it_was() {
+        assert!(abandoned_note(None).is_empty(), "never asked, say nothing");
+        let late = abandoned_note(Some("timed-out"));
+        assert!(late.contains("No arbiter ruling was made"), "{late}");
+        assert!(late.contains("ran out of time"), "{late}");
+        assert!(late.contains("not a decision about your case"), "{late}");
+        assert!(
+            abandoned_note(Some("spawn-failed")).contains("would not start"),
+            "each outcome reaches the session in its own words"
+        );
     }
 
     /// A denial's text is the gate's own, and a waiting message rides beside it
