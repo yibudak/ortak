@@ -3,7 +3,12 @@ use crate::db::{Db, PublishRow, Session};
 use crate::workspace::Workspace;
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{BranchType, Commit, IndexEntry, IndexTime, Oid, Repository, Signature, Tree};
+use std::collections::BTreeSet;
 use std::path::Path;
+
+/// How many repositories a refusal names before it starts counting instead.
+/// Forty of them is a wall of text where the count is the point.
+const REPOS_LISTED: usize = 5;
 
 /// Which of a session's edits one publish carries. The three are exclusive:
 /// each names a different point to start reading the journal from.
@@ -113,6 +118,13 @@ pub fn run(ws: &Workspace, cfg: &Config, session_ref: &str, opts: PublishOpts) -
                 dir,
                 session.id
             );
+        }
+        // A prefix that matches nothing is caught above. A prefix that matches
+        // too much reaches the spanning refusal further down, which explains
+        // that this session has edited two repositories, when what happened is
+        // that `--repo repos` named forty of them at once.
+        if let Some(problem) = too_many_repositories(ws, dir, &files) {
+            bail!("{problem}");
         }
     }
     if files.is_empty() {
@@ -1134,6 +1146,36 @@ fn net_kind<'k>(base: &Tree, prefix: &str, file: &str, kind: &'k str) -> &'k str
         true => kind,
         false => "create",
     }
+}
+
+/// How many repositories a `--repo` prefix covers, and `None` while it covers
+/// one, which is what it is for.
+///
+/// `--repo` is a path prefix. A prefix matching nothing is a typo and already
+/// says so; a prefix matching too much is the other half of the same mistake
+/// and had no answer of its own, so `--repo repos` in a tree of sixty reached
+/// the spanning refusal and explained that this session had edited two
+/// repositories, which is true and is not what went wrong.
+fn too_many_repositories(ws: &Workspace, dir: &str, files: &[(String, String)]) -> Option<String> {
+    let under: BTreeSet<String> = files.iter().filter_map(|(f, _)| ws.repo_of(f)).collect();
+    if under.len() < 2 {
+        return None;
+    }
+    let named: Vec<&str> = under
+        .iter()
+        .take(REPOS_LISTED)
+        .map(String::as_str)
+        .collect();
+    let rest = match under.len() > named.len() {
+        true => format!(", and {} more", under.len() - named.len()),
+        false => String::new(),
+    };
+    Some(format!(
+        "--repo {dir} covers {} repositories and a branch belongs to one: {}{}. Name one of them, and the rest keep their place in the journal for their own publish",
+        under.len(),
+        named.join(", "),
+        rest
+    ))
 }
 
 /// The repository this branch belongs in, and how far its files sit below the
@@ -3551,6 +3593,61 @@ mod tests {
             waiting.contains(&"README.md".to_string()),
             "the root repository's edit left the journal: {waiting:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `--repo repos` in the tree this was built for names forty repositories
+    /// at once. The prefix that matches nothing is a typo and says so; this one
+    /// used to reach the spanning refusal, which explains that the session
+    /// edited two repositories rather than that the argument named both.
+    #[test]
+    fn a_repo_prefix_covering_several_repositories_says_which_ones() {
+        let (root, _outer, _inner) = nested_workspace("wide");
+        let mut opts = git2::RepositoryInitOptions::new();
+        std::fs::create_dir_all(root.join("repos/other/models")).unwrap();
+        let other =
+            Repository::init_opts(root.join("repos/other"), opts.initial_head("main")).unwrap();
+        std::fs::write(root.join("repos/other/models/stock.py"), "QTY = 1\n").unwrap();
+        commit_everything(&other);
+
+        let ws = Workspace::at(&root);
+        let cfg = Config::default();
+        std::fs::create_dir_all(&ws.ortak_dir).unwrap();
+        let shadow = crate::shadow::init(&ws, &cfg).unwrap();
+        crate::shadow::baseline(&shadow, &ws, &cfg).unwrap();
+        let db = Db::open(&ws.db_path).unwrap();
+        let me = db.upsert_session("ext", "b", "llm", Some("wide")).unwrap();
+        std::fs::write(root.join("repos/inner/models/sale.py"), "PRICE = 2\n").unwrap();
+        journal_edit(&shadow, &db, me, "repos/inner/models/sale.py");
+        std::fs::write(root.join("repos/other/models/stock.py"), "QTY = 2\n").unwrap();
+        journal_edit(&shadow, &db, me, "repos/other/models/stock.py");
+
+        let refused = run(
+            &ws,
+            &cfg,
+            &format!("ortak-{me}"),
+            PublishOpts {
+                branch: Some("task/wide"),
+                base: None,
+                exclude: &[],
+                repo: Some("repos"),
+                scope: Scope::New,
+                push: false,
+                message: None,
+                dry_run: false,
+                squash: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        for expected in [
+            "--repo repos",
+            "2 repositories",
+            "repos/inner",
+            "repos/other",
+        ] {
+            assert!(refused.contains(expected), "{expected} missing: {refused}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
