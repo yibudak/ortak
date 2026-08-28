@@ -110,7 +110,7 @@ enum Command {
         to: String,
         /// Message text
         text: Vec<String>,
-        /// Sending session (default: the human session)
+        /// Sending session (default: the session $CLAUDE_CODE_SESSION_ID names, else the human)
         #[arg(long)]
         from: Option<String>,
         /// Read the message from standard input instead of the arguments
@@ -996,6 +996,49 @@ fn print_sessions(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// The harness session id this process was started under, if any. Claude Code
+/// exports it; a person at a terminal has no such thing.
+fn harness_session_id() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID").ok()
+}
+
+/// The session a command is running as.
+///
+/// `tell` used to sign every message with the human session, because the only
+/// way to name a sender was a flag and in twelve rounds nobody passed it. The
+/// harness exports the same string `sessions.external_id` stores, so the answer
+/// was always there to look up. Every step from the environment to a session id
+/// is allowed to come up empty, and empty means the human: a person at a
+/// terminal has no harness id and still has to be able to send a message.
+///
+/// A harness id this workspace has never registered falls through to the human
+/// rather than registering itself. A session registers at `SessionStart`, in
+/// the workspace it starts in, and a messaging command that created sessions as
+/// a side effect would put rows in `ortak status` for agents that never worked
+/// here. That costs one mislabelled message per unregistered session, so it
+/// says out loud that it fell through.
+fn calling_session(db: &Db, from: Option<&str>, external: Option<&str>) -> Result<i64> {
+    // A named sender wins: it is how the watcher speaks for another session and
+    // how a test drives this, and a reference it cannot resolve is a typo worth
+    // failing on rather than quietly signing with somebody else's name.
+    if let Some(reference) = from {
+        return Ok(db.resolve_session(reference)?.id);
+    }
+    let Some(external) = external else {
+        return db.ensure_human();
+    };
+    match db.resolve_session(external) {
+        Ok(s) => Ok(s.id),
+        Err(_) => {
+            eprintln!(
+                "no session in this workspace for harness id {external}; \
+                 recording this as the human session."
+            );
+            db.ensure_human()
+        }
+    }
+}
+
 /// Answer "which session am I here?" from the one handle that survives.
 ///
 /// `ortak-N` is a row id handed out in registration order, so it is per
@@ -1011,7 +1054,7 @@ fn whoami(session_id: Option<&str>) -> Result<()> {
     // Nothing else is assumed to, so every other harness passes it in.
     let external_id = match session_id {
         Some(id) => id.to_string(),
-        None => std::env::var("CLAUDE_CODE_SESSION_ID").map_err(|_| {
+        None => harness_session_id().ok_or_else(|| {
             anyhow::anyhow!(
                 "no harness session id in the environment; pass it: ortak whoami <session-id>. \
                  Claude Code exports it as CLAUDE_CODE_SESSION_ID"
@@ -1267,11 +1310,7 @@ fn tell(to: &str, text: &[String], from: Option<&str>, stdin: bool) -> Result<()
     }
     let ws = Workspace::discover_from_cwd()?;
     let db = Db::open(&ws.db_path)?;
-    // No sender named means a person at a terminal typed this.
-    let sender = match from {
-        Some(r) => db.resolve_session(r)?.id,
-        None => db.ensure_human()?,
-    };
+    let sender = calling_session(&db, from, harness_session_id().as_deref())?;
     if to == "all" {
         match db.broadcast_message(sender, &text)? {
             0 => println!("no other active sessions; nothing was sent."),
@@ -1338,6 +1377,56 @@ fn inbox(session_ref: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+
+    /// The environment is the input here, so the test names it directly rather
+    /// than setting a variable: `std::env::set_var` is process-wide and the
+    /// suite runs its tests in threads.
+    #[test]
+    fn a_message_is_signed_by_the_session_the_environment_names() {
+        let path = std::env::temp_dir().join(format!("ortak-sender-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let agent = db
+            .upsert_session("sess-a", "claude-aaaa", "llm", Some("claude-code"))
+            .unwrap();
+        let watcher = db
+            .upsert_session("sess-w", "claude-wwww", "llm", Some("claude-code"))
+            .unwrap();
+        let human = db.ensure_human().unwrap();
+
+        assert_eq!(
+            calling_session(&db, None, Some("sess-a")).unwrap(),
+            agent,
+            "the harness id names the sender"
+        );
+        assert_eq!(
+            calling_session(&db, Some("ortak-2"), Some("sess-a")).unwrap(),
+            watcher,
+            "--from wins, which is how one session speaks for another"
+        );
+        assert_eq!(
+            calling_session(&db, None, None).unwrap(),
+            human,
+            "a person at a terminal has no harness id"
+        );
+        // The first message a session sends can arrive before any hook has
+        // registered it here, and this used to be the only way `tell` behaved.
+        assert_eq!(
+            calling_session(&db, None, Some("sess-elsewhere")).unwrap(),
+            human,
+            "an id this workspace never registered does not fail"
+        );
+        assert!(
+            calling_session(&db, Some("ortak-99"), None).is_err(),
+            "a named sender that resolves to nothing is a typo, not the human"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]
